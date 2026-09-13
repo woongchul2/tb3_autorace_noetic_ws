@@ -1,99 +1,48 @@
 # Custom AutoRace description
 
-ROBOTIS 원본을 수정하지 않고 사용하는 파라미터형 ROS Noetic Xacro 패키지입니다.
+ROBOTIS 원본을 수정하지 않고 실측 로봇과 Gazebo 센서를 구성하는 ROS Noetic Xacro 패키지입니다.
 
-## 주요 파라미터 상태
+## 기준 파일
 
-`urdf/robot_parameters.xacro`의 기구 실측값은 입력 완료했습니다. 단위는 m, kg, rad, Hz입니다.
+- 실측값, 계산 근거와 미확정 항목: [`HARDWARE_PARAMETERS.md`](HARDWARE_PARAMETERS.md)
+- URDF/Xacro 실행값: [`urdf/robot_parameters.xacro`](urdf/robot_parameters.xacro)
+- 비대칭 주행 footprint: [`../custom_autorace_bringup/config/navigation_footprint.yaml`](../custom_autorace_bringup/config/navigation_footprint.yaml)
+- 기어비와 회전 방향 보정: [`../../firmware/custom_autorace_core`](../../firmware/custom_autorace_core)
 
-1. `wheel_radius`, `wheel_width`, `wheel_separation`은 실측값 입력 완료
-2. 차체 collision 크기·중심과 Onshape 고정부 질량·COM·관성은 입력 완료
-3. Mid-360 점군 원점의 `lidar_x/y/z`, `roll/pitch/yaw`는 입력 완료
-4. D405 장착점·광학 중심과 `roll/pitch/yaw`는 입력 완료
-5. LiDAR 범위·샘플 수·주기와 카메라 수평 FOV·해상도·FPS는 초기 시뮬레이션값 적용
-6. 전체 수평 외곽 footprint와 보수적 반경 `0.149 m`는 입력 완료
+하드웨어 수치는 `HARDWARE_PARAMETERS.md`에서 한 번만 설명합니다. 값을 변경할 때는 원장과 Xacro 또는 펌웨어 실행값을 함께 갱신합니다.
 
-좌표는 `base_link` 기준으로 +x 전방, +y 왼쪽, +z 위입니다. 각도는 rad이며 roll/pitch/yaw 순서입니다.
+## 실행 방식
 
-## 확인 명령
+Xacro 확인, 센서 단독 Gazebo, 코스 이미지 교체와 odometry 비교 명령은
+[`DOCKER_NOETIC.md`](../../DOCKER_NOETIC.md#로봇-모델과-센서-단독-확인)를 사용합니다.
+이 문서에는 각 옵션의 동작만 설명합니다.
 
-```bash
-cd ~/tb3_autorace_noetic_ws
-catkin_make
-source devel/setup.bash
-roslaunch custom_autorace_description description.launch use_gui:=true
-```
+선택한 PNG는 SHA 기반 `/tmp` 모델에 스테이징되어 gzserver와 gzclient가 같은 모델을 사용합니다. 기본값 `course_texture:=from_model`은 원본 월드를 그대로 실행합니다.
 
-Gazebo AutoRace 맵:
+## Odometry와 진단 토픽
 
-```bash
-roslaunch custom_autorace_description gazebo_autorace.launch
-```
+Gazebo 기본값은 바퀴 회전 기반 `encoder` odometry와 encoder 전진속도·IMU 방향·각속도를 결합한 EKF입니다. Gazebo raw odom TF는 끄고 EKF만 `odom -> base_footprint`를 발행합니다.
 
-별도 컬러 코스 PNG를 원본 모델 수정 없이 Gazebo 바닥과 카메라에 적용:
+| 토픽 | 역할 |
+|---|---|
+| `/camera/color/image_raw` | 가상 카메라 원본 영상 |
+| `/scan_mid360_raw` | Mid-360 형식의 Gazebo 2D scan 근사 |
+| `/imu` | 가상 IMU |
+| `/odom` | EKF 입력용 raw odometry |
+| `/odometry/filtered` | EKF 자세·속도와 6×6 공분산 |
+| `/ground_truth/path` | Gazebo 실제 경로 |
+| `/filtered/path` | encoder+IMU EKF 경로 |
+| `/trajectory/comparison` | 실제·EKF 경로와 2-sigma 위치 공분산 |
 
-```bash
-roslaunch custom_autorace_description gazebo_autorace.launch \
-  course_texture:=/workspace/maps/changed_course.png
-```
+RViz Fixed Frame은 `odom`을 사용합니다. `/trajectory/comparison`의 빨간 점은 Gazebo 실제 위치, 초록색은 EKF 경로, 노란색 타원은 현재 EKF 위치 공분산입니다. Ground Truth는 비교 전용이며 TF를 발행하지 않습니다. 궤적 초기화 명령은 [`DOCKER_NOETIC.md`](../../DOCKER_NOETIC.md#카메라와-토픽-확인)에 있습니다.
 
-선택한 PNG는 SHA 기반 `/tmp` 모델에 스테이징되며 gzserver와 gzclient가 같은 모델을
-사용합니다. 기본값 `course_texture:=from_model`은 원본 월드를 그대로 실행합니다.
+`fuse_imu:=false`에서는 TF가 끊기지 않도록 Gazebo raw odom TF가 다시 활성화되며 EKF TF와 동시에 발행되지 않습니다.
 
-가상 센서의 원본 토픽은 `/camera/color/image_raw`, `/scan_mid360_raw`, `/imu`,
-`/odom`입니다. Gazebo에서는 기본적으로 바퀴 회전을 적분하는 `encoder` 오도메트리와
-encoder 전진속도+IMU 방향/각속도를 결합한 EKF를 함께 실행합니다.
+## 실물 적용 전 확인
 
-```text
-/ground_truth/path       Gazebo 실제 경로(nav_msgs/Path)
-/filtered/path           encoder+IMU EKF 경로(nav_msgs/Path)
-/odometry/filtered       EKF 자세·속도와 계산된 6x6 공분산(nav_msgs/Odometry)
-/trajectory/comparison   Ground Truth·EKF 경로와 2-sigma 위치 공분산(MarkerArray)
-```
+- 저장소의 커스텀 OpenCR 스케치를 실물 보드에 업로드합니다.
+- 최종 장착 상태에서 카메라 intrinsic, projection과 compensation을 보정합니다.
+- 공통 costmap은 `navigation_footprint.yaml`의 비대칭 footprint를 사용합니다.
+- 센서 잡음, 공분산, 속도와 가속도는 실물 로그와 반복 주행으로 조정합니다.
 
-RViz의 Fixed Frame을 `odom`으로 설정하고 `MarkerArray` Display에서
-`/trajectory/comparison`만 선택하면 다음 색으로 겹쳐 보입니다.
-
-```text
-빨간 점: `/gazebo/model_states`에서 직접 읽은 실제 시뮬레이션 위치 표식
-초록색: encoder+IMU EKF
-노란색 타원: 현재 EKF 위치 공분산의 2-sigma 범위
-```
-
-기본 실행에서는 Gazebo diff-drive의 raw odom TF를 끄고 EKF가 유일하게
-`odom -> base_footprint` TF를 발행합니다. 따라서 RViz의 RobotModel과 LiDAR는
-초록색 `/odometry/filtered` 자세를 따릅니다. 빨간색 Ground Truth는 시뮬레이션
-비교용이며 TF를 제어하지 않습니다. Raw `/odom`은 EKF 입력으로만 유지하고 RViz에는
-별도 궤적으로 표시하지 않습니다.
-
-수치 공분산은 `/odometry/filtered`의 `pose.covariance`와 `twist.covariance`에서
-확인할 수 있습니다. 시뮬레이션 초기 표준편차는 encoder 전진속도 `0.02 m/s`,
-IMU 출력 `0.002`로 두었으며, 실물 로그를 수집한 뒤 반드시 다시 추정해야 합니다.
-경로를 초기화하려면 다음 서비스를 호출합니다.
-
-```bash
-rosservice call /trajectory/reset
-```
-
-기존처럼 Gazebo 실제 위치 기반 `/odom`이 필요한 경우에만 다음 인자를 사용합니다.
-
-```bash
-roslaunch custom_autorace_description gazebo_autorace.launch odometry_source:=world
-```
-
-EKF를 제외하고 encoder odom만 시험하려면 다음 인자를 사용합니다.
-
-```bash
-roslaunch custom_autorace_description gazebo_autorace.launch fuse_imu:=false
-```
-
-이 모드에서는 TF 트리가 끊기지 않도록 Gazebo raw odom TF가 자동으로 다시
-활성화되며, EKF TF와 동시에 발행되지는 않습니다.
-
-## Xacro 밖에서 반드시 별도로 처리할 항목
-
-- **2:1 증속 기어**: 저장소의 `firmware/custom_autorace_core`에 `cmd_vel -> 모터 RPM`과 `encoder tick -> wheel rotation` 보정을 모두 반영했습니다. 실물 OpenCR에는 이 커스텀 스케치를 업로드해야 합니다.
-- 실물 카메라는 intrinsic calibration을 새로 하고, 설치 위치/각도 변경 후 AutoRace projection 및 compensation도 다시 보정합니다.
-- Navigation용 실제 외곽 측정은 완료했습니다. `custom_autorace_bringup/config/navigation_footprint.yaml`의 비대칭 footprint를 공통 costmap 설정에 불러오고, 최대 속도/가속도는 실물 주행으로 조정합니다.
-
-고정부 visual은 Onshape Assembly 원점 기준 Medium STL(약 9.4 MB, 197,026 triangles)을 `base_link`로 보정해 사용합니다. Collision은 성능과 안정성을 위해 실측 외곽의 단순 box를 별도로 유지합니다.
+고정부 visual은 Onshape STL을 `base_link`에 맞춰 사용하고, collision은 계산량과 안정성을 위해 실측 외곽의 단순 box로 유지합니다. 세부 수치와 계산 근거는 하드웨어 원장을 참조하십시오.
