@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
+source /opt/ros/noetic/setup.bash
+
 cd /workspace
 
 rosdep check --from-paths src --ignore-src --rosdistro noetic \

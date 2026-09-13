@@ -244,15 +244,6 @@ class RasterRouteCorridorChecker:
         delta_y = world_y[:, None] - self.path.y[None, first:last]
         return first + np.argmin(delta_x * delta_x + delta_y * delta_y, axis=1)
 
-    def covers_pose(self, x, y, heading):
-        center_distance = np.hypot(self.path.x - x, self.path.y - y)
-        center_index = int(np.argmin(center_distance))
-        world_x, world_y = self._footprint_world(x, y, heading)
-        indices = self._nearest_indices(world_x, world_y, center_index)
-        return self._indices_within_endpoint_extension(
-            world_x, world_y, indices
-        )
-
     def _indices_within_endpoint_extension(self, world_x, world_y, indices):
         first = indices == 0
         if np.any(first):

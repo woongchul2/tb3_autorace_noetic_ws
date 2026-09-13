@@ -30,11 +30,15 @@ Gazebo 기본값은 바퀴 회전 기반 `encoder` odometry와 encoder 전진속
 | `/imu` | 가상 IMU |
 | `/odom` | EKF 입력용 raw odometry |
 | `/odometry/filtered` | EKF 자세·속도와 6×6 공분산 |
-| `/ground_truth/path` | Gazebo 실제 경로 |
-| `/filtered/path` | encoder+IMU EKF 경로 |
-| `/trajectory/comparison` | 실제·EKF 경로와 2-sigma 위치 공분산 |
+| `/ground_truth/path` | 선택 진단의 Gazebo 실제 경로 |
+| `/filtered/path` | 선택 진단의 encoder+IMU EKF 경로 |
+| `/trajectory/comparison` | 선택 진단의 실제·EKF 경로와 2-sigma 위치 공분산 |
 
-RViz Fixed Frame은 `odom`을 사용합니다. `/trajectory/comparison`의 빨간 점은 Gazebo 실제 위치, 초록색은 EKF 경로, 노란색 타원은 현재 EKF 위치 공분산입니다. Ground Truth는 비교 전용이며 TF를 발행하지 않습니다. 궤적 초기화 명령은 [`DOCKER_NOETIC.md`](../../DOCKER_NOETIC.md#카메라와-토픽-확인)에 있습니다.
+세 궤적 토픽은 `publish_trajectories:=true`일 때만 발행됩니다. RViz Fixed Frame은
+`odom`을 사용합니다. `/trajectory/comparison`의 빨간 점은 Gazebo 실제 위치,
+초록색은 EKF 경로, 노란색 타원은 현재 EKF 위치 공분산입니다. Ground Truth는 비교
+전용이며 TF를 발행하지 않습니다. 실행과 초기화 명령은
+[`DOCKER_NOETIC.md`](../../DOCKER_NOETIC.md#카메라와-토픽-확인)에 있습니다.
 
 `fuse_imu:=false`에서는 TF가 끊기지 않도록 Gazebo raw odom TF가 다시 활성화되며 EKF TF와 동시에 발행되지 않습니다.
 

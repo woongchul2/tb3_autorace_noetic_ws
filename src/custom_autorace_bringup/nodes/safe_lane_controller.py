@@ -723,13 +723,6 @@ def ego_connected_lane_poses(forward, lateral, maximum_spacing):
     )
 
 
-def connect_ego_to_lane_candidate(forward, lateral, maximum_spacing):
-    """Return the XY projection of :func:`ego_connected_lane_poses`."""
-
-    poses = ego_connected_lane_poses(forward, lateral, maximum_spacing)
-    return poses[:, 0], poses[:, 1]
-
-
 def boundary_geometry_options(
     yellow_candidate,
     white_candidate,

@@ -10,6 +10,12 @@ import yaml
 
 LAUNCH_FILE = Path(__file__).resolve().parents[1] / "launch" / "gazebo.launch"
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
+DESCRIPTION_GAZEBO_LAUNCH = (
+    PACKAGE_DIR.parent
+    / "custom_autorace_description"
+    / "launch"
+    / "gazebo_autorace.launch"
+)
 LANE_PATH_LAUNCH = PACKAGE_DIR / "launch" / "gazebo_lane_path_test.launch"
 MISSION_ZONES = PACKAGE_DIR / "config" / "mission_zones_gazebo.yaml"
 MISSION_CONFIGS = {
@@ -51,6 +57,22 @@ class GazeboLaunchWiringTest(unittest.TestCase):
     def test_default_race_launch_provides_filtered_odometry(self):
         self.assertEqual(self.arg("odometry_source").get("default"), "world")
         self.assertEqual(self.arg("fuse_imu").get("default"), "true")
+
+    def test_trajectory_comparison_is_explicitly_opt_in(self):
+        self.assertEqual(
+            self.arg("publish_trajectories").get("default"), "false"
+        )
+        forwarded = self.root.find(
+            ".//include/arg[@name='publish_trajectories']"
+        )
+        self.assertIsNotNone(forwarded)
+        self.assertEqual(forwarded.get("value"), "$(arg publish_trajectories)")
+
+        description_root = ET.parse(str(DESCRIPTION_GAZEBO_LAUNCH)).getroot()
+        description_arg = description_root.find(
+            "./arg[@name='publish_trajectories']"
+        )
+        self.assertEqual(description_arg.get("default"), "false")
 
     def test_gazebo_amcl_uses_signed_subcentimetre_diff_model(self):
         with AMCL_CONFIG.open(encoding="utf-8") as stream:

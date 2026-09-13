@@ -8,8 +8,7 @@ source /opt/ros/noetic/setup.bash
 if [[ -f /workspace/devel/setup.bash ]]; then
   source /workspace/devel/setup.bash
 else
-  echo "오류: /workspace/devel/setup.bash가 없습니다. 워크스페이스를 먼저 빌드하세요." >&2
-  exit 1
+  echo "안내: devel/setup.bash가 없습니다. ./docker/build_workspace.sh로 먼저 빌드하세요." >&2
 fi
 
 cd /workspace

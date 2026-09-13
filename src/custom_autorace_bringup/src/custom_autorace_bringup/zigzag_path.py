@@ -1043,14 +1043,6 @@ class RasterPaintCorridorChecker:
         )
         return world_x, world_y
 
-    def covers_pose(self, x, y, heading):
-        """Return whether every footprint edge has extracted paint data."""
-        world_x, _ = self._footprint_world(x, y, heading)
-        return bool(
-            float(np.min(world_x)) >= float(self.boundary_x[0]) - 1e-9
-            and float(np.max(world_x)) <= float(self.boundary_x[-1]) + 1e-9
-        )
-
     def pose_metrics(self, x, y, heading):
         """Return ``(inner_intrusion, outer_edge_reserve)`` in metres."""
         world_x, world_y = self._footprint_world(x, y, heading)
@@ -1073,52 +1065,3 @@ class RasterPaintCorridorChecker:
             float(np.min(upper_outer - world_y)),
         )
         return inner_intrusion, outer_reserve
-
-    def path_metrics(self, path, start_index=0, end_index=None):
-        maximum_inner_intrusion = 0.0
-        minimum_outer_reserve = math.inf
-        start_index = max(0, int(start_index))
-        if end_index is None:
-            end_index = path.x.size
-        end_index = min(path.x.size, max(start_index, int(end_index)))
-        for x, y, heading in zip(
-            path.x[start_index:end_index],
-            path.y[start_index:end_index],
-            path.heading[start_index:end_index],
-        ):
-            inner, outer = self.pose_metrics(x, y, heading)
-            maximum_inner_intrusion = max(maximum_inner_intrusion, inner)
-            minimum_outer_reserve = min(minimum_outer_reserve, outer)
-        return maximum_inner_intrusion, minimum_outer_reserve
-
-    def segment_metrics(
-        self,
-        start_pose,
-        end_pose,
-        translation_step=0.001,
-        heading_step=math.radians(0.25),
-    ):
-        distance = math.hypot(
-            float(end_pose[0]) - float(start_pose[0]),
-            float(end_pose[1]) - float(start_pose[1]),
-        )
-        yaw_change = normalize_angle(float(end_pose[2]) - float(start_pose[2]))
-        count = max(
-            1,
-            int(math.ceil(distance / max(0.0005, translation_step))),
-            int(math.ceil(abs(yaw_change) / max(math.radians(0.05), heading_step))),
-        )
-        maximum_inner_intrusion = 0.0
-        minimum_outer_reserve = math.inf
-        for fraction in np.linspace(0.0, 1.0, count + 1):
-            pose = (
-                float(start_pose[0])
-                + fraction * (float(end_pose[0]) - float(start_pose[0])),
-                float(start_pose[1])
-                + fraction * (float(end_pose[1]) - float(start_pose[1])),
-                normalize_angle(float(start_pose[2]) + fraction * yaw_change),
-            )
-            inner, outer = self.pose_metrics(*pose)
-            maximum_inner_intrusion = max(maximum_inner_intrusion, inner)
-            minimum_outer_reserve = min(minimum_outer_reserve, outer)
-        return maximum_inner_intrusion, minimum_outer_reserve

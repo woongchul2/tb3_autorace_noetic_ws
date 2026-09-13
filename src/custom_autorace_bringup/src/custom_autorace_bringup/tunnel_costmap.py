@@ -391,15 +391,6 @@ class TunnelCostmap:
             return column, row
         return None
 
-    def cell_center(self, column, row):
-        """Return the world coordinates of one cell's centre."""
-        column = self._cell_coordinate("column", column, self.width)
-        row = self._cell_coordinate("row", row, self.height)
-        return (
-            self.origin_x + (column + 0.5) * self.resolution,
-            self.origin_y + (row + 0.5) * self.resolution,
-        )
-
     @staticmethod
     def _cell_coordinate(name, value, limit):
         if isinstance(value, bool):

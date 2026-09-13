@@ -47,6 +47,7 @@
   <arg name="wait_for_green" default="true"/>
   <arg name="rviz" default="true"/>
   <arg name="rviz_config" default="/workspace/autorace_sim.rviz"/>
+  <arg name="publish_trajectories" default="false"/>
 
   <include file="$(find custom_autorace_description)/launch/gazebo_autorace.launch">
     <arg name="x_pos" value="$(arg x_pos)"/>
@@ -57,6 +58,7 @@
     <arg name="course_texture" value="$(arg course_texture)"/>
     <arg name="fuse_imu" value="$(arg fuse_imu)"/>
     <arg name="odometry_source" value="$(arg odometry_source)"/>
+    <arg name="publish_trajectories" value="$(arg publish_trajectories)"/>
   </include>
 
   <!-- Spawn and update the original AutoRace mission environment:

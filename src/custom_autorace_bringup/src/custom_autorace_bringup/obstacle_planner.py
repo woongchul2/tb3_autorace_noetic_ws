@@ -16,7 +16,6 @@ from custom_autorace_bringup.path_following import (
     CommonPath,
     GoalTolerance,
     PathSafety,
-    Pose2D,
     SafetyMargins,
     SpeedProfile,
     StraightCorridorBoundary,
@@ -93,72 +92,6 @@ class RectanglePathChecker:
                 tracking=footprint.tracking_margin,
             ),
         )
-
-    def pose_clearance(
-        self,
-        x,
-        y,
-        heading,
-        obstacle_points,
-        right_line,
-        left_line,
-        footprint=None,
-    ):
-        """Return (safe, obstacle clearance, painted-line clearance)."""
-        footprint = self.footprint if footprint is None else footprint
-        safety = self.safety(obstacle_points, right_line, left_line, footprint)
-        result = self.validator.validate_poses(
-            (Pose2D(float(x), float(y), float(heading)),), safety=safety
-        )
-        return (
-            result.safe,
-            result.minimum_obstacle_clearance,
-            result.minimum_line_clearance,
-        )
-
-    def path_is_safe(
-        self,
-        path,
-        obstacle_points,
-        right_line,
-        left_line,
-        start_index=0,
-        footprint=None,
-        maximum_distance=None,
-    ):
-        if path is None or path.x.size == 0:
-            return False
-        footprint = self.footprint if footprint is None else footprint
-        safety = self.safety(obstacle_points, right_line, left_line, footprint)
-        first = max(0, min(int(start_index), path.size - 1))
-        result = self.validator.validate_path(
-            path,
-            start_station=float(path.station[first]),
-            maximum_distance=maximum_distance,
-            safety=safety,
-        )
-        return result.safe
-
-    def measure_path_clearance(
-        self,
-        path,
-        obstacle_points,
-        right_line,
-        left_line,
-        footprint=None,
-        maximum_distance=None,
-    ):
-        if path is None:
-            return math.inf, math.inf
-        footprint = self.footprint if footprint is None else footprint
-        safety = self.safety(obstacle_points, right_line, left_line, footprint)
-        result = self.validator.validate_path(
-            path,
-            maximum_distance=maximum_distance,
-            safety=safety,
-        )
-        return result.minimum_obstacle_clearance, result.minimum_line_clearance
-
 
 def rectangle_surface_points(
     center_x,

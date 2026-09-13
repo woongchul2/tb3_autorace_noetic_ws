@@ -14,8 +14,8 @@ cd ~/tb3_autorace_noetic_ws
 역할: Xacro 로봇 모델을 빌드하고 GUI에서 확인합니다.
 
 ```bash
-cd ~/tb3_autorace_noetic_ws
-catkin_make
+cd /workspace
+./docker/build_workspace.sh
 source devel/setup.bash
 roslaunch custom_autorace_description description.launch use_gui:=true
 ```
@@ -424,7 +424,13 @@ rosnode list
 rostopic list
 ```
 
-역할: RViz 주행 궤적을 초기화합니다.
+역할: Gazebo 실제 위치와 EKF 궤적 비교를 켜서 통합 자동주행을 실행합니다.
+
+```bash
+roslaunch custom_autorace_bringup gazebo.launch publish_trajectories:=true
+```
+
+역할: 위 선택 진단을 켠 실행에서 RViz 주행 궤적을 초기화합니다.
 
 ```bash
 rosservice call /trajectory/reset
@@ -442,8 +448,7 @@ docker exec -it custom-autorace-noetic bash
 
 ```bash
 cd /workspace
-source /opt/ros/noetic/setup.bash
-catkin_make
+./docker/build_workspace.sh
 source devel/setup.bash
 ```
 
@@ -459,20 +464,14 @@ rospack find amcl
 rosparam get /amcl/odom_model_type
 ```
 
-역할: AMCL, bringup, 카메라와 description 전체 테스트를 실행합니다.
+역할: 전체 workspace의 등록 시험을 실행하고 결과를 집계합니다.
 
 ```bash
 cd /workspace
-source /opt/ros/noetic/setup.bash
-catkin_make
+./docker/build_workspace.sh
 source devel/setup.bash
-catkin_make run_tests_amcl_gtest_amcl_odom_model_test \
-  run_tests_custom_autorace_bringup run_tests_turtlebot3_autorace_camera \
-  run_tests_custom_autorace_description
-catkin_test_results build/test_results/amcl
-catkin_test_results build/test_results/custom_autorace_bringup
-catkin_test_results build/test_results/turtlebot3_autorace_camera
-catkin_test_results build/test_results/custom_autorace_description
+catkin_make run_tests
+catkin_test_results build/test_results
 ```
 
 역할: 터널과 통합 launch 관련 회귀만 빠르게 실행합니다.

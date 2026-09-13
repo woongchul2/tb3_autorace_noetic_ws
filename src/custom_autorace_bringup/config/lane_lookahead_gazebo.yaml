@@ -1,18 +1,6 @@
 # Gazebo-only ground-truth oracle for the camera rolling-path benchmark.
 # This surveyed path is never used to calculate the robot command.
 lane_lookahead:
-  start:
-    # This complete rectangle was swept with the tracking and rectangular-
-    # footprint checks. Positions behind x=0.795 exceed the start-endpoint
-    # reserve when heading error is also present.
-    min_x: 0.795
-    max_x: 0.82
-    min_y: -1.765
-    max_y: -1.729
-    heading_deg: 0.0
-    heading_tolerance_deg: 5.0
-    maximum_pose_stamp_skew: 0.04
-
   # Editable geometry for a shortened or extended copy of this isolated
   # start-to-intersection course. The start anchor stays fixed. Change only
   # `length`, or pass straight_length:=... to the dedicated path benchmark.

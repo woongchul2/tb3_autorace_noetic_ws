@@ -204,17 +204,26 @@ class ObstaclePlannerTest(unittest.TestCase):
         )
         obstacle = np.asarray([[0.40, 0.0]])
         self.assertFalse(
-            self.checker.path_is_safe(
-                path, obstacle, self.right_line, self.left_line
-            )
+            self.checker.validator.validate_path(
+                path,
+                safety=self.checker.safety(
+                    obstacle,
+                    self.right_line,
+                    self.left_line,
+                    self.footprint,
+                ),
+            ).safe
         )
         self.assertTrue(
-            self.checker.path_is_safe(
+            self.checker.validator.validate_path(
                 path,
-                np.asarray([[0.40, 0.20]]),
-                self.right_line,
-                self.left_line,
-            )
+                safety=self.checker.safety(
+                    np.asarray([[0.40, 0.20]]),
+                    self.right_line,
+                    self.left_line,
+                    self.footprint,
+                ),
+            ).safe
         )
 
     def test_course_spline_is_fast_smooth_and_rectangularly_safe(self):
@@ -231,9 +240,15 @@ class ObstaclePlannerTest(unittest.TestCase):
         )
         self.assertIsNotNone(path)
         self.assertTrue(
-            self.checker.path_is_safe(
-                path, obstacles, self.right_line, self.left_line
-            )
+            self.checker.validator.validate_path(
+                path,
+                safety=self.checker.safety(
+                    obstacles,
+                    self.right_line,
+                    self.left_line,
+                    self.footprint,
+                ),
+            ).safe
         )
         self.assertLess(path.length, 2.30)
         self.assertLess(float(np.max(np.abs(path.curvature))), 6.30)
@@ -407,28 +422,24 @@ class ObstaclePlannerTest(unittest.TestCase):
         )
 
         for color, boundary in self.course_boundary_points().items():
-            self.assertTrue(
-                self.checker.path_is_safe(
-                    path,
+            result = self.checker.validator.validate_path(
+                path,
+                safety=self.checker.safety(
                     boundary,
                     -math.inf,
                     math.inf,
-                    footprint=boundary_footprint,
+                    boundary_footprint,
                 ),
+            )
+            self.assertTrue(
+                result.safe,
                 msg="rectangular sweep crosses the %s course line" % color,
             )
-            clearance, _ = self.checker.measure_path_clearance(
-                path,
-                boundary,
-                -math.inf,
-                math.inf,
-                footprint=boundary_footprint,
-            )
             self.assertGreaterEqual(
-                clearance,
+                result.minimum_obstacle_clearance,
                 spline.minimum_nominal_clearance,
                 msg="%s course-line clearance is %.6f m"
-                % (color, clearance),
+                % (color, result.minimum_obstacle_clearance),
             )
 
     def test_exit_bezier_is_heading_and_curvature_continuous_at_join(self):
@@ -661,18 +672,23 @@ class ObstaclePlannerTest(unittest.TestCase):
         middle_barrier = rectangle_surface_points(
             0.98, -0.1025, 0.10, 0.25, spacing=0.002
         )
-        rectangle_safe, obstacle_clearance, line_clearance = (
-            self.checker.pose_clearance(
-                0.98,
-                0.1375,
-                0.0,
+        result = self.checker.validator.validate_poses(
+            (Pose2D(0.98, 0.1375, 0.0),),
+            safety=self.checker.safety(
                 middle_barrier,
                 self.right_line,
                 self.left_line,
-            )
+                self.footprint,
+            ),
         )
-        self.assertTrue(rectangle_safe)
-        self.assertGreater(min(obstacle_clearance, line_clearance), 0.010)
+        self.assertTrue(result.safe)
+        self.assertGreater(
+            min(
+                result.minimum_obstacle_clearance,
+                result.minimum_line_clearance,
+            ),
+            0.010,
+        )
         self.assertLess(rectangle_required, free_gap)
         self.assertGreater(circle_required, free_gap)
 

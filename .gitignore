@@ -10,8 +10,6 @@
 # Runtime recordings and local analysis artifacts
 /diagnostics/
 /tmp/
-/official007_deadlock.png
-/%.6f
 *.bag
 *.bag.*
 *.active

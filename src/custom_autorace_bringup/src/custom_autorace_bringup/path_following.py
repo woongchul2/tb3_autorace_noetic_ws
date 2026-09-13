@@ -2022,15 +2022,6 @@ class ValidationResult:
     first_unsafe_distance: float = math.inf
     samples: int = 0
 
-    @property
-    def minimum_clearance(self):
-        return min(
-            self.minimum_line_clearance,
-            self.minimum_obstacle_clearance,
-            self.minimum_map_clearance,
-        )
-
-
 @dataclass(frozen=True)
 class SafetyDecision:
     """One runtime decision from nominal-route and complete-stop sweeps."""

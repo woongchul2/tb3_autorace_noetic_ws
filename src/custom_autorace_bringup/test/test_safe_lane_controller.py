@@ -878,11 +878,11 @@ class SafeLaneControllerTest(unittest.TestCase):
             forward, lateral
         )
 
-        connected_forward, connected_lateral = (
-            controller_module.connect_ego_to_lane_candidate(
-                forward, lateral, 0.005
-            )
+        connected_poses = controller_module.ego_connected_lane_poses(
+            forward, lateral, 0.005
         )
+        connected_forward = connected_poses[:, 0]
+        connected_lateral = connected_poses[:, 1]
 
         join = int(np.flatnonzero(np.isclose(connected_forward, 0.20))[0])
         self.assertAlmostEqual(connected_forward[0], 0.0)
@@ -901,9 +901,6 @@ class SafeLaneControllerTest(unittest.TestCase):
         )
         self.assertAlmostEqual(first_slope, 0.0, delta=0.02)
 
-        connected_poses = controller_module.ego_connected_lane_poses(
-            forward, lateral, 0.005
-        )
         pose_join = int(
             np.flatnonzero(np.isclose(connected_poses[:, 0], 0.20))[0]
         )

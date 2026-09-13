@@ -68,11 +68,6 @@ class PlannedPath:
     expanded_nodes: int
 
     @property
-    def heading(self):
-        """Compatibility alias used by the other AutoRace path utilities."""
-        return self.yaw
-
-    @property
     def length(self):
         if self.x.size < 2:
             return 0.0
@@ -251,10 +246,6 @@ class OccupancyGrid:
             0 <= int(grid_x) < self.width
             and 0 <= int(grid_y) < self.height
         )
-
-    def contains_world(self, x, y):
-        grid_x, grid_y = self.world_to_grid(x, y)
-        return self.contains_cell(grid_x, grid_y)
 
     def is_occupied_cell(self, grid_x, grid_y, inflation_radius=0.0):
         """Treat out-of-map cells as occupied."""

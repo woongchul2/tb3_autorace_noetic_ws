@@ -16,7 +16,7 @@
   <!-- Avoid competing odom -> base_footprint publishers. The raw Gazebo TF is
        only restored automatically when the EKF is explicitly disabled. -->
   <arg name="publish_raw_odom_tf" default="$(eval not arg('fuse_imu'))"/>
-  <arg name="publish_trajectories" default="true"/>
+  <arg name="publish_trajectories" default="false"/>
   <arg name="trajectory_max_points" default="20000"/>
 
   <env name="GAZEBO_RESOURCE_PATH" value="$(find turtlebot3_gazebo)/models/autorace/ground_picture"/>

@@ -13,10 +13,10 @@ footprint 통과까지 확인했다.
 
 - 오프라인 통합 판정: **22/22 PASS**, 실패 항목 0
 - 출발 명령부터 결승선 통과까지: **280.472 s**
-- 등록 시험: `custom_autorace_bringup` **504개**, 전체 workspace **557개**가 각각
+- 등록 시험: `custom_autorace_bringup` **505개**, 전체 workspace **558개**가 각각
   `0 errors`, `0 failures`, `0 skipped`로 통과
 
-여기서 `504/557`은 성공 비율이 아니라 패키지 범위와 전체 workspace 범위에서 실행한
+여기서 `505/558`은 성공 비율이 아니라 패키지 범위와 전체 workspace 범위에서 실행한
 두 테스트 모음의 개수다. 상세한 조건, 미션별 시간과 여유 값은
 [공통 경로 주행 구조 및 검증 기록](src/custom_autorace_bringup/PATH_FOLLOWING.md)을 따른다.
 
@@ -30,6 +30,8 @@ footprint 통과까지 확인했다.
 - [실물 하드웨어 파라미터](src/custom_autorace_description/HARDWARE_PARAMETERS.md):
   D405, Mid-360, OpenCR 기준값
 - [Upstream 출처](UPSTREAM_SOURCES.md): monorepo에 포함한 외부 소스의 기준 revision
+- [진단 자료 보존 기준](DIAGNOSTICS_RETENTION.md): 로컬 원시 기록과 요약 파일의
+  보존 범위
 - [작업 원칙](AGENTS.md): 구현 및 최종 검증 기준
 - [Notion 작성 규칙](NOTION_GUIDE.md): AutoRace 관련 Notion 문서 규칙
 

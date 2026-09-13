@@ -68,27 +68,6 @@ def is_inside_with_margin(signed_distance, inside_margin=0.0):
     return signed_distance >= max(0.0, float(inside_margin))
 
 
-def update_timed_confirmation(
-    count,
-    last_confirmation_time,
-    inside,
-    now,
-    minimum_interval,
-    maximum_gap,
-):
-    """Update a consecutive region count while rejecting bursts and stale gaps."""
-    if not inside:
-        return 0, None
-    if last_confirmation_time is None:
-        return 1, now
-    gap = now - last_confirmation_time
-    if gap < 0.0 or gap > maximum_gap:
-        return 1, now
-    if gap >= minimum_interval:
-        return count + 1, now
-    return count, last_confirmation_time
-
-
 class MissionZoneSequence:
     """Only activate the expected polygon in a configured mission sequence."""
 

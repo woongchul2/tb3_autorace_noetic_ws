@@ -8,8 +8,6 @@
 # projection_config:=/absolute/path/to/measured_d405_projection.yaml.
 calibration_status: unverified_template
 opencv_threads: 1
-input_width: 320
-input_height: 240
 
 center_x: 160.0
 top_x: 72.0
