@@ -1,0 +1,44 @@
+<?xml version='1.0'?>
+<sdf version="1.6">
+  <model name="traffic_bar_up">
+    <link name="traffic_bar_up">
+      <!-- Keep the course pose on the link: gazebo/spawn_sdf_model replaces a
+           model-level pose with its initial_pose argument. -->
+      <pose frame=''>-1.0 1.2 0.15 0 0 1.57</pose>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>0.3 0.02 0.05</size>
+          </box>
+        </geometry>
+      </collision>
+      <!-- Gazebo uses one horizontal ray at the Mid-360 origin, while the
+           hardware LaserScan aggregates a vertical point-cloud slice. This
+           thin invisible proxy preserves the physical 50 mm collision above
+           and gives both sensors the same closed-bar return. -->
+      <collision name="lidar_proxy">
+        <pose frame=''>0 0 0.04165 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.3 0.02 0.02</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>0.3 0.02 0.05</size>
+          </box>
+        </geometry>
+        <material>
+          <script>
+            <uri>model://turtlebot3_autorace_2020/traffic_bar_up/materials/scripts</uri>
+            <uri>model://turtlebot3_autorace_2020/traffic_bar_up/materials/textures</uri>
+            <name>traffic_bar_up</name>
+          </script>
+        </material>
+      </visual>
+    </link> 
+    <static>1</static>   
+  </model>
+</sdf>

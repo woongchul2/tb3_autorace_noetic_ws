@@ -1,0 +1,118 @@
+# Gazebo-only ground-truth oracle for the camera rolling-path benchmark.
+# This surveyed path is never used to calculate the robot command.
+lane_lookahead:
+  start:
+    # This complete rectangle was swept with the tracking and rectangular-
+    # footprint checks. Positions behind x=0.795 exceed the start-endpoint
+    # reserve when heading error is also present.
+    min_x: 0.795
+    max_x: 0.82
+    min_y: -1.765
+    max_y: -1.729
+    heading_deg: 0.0
+    heading_tolerance_deg: 5.0
+    maximum_pose_stamp_skew: 0.04
+
+  # Editable geometry for a shortened or extended copy of this isolated
+  # start-to-intersection course. The start anchor stays fixed. Change only
+  # `length`, or pass straight_length:=... to the dedicated path benchmark.
+  # The first four path knots are redistributed along this straight and every
+  # later lookahead knot plus the finish gate moves by the same length delta.
+  geometry:
+    straight:
+      start: [0.800000, -1.747000]
+      heading_deg: 0.0
+      reference_length: 0.600
+      length: 0.600
+      minimum_length: 0.200
+      # The fixed 4 m course canvas loses the outer white stripe beyond about
+      # 0.722 m even after a consistent texture warp.
+      maximum_length: 0.720
+      path_start_knot: 0
+      path_end_knot: 3
+      anchor_tolerance: 0.002
+
+  # This fixed benchmark finish is only the lane-approach timing plane. The
+  # mission observation polygon is tuned independently from integrated runs.
+  # The benchmark path continues 51 mm beyond this plane.
+  finish:
+    x: 1.55
+    min_y: -0.83
+    max_y: -0.57
+    minimum_station: 1.85
+    heading_deg: 180.0
+    heading_tolerance_deg: 30.0
+
+  footprint:
+    front: 0.067645
+    rear: 0.118073
+    half_width: 0.0903
+    validation_sample_spacing: 0.004
+
+  path:
+    start_heading_deg: 0.0
+    end_heading_deg: 180.0
+    sample_spacing: 0.002
+    # Three final straight knots shape the exit tangent. This exact length
+    # crops them after the full C2 spline has been sampled.
+    guide_tail_length: 0.30001137
+    # Surveyed centre path, shifted 12 mm toward the inside of both left bends
+    # to account for the rectangular footprint's swept outer corners.
+    knots:
+      - [0.800000, -1.747000]
+      - [1.000000, -1.744000]
+      - [1.200000, -1.739000]
+      - [1.400000, -1.736941]
+      - [1.585046, -1.722411]
+      - [1.657511, -1.680574]
+      - [1.711296, -1.616475]
+      - [1.739914, -1.537847]
+      - [1.743575, -1.496010]
+      - [1.743575, -1.300000]
+      - [1.743575, -1.100000]
+      - [1.744756, -1.002928]
+      - [1.729932, -0.918856]
+      - [1.687248, -0.844924]
+      - [1.621851, -0.790050]
+      - [1.541631, -0.760853]
+      - [1.498947, -0.757118]
+      - [1.398947, -0.757118]
+      - [1.298947, -0.757118]
+      - [1.198947, -0.757118]
+
+  texture:
+    package: turtlebot3_gazebo
+    relative_path: models/turtlebot3_autorace_2020/course/materials/textures/course.png
+    # A non-reference length is rejected while this exact stock image remains
+    # selected. The benchmark launch stages course_texture into Gazebo and
+    # gives that same file to the independent ground-truth checker.
+    reference_sha256: a551d2751c4973f5758b967c5c348d20d2ece96752dd0e6f1495f20f339b5871
+    course_size: 4.0
+    course_yaw: -3.14
+    expected_boundary_offset: 0.12
+    line_search_half_width: 0.08
+    boundary_step: 0.0005
+    projection_search_distance: 0.16
+    endpoint_extension: 0.14
+    color_threshold: 128
+    color_tolerance: 4
+    yellow_blue_maximum: 16
+
+  control:
+    # Speed fields are used only to annotate the fixed oracle path and verify
+    # that its curvature profile is dynamically feasible.
+    cruise_velocity: 0.22
+    minimum_velocity: 0.06
+    entry_velocity: 0.10
+    exit_velocity: 0.10
+    maximum_angular_velocity: 1.50
+    maximum_lateral_acceleration: 0.16
+    linear_acceleration: 0.20
+    linear_deceleration: 0.35
+    angular_acceleration: 2.50
+
+  safety:
+    maximum_nominal_inner_intrusion: 0.001
+    minimum_nominal_outer_reserve: 0.025
+    maximum_inner_intrusion: 0.016
+    minimum_outer_reserve: 0.005

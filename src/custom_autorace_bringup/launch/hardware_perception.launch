@@ -1,0 +1,92 @@
+<launch>
+  <!-- This launch consumes the one rectified stream produced by
+       realsense_d405.launch. It never starts another camera adapter and never
+       publishes cmd_vel. -->
+  <arg name="projection_config"
+       default="$(find custom_autorace_bringup)/config/d405_projection_uncalibrated.yaml"/>
+  <arg name="lane_detector_config"
+       default="$(find custom_autorace_bringup)/config/lane_detector_d405_uncalibrated.yaml"/>
+  <arg name="traffic_light_config"
+       default="$(find turtlebot3_autorace_detect)/param/traffic_light/traffic_light.yaml"/>
+  <arg name="sign_detector_config"
+       default="$(find custom_autorace_bringup)/config/sign_detector_d405.yaml"/>
+
+  <arg name="lane_process_every_n_frames" default="1"/>
+  <arg name="lane_temporal_state_every_n_frames" default="3"/>
+  <arg name="traffic_light_process_every_n_frames" default="1"/>
+  <arg name="traffic_light_processing_rate_hz" default="30.0"/>
+  <arg name="sign_process_every_n_frames" default="1"/>
+  <arg name="sign_debug_every_n_frames" default="3"/>
+
+  <group ns="camera">
+    <node pkg="turtlebot3_autorace_camera" type="image_projection"
+          name="image_projection" output="screen">
+      <rosparam command="load" file="$(arg projection_config)"/>
+      <param name="is_extrinsic_camera_calibration_mode" value="false"/>
+      <param name="input_image_type" value="raw"/>
+      <param name="input_topic" value="/camera/image_rect_color"/>
+      <param name="output_image_type" value="raw"/>
+      <param name="output_topic" value="/camera/image_projected"/>
+    </node>
+
+    <node pkg="turtlebot3_autorace_camera" type="image_compensation"
+          name="image_compensation_projection" output="screen">
+      <param name="is_extrinsic_camera_calibration_mode" value="false"/>
+      <param name="input_image_type" value="raw"/>
+      <param name="input_topic" value="/camera/image_projected"/>
+      <param name="output_topic" value="/camera/image_projected_compensated"/>
+      <param name="clip_hist_percent" value="1.0"/>
+    </node>
+  </group>
+
+  <!-- One lane detector creates the scalar lane result, both colour
+       boundaries and the near/mid/far centreline from the same masks. -->
+  <node pkg="turtlebot3_autorace_detect" type="detect_lane"
+        name="detect_lane" output="screen">
+    <rosparam command="load" file="$(arg lane_detector_config)"/>
+    <param name="is_detection_calibration_mode" value="false"/>
+    <param name="process_every_n_frames"
+           value="$(arg lane_process_every_n_frames)"/>
+    <param name="temporal_state_every_n_frames"
+           value="$(arg lane_temporal_state_every_n_frames)"/>
+    <remap from="/detect/image_input"
+           to="/camera/image_projected_compensated"/>
+    <remap from="/detect/image_input/compressed"
+           to="/camera/image_projected_compensated/compressed"/>
+    <remap from="/detect/image_output" to="/detect/image_lane"/>
+    <remap from="/detect/image_output/compressed"
+           to="/detect/image_lane/compressed"/>
+    <remap from="/detect/image_output_sub1"
+           to="/detect/image_white_lane_marker"/>
+    <remap from="/detect/image_output_sub1/compressed"
+           to="/detect/image_white_lane_marker/compressed"/>
+    <remap from="/detect/image_output_sub2"
+           to="/detect/image_yellow_lane_marker"/>
+    <remap from="/detect/image_output_sub2/compressed"
+           to="/detect/image_yellow_lane_marker/compressed"/>
+  </node>
+
+  <node pkg="turtlebot3_autorace_detect" type="detect_traffic_light"
+        name="detect_traffic_light" output="screen">
+    <rosparam command="load" file="$(arg traffic_light_config)"/>
+    <param name="is_detection_calibration_mode" value="false"/>
+    <param name="process_every_n_frames"
+           value="$(arg traffic_light_process_every_n_frames)"/>
+    <param name="processing_rate_hz"
+           value="$(arg traffic_light_processing_rate_hz)"/>
+    <remap from="/detect/image_input/compressed"
+           to="/camera/image_rect_color/compressed"/>
+    <remap from="/detect/image_output" to="/detect/image_traffic_light"/>
+    <remap from="/detect/image_output/compressed"
+           to="/detect/image_traffic_light/compressed"/>
+  </node>
+
+  <node pkg="custom_autorace_bringup" type="sign_detector.py"
+        name="sign_detector" output="screen">
+    <rosparam command="load" file="$(arg sign_detector_config)"/>
+    <param name="sign_detector/process_every_n_frames"
+           value="$(arg sign_process_every_n_frames)"/>
+    <param name="sign_detector/debug_every_n_frames"
+           value="$(arg sign_debug_every_n_frames)"/>
+  </node>
+</launch>

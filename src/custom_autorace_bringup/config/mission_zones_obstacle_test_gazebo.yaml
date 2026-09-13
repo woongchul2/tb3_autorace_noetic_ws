@@ -1,0 +1,29 @@
+# Gazebo regression profile for starting directly before the construction zone.
+# This deliberately contains only the obstacle mission; normal races use
+# mission_zones_gazebo.yaml and retain intersection -> obstacle -> parking.
+
+pose:
+  map_frame: map
+  base_frame: base_footprint
+  transform_timeout: 0.03
+
+zone:
+  enter_margin: 0.03
+  signal_period: 0.20
+
+sequence: [obstacle]
+
+missions:
+  obstacle:
+    polygon:
+      - [1.28, -0.10]
+      - [2.00, -0.10]
+      - [2.00, 1.60]
+      - [1.28, 1.60]
+    gate_topic: /mission/enable/obstacle
+    inside_topic: /mission/inside/obstacle
+    # Fixed yaw-180 exit: half_width 0.0903 + line margin 0.009 + AMCL margin.
+    clearance_margin: 0.11
+    clearance_topic: /mission/clear/obstacle
+    completion_topic: /obstacle/state
+    completion_values: [COMPLETE]

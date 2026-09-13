@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>custom_autorace_bringup</name>
+  <version>0.1.0</version>
+  <description>Hardware bringup for OpenCR, RealSense D405 and Livox Mid-360.</description>
+  <maintainer email="user@example.com">AutoRace Team</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>cv_bridge</depend>
+  <depend>custom_autorace_description</depend>
+  <exec_depend>gazebo_msgs</exec_depend>
+  <depend>geometry_msgs</depend>
+  <exec_depend>amcl</exec_depend>
+  <build_depend>message_generation</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+  <depend>nav_msgs</depend>
+  <exec_depend>map_server</exec_depend>
+  <depend>livox_ros_driver2</depend>
+  <depend>pointcloud_to_laserscan</depend>
+  <exec_depend>python3-rospkg</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <test_depend>python3-pil</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <depend>realsense2_camera</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>rosserial_python</depend>
+  <exec_depend>rosgraph</exec_depend>
+  <depend>rospy</depend>
+  <exec_depend>rviz</exec_depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <depend>turtlebot3_autorace_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <exec_depend>turtlebot3_autorace_camera</exec_depend>
+  <exec_depend>turtlebot3_autorace_core</exec_depend>
+  <exec_depend>turtlebot3_autorace_detect</exec_depend>
+  <exec_depend>turtlebot3_gazebo</exec_depend>
+</package>

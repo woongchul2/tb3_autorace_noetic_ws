@@ -1,0 +1,55 @@
+# Planar encoder + IMU fusion for Gazebo.
+#
+# The wheel forward-velocity covariance is supplied by encoder_covariance_adapter.
+# The IMU covariance is derived from imu_gaussian_noise in robot_parameters.xacro.
+# Only planar pose/yaw information is fused; linear acceleration is intentionally
+# excluded because integrating it causes rapid drift without additional sensors.
+
+frequency: 30
+sensor_timeout: 0.2
+two_d_mode: true
+transform_time_offset: 0.0
+transform_timeout: 0.0
+print_diagnostics: true
+debug: false
+dynamic_process_noise_covariance: true
+
+# This is the single odom -> base_footprint TF authority while the EKF runs.
+publish_tf: true
+publish_acceleration: false
+
+map_frame: map
+odom_frame: odom
+base_link_frame: base_footprint
+world_frame: odom
+
+odom0: /odom/encoder_with_covariance
+odom0_config: [false, false, false,
+               false, false, false,
+               true,  true,  false,
+               false, false, false,
+               false, false, false]
+odom0_queue_size: 10
+odom0_nodelay: true
+odom0_differential: false
+odom0_relative: false
+
+imu0: /imu
+imu0_config: [false, false, false,
+              false, false, true,
+              false, false, false,
+              false, false, true,
+              false, false, false]
+imu0_queue_size: 20
+imu0_nodelay: true
+imu0_differential: false
+# The Gazebo IMU orientation is expressed in the world frame. Making it relative
+# removes the robot's arbitrary spawn yaw before it is fused with odom yaw.
+imu0_relative: true
+imu0_remove_gravitational_acceleration: true
+
+# Reject isolated simulation spikes instead of allowing one sample to rotate the
+# complete filtered trajectory.
+odom0_pose_rejection_threshold: 5.0
+imu0_pose_rejection_threshold: 5.0
+imu0_twist_rejection_threshold: 5.0

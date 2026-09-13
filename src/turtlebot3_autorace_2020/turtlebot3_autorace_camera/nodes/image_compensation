@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+
+# Author: Leon Jung
+
+import cv2
+import numpy as np
+import rospy
+from cv_bridge import CvBridge, CvBridgeError
+from dynamic_reconfigure.server import Server
+from sensor_msgs.msg import CompressedImage, Image
+from turtlebot3_autorace_camera.cfg import ImageCompensationParamsConfig
+
+
+def _compensation_param(name, default):
+    """Read the flat runtime parameter before the legacy calibration tree."""
+    flat_name = "~{}".format(name)
+    if rospy.has_param(flat_name):
+        return rospy.get_param(flat_name)
+    legacy_name = "~camera/extrinsic_camera_calibration/{}".format(name)
+    return rospy.get_param(legacy_name, default)
+
+
+class ImageCompensation:
+    RAW_IMAGE_BUFFER_SIZE = 1 << 24
+
+    def __init__(self):
+        self.cvBridge = CvBridge()
+        self.opencv_threads = max(
+            1, int(rospy.get_param("~opencv_threads", 1))
+        )
+        cv2.setNumThreads(self.opencv_threads)
+        self.clip_hist_percent = float(
+            _compensation_param("clip_hist_percent", 1.0)
+        )
+        self.is_calibration_mode = bool(
+            rospy.get_param(
+                "~is_extrinsic_camera_calibration_mode",
+                rospy.get_param("/is_extrinsic_camera_calibration_mode", False),
+            )
+        )
+
+        input_topic = rospy.get_param(
+            "~input_topic", "/camera/image_input/compressed"
+        )
+        self.input_image_type = str(
+            rospy.get_param("~input_image_type", "compressed")
+        ).strip().lower()
+        if self.input_image_type not in ("compressed", "raw"):
+            raise rospy.ROSInitException(
+                "input_image_type must be 'compressed' or 'raw'"
+            )
+        output_topic = rospy.get_param("~output_topic", "/camera/image_output")
+
+        self.pub_image_compensated = rospy.Publisher(
+            output_topic, Image, queue_size=1
+        )
+        if self.is_calibration_mode:
+            self.reconfigure_server = Server(
+                ImageCompensationParamsConfig,
+                self.cbGetImageCompensationParam,
+            )
+
+        self.sub_image_original = rospy.Subscriber(
+            input_topic,
+            Image if self.input_image_type == "raw" else CompressedImage,
+            self.cbImageCompensation,
+            queue_size=1,
+            buff_size=self.RAW_IMAGE_BUFFER_SIZE,
+            tcp_nodelay=True,
+        )
+
+    def cbGetImageCompensationParam(self, config, level):
+        rospy.loginfo(
+            "[Image Compensation] clip_hist_percent=%.3f",
+            config.clip_hist_percent,
+        )
+        self.clip_hist_percent = float(config.clip_hist_percent)
+        return config
+
+    def _clipped_range(self, gray):
+        if self.clip_hist_percent <= 0.0:
+            minimum, maximum, _, _ = cv2.minMaxLoc(gray)
+            return int(minimum), int(maximum)
+
+        histogram = cv2.calcHist([gray], [0], None, [256], [0, 256])
+        cumulative = np.cumsum(histogram).reshape(-1)
+        total = float(cumulative[-1])
+        if total <= 0.0:
+            return 0, 0
+
+        clipped_each_side = total * self.clip_hist_percent / 200.0
+        minimum = int(
+            np.searchsorted(cumulative, clipped_each_side, side="left")
+        )
+        maximum = int(
+            np.searchsorted(
+                cumulative,
+                total - clipped_each_side,
+                side="left",
+            )
+        )
+        return min(255, minimum), min(255, maximum)
+
+    def _compensate_image(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        min_gray, max_gray = self._clipped_range(gray)
+        if max_gray <= min_gray:
+            return np.copy(image)
+
+        alpha = 255.0 / float(max_gray - min_gray)
+        beta = -float(min_gray) * alpha
+        return cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+
+    def cbImageCompensation(self, msg_img):
+        if self.input_image_type == "raw":
+            try:
+                image = self.cvBridge.imgmsg_to_cv2(
+                    msg_img, desired_encoding="bgr8"
+                )
+            except CvBridgeError as error:
+                rospy.logwarn_throttle(
+                    5.0, "Could not read raw projected camera image: %s", error
+                )
+                return
+        else:
+            encoded = np.frombuffer(msg_img.data, dtype=np.uint8)
+            if encoded.size == 0:
+                rospy.logwarn_throttle(
+                    5.0, "Could not decode projected camera image"
+                )
+                return
+            image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            if image is None:
+                rospy.logwarn_throttle(
+                    5.0, "Could not decode projected camera image"
+                )
+                return
+
+        compensated_msg = self.cvBridge.cv2_to_imgmsg(
+            self._compensate_image(image), encoding="bgr8"
+        )
+        compensated_msg.header = msg_img.header
+        self.pub_image_compensated.publish(compensated_msg)
+
+    def main(self):
+        rospy.spin()
+
+
+if __name__ == "__main__":
+    rospy.init_node("image_compensation")
+    node = ImageCompensation()
+    node.main()

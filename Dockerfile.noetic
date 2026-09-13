@@ -1,0 +1,82 @@
+FROM osrf/ros:noetic-desktop-full
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG USER_NAME=ros
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+ARG REALSENSE_VERSION=2.55.1
+
+SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      git \
+      libapr1-dev \
+      libssl-dev \
+      libudev-dev \
+      libusb-1.0-0-dev \
+      pkg-config \
+      python3-catkin-tools \
+      python3-numpy \
+      python3-opencv \
+      python3-pip \
+      python3-rosdep \
+      ros-noetic-amcl \
+      ros-noetic-ddynamic-reconfigure \
+      ros-noetic-hls-lfcd-lds-driver \
+      ros-noetic-map-server \
+      ros-noetic-move-base \
+      ros-noetic-move-base-msgs \
+      ros-noetic-pointcloud-to-laserscan \
+      ros-noetic-robot-localization \
+      ros-noetic-rosserial-python \
+      sudo \
+      udev \
+      usbutils \
+      v4l-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Noetic APT ships librealsense 2.50.0, while D405 support starts at 2.51.1.
+# Build a known D405-capable SDK and use the libusb backend so the Ubuntu 24.04
+# host kernel does not need the librealsense kernel patch.
+RUN git clone --depth 1 --branch "v${REALSENSE_VERSION}" \
+      https://github.com/realsenseai/librealsense.git /tmp/librealsense \
+    && cmake -S /tmp/librealsense -B /tmp/librealsense/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_EXAMPLES=OFF \
+      -DBUILD_GRAPHICAL_EXAMPLES=OFF \
+      -DBUILD_PYTHON_BINDINGS=OFF \
+      -DBUILD_TOOLS=OFF \
+      -DFORCE_RSUSB_BACKEND=ON \
+    && cmake --build /tmp/librealsense/build --parallel 2 \
+    && cmake --install /tmp/librealsense/build \
+    && ldconfig \
+    && rm -rf /tmp/librealsense
+
+RUN git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git /tmp/Livox-SDK2 \
+    && cmake -S /tmp/Livox-SDK2 -B /tmp/Livox-SDK2/build \
+    && cmake --build /tmp/Livox-SDK2/build --parallel \
+    && cmake --install /tmp/Livox-SDK2/build \
+    && rm -rf /tmp/Livox-SDK2
+
+RUN existing_group="$(getent group "${GROUP_ID}" | cut -d: -f1)"; \
+    if [ -z "${existing_group}" ]; then \
+      groupadd --gid "${GROUP_ID}" "${USER_NAME}"; \
+      existing_group="${USER_NAME}"; \
+    fi; \
+    useradd --uid "${USER_ID}" --gid "${existing_group}" --create-home --shell /bin/bash "${USER_NAME}"; \
+    usermod -aG dialout,video,plugdev,sudo "${USER_NAME}"; \
+    echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}"; \
+    chmod 0440 "/etc/sudoers.d/${USER_NAME}"
+
+COPY docker/noetic_entrypoint.sh /noetic_entrypoint.sh
+RUN chmod +x /noetic_entrypoint.sh
+
+USER ${USER_NAME}
+RUN rosdep update --rosdistro noetic
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/noetic_entrypoint.sh"]
+CMD ["bash"]

@@ -1,0 +1,235 @@
+# Gazebo-only zigzag route measured from the 4 m course texture. Hardware must
+# use a separately surveyed path, boundaries, footprint and odometry profile.
+zigzag:
+  topics:
+    odometry: /odom
+    scan: /scan_mid360_raw
+    map_pose: /mission/map_pose
+    zone_gate: /mission/enable/zigzag
+    lane_boundaries: /detect/lane_boundaries
+    manual_stop: /control/manual_stop
+    cmd_vel: /cmd_vel
+    lane_speed_limit: /control/max_vel
+    lane_control_service: /control/lane_mission_handoff
+    lane_stop_service: /control/lane_following
+
+  # Gazebo /odom is the world frame used to survey the texture path. AMCL still
+  # owns ordered mission gating, but a localization correction must not shift
+  # this millimetre-clearance route. Hardware profiles normally set this false.
+  route:
+    odom_aligned: true
+    frame_id: odom
+
+  # The ordered gate may open anywhere along the straight lead-in. Acquisition
+  # projects the current pose onto the remaining path instead of requiring a
+  # fixed map-coordinate rectangle.
+  start:
+    maximum_path_error: 0.018
+    maximum_join_heading_error_deg: 7.0
+    maximum_pose_stamp_skew: 0.04
+
+  scan:
+    # /scan_mid360_raw is expressed at base_scan. Every accepted return is
+    # frozen in odom with an SE(2)-interpolated pose bracketed around the scan
+    # source timestamp. A scan received before its right bracket is held in a
+    # bounded queue; the current pose is never substituted.
+    frame_id: base_scan
+    maximum_range: 1.0
+    maximum_pose_stamp_skew: 0.04
+    odom_history_duration: 1.0
+    pending_scan_limit: 4
+    # base_scan origin in custom_autorace_description/robot_parameters.xacro.
+    lidar_x: -0.033073
+    lidar_y: 0.0
+    lidar_yaw: 0.0
+
+  footprint:
+    front: 0.067645
+    rear: 0.118073
+    half_width: 0.0903
+    validation_sample_spacing: 0.004
+    line_margin: 0.0
+    obstacle_margin: 0.009
+    localization_error: 0.0005
+    tracking_error: 0.0005
+    sweep_translation_step: 0.002
+    sweep_heading_step_deg: 1.0
+
+  validation:
+    # The asymmetric Burger footprint cannot pass both sharp texture corners
+    # without entering the inner paint (the configuration space disconnects
+    # near x=-0.525). The established spline remains the executable route, so
+    # the inner edge is not a blocking boundary. The outer paint edge and
+    # LiDAR obstacle contact remain blocking conditions in the common swept
+    # validator.
+    inner_paint_blocking: false
+
+  path:
+    start_heading_deg: 180.0
+    end_heading_deg: 180.0
+    sample_spacing: 0.002
+    # A short final guide tail makes the driven endpoint nearly straight. It
+    # shapes the spline but is cropped before the speed profile is generated.
+    guide_tail_length: 0.125
+    maximum_curvature: 5.10
+    # C2 clamped spline knots in the Gazebo map frame. The path starts before
+    # the parking completion window and ends where both exit lines remain in
+    # view, on the straight before the U-turn.
+    knots:
+      - [0.432700, 1.750000]
+      - [0.232700, 1.750000]
+      - [0.032700, 1.750000]
+      - [-0.067300, 1.759880]
+      - [-0.167300, 1.753857]
+      - [-0.247300, 1.738567]
+      - [-0.317300, 1.713767]
+      - [-0.367300, 1.693063]
+      - [-0.417300, 1.674784]
+      - [-0.467300, 1.663066]
+      - [-0.517300, 1.661624]
+      - [-0.567300, 1.670939]
+      - [-0.667300, 1.709365]
+      - [-0.767300, 1.759199]
+      - [-0.867300, 1.807755]
+      - [-0.967300, 1.840691]
+      - [-1.017300, 1.846416]
+      - [-1.067300, 1.842639]
+      - [-1.167300, 1.806374]
+      - [-1.247300, 1.771363]
+      - [-1.317300, 1.750586]
+      - [-1.417300, 1.750000]
+      # Geometry-only tail; guide_tail_length removes it from the driven path.
+      - [-1.517300, 1.750000]
+
+  # Sparse yellow/white stripe references used as a secondary map-y guard and
+  # to select the intended paint runs in course.png.
+  corridor:
+    # These surveyed inner edges remain diagnostic references. The validation
+    # policy above controls whether their crossing is a stop condition.
+    lower_boundary:
+      - [0.650000, 1.630000]
+      - [0.305104, 1.625488]
+      - [0.074309, 1.641249]
+      - [-0.117998, 1.640943]
+      - [-0.233383, 1.640759]
+      - [-0.310241, 1.600314]
+      - [-0.387113, 1.567934]
+      - [-0.463972, 1.527489]
+      - [-0.502408, 1.511299]
+      - [-0.540895, 1.527366]
+      - [-0.617882, 1.567566]
+      - [-0.694869, 1.607766]
+      - [-0.771856, 1.647966]
+      - [-0.848844, 1.688166]
+      - [-0.925818, 1.720302]
+      - [-1.002805, 1.760502]
+      - [-1.079664, 1.720057]
+      - [-1.156536, 1.687676]
+      - [-1.233394, 1.647231]
+      - [-1.271843, 1.639106]
+      - [-1.387215, 1.630857]
+      - [-1.464138, 1.630735]
+      - [-1.541060, 1.630612]
+      - [-1.650000, 1.540000]
+    upper_boundary:
+      - [0.650000, 1.867700]
+      - [0.304719, 1.867423]
+      - [0.073950, 1.867056]
+      - [-0.118358, 1.866749]
+      - [-0.233742, 1.866566]
+      - [-0.310614, 1.834185]
+      - [-0.387486, 1.801805]
+      - [-0.464357, 1.769424]
+      - [-0.502819, 1.769363]
+      - [-0.541280, 1.769301]
+      - [-0.618254, 1.801437]
+      - [-0.695242, 1.841637]
+      - [-0.772216, 1.873773]
+      - [-0.849203, 1.913973]
+      - [-0.926190, 1.954173]
+      - [-1.003165, 1.986308]
+      - [-1.080036, 1.953928]
+      - [-1.156895, 1.913482]
+      - [-1.233754, 1.873037]
+      - [-1.272203, 1.864912]
+      - [-1.387587, 1.864728]
+      - [-1.464510, 1.864605]
+      - [-1.541433, 1.864483]
+      - [-1.650000, 1.820000]
+
+  # The sparse curves above only select the intended stripes. This Gazebo
+  # guard extracts the real inner and outer paint edges from course.png. Both
+  # are measured; the validation policy above decides which edge can stop the
+  # established route.
+  texture:
+    enabled: true
+    package: turtlebot3_gazebo
+    relative_path: models/turtlebot3_autorace_2020/course/materials/textures/course.png
+    course_size: 4.0
+    course_yaw: -3.14
+    boundary_min_x: -1.58
+    boundary_max_x: 0.38
+    boundary_x_step: 0.002
+    boundary_y_step: 0.0005
+    line_search_half_width: 0.080
+    color_threshold: 128
+    color_tolerance: 4
+    yellow_blue_maximum: 16
+    # The outer paint edge itself is the blocking map boundary. Localization
+    # and tracking uncertainty are already applied by the common validator's
+    # expanded footprint, so no second distance margin is added here.
+    minimum_outer_reserve: 0.000
+    prediction_reaction_time: 0.10
+    prediction_distance_margin: 0.005
+
+  control:
+    period: 0.05
+    # Match the verified parking handoff speed on the westbound straight.
+    # The path profile below still applies its own lower curvature speeds.
+    entry_velocity_cap: 0.10
+    lane_resume_max_velocity: 0.30
+    cruise_velocity: 0.14
+    minimum_velocity: 0.05
+    entry_velocity: 0.06
+    exit_velocity: 0.07
+    maximum_angular_velocity: 0.80
+    maximum_lateral_acceleration: 0.035
+    linear_acceleration: 0.04
+    linear_deceleration: 0.12
+    angular_acceleration: 0.80
+    lookahead_distance: 0.065
+    heading_gain: 0.35
+    path_curvature_weight: 0.25
+    lateral_feedback_gain: 1.0
+    # 0.15 m exceeds the 0.102 m reaction-plus-full-stop horizon at the
+    # configured 0.14 m/s maximum.  A longer per-tick sweep delayed odometry
+    # callbacks without adding reachable-area coverage.
+    nearest_search_ahead: 0.15
+
+  exit:
+    handoff_remaining_distance: 0.005
+    confirmation_lead_distance: 0.030
+    position_tolerance: 0.050
+    heading_tolerance_deg: 10.0
+    boundary_timeout: 0.35
+    lane_width_min: 450.0
+    lane_width_max: 820.0
+    image_center: 500.0
+    # Same one-boundary centre estimate used by detect_lane.make_lane().
+    single_line_center_offset: 320.0
+    lane_center_tolerance: 180.0
+    # 6 frames at 30 Hz preserves the former 2-frame/10 Hz confirmation.
+    confirmation_frames: 6
+    confirmation_max_gap: 0.20
+    join_velocity_cap: 0.07
+    join_minimum_distance: 0.035
+    join_confirmation_frames: 6
+    join_timeout: 1.5
+
+  timeouts:
+    map_pose: 0.35
+    odometry: 0.35
+    scan: 0.35
+    acquisition: 2.0
+    mission: 30.0
+    exit_confirmation: 2.0

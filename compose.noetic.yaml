@@ -1,0 +1,27 @@
+services:
+  autorace:
+    build:
+      context: .
+      dockerfile: Dockerfile.noetic
+      args:
+        USER_ID: ${LOCAL_UID:-1000}
+        GROUP_ID: ${LOCAL_GID:-1000}
+    image: custom-autorace:noetic
+    container_name: custom-autorace-noetic
+    network_mode: host
+    ipc: host
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: ${DISPLAY:-:0}
+      QT_X11_NO_MITSHM: "1"
+      TURTLEBOT3_MODEL: burger
+      ROS_MASTER_URI: ${ROS_MASTER_URI:-http://127.0.0.1:11311}
+      ROS_IP: ${ROS_IP:-127.0.0.1}
+    volumes:
+      - .:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    group_add:
+      - ${DIALOUT_GID:-20}
+      - ${VIDEO_GID:-44}
+      - ${PLUGDEV_GID:-46}

@@ -1,0 +1,887 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+
+# Authors: Leon Jung, Gilbert, Ashe Kim, Special Thanks : Roger Sacchelli
+
+import rospy
+import numpy as np
+import cv2
+from cv_bridge import CvBridge
+from std_msgs.msg import UInt8, Float64, Float64MultiArray
+from sensor_msgs.msg import Image, CompressedImage
+from dynamic_reconfigure.server import Server
+from turtlebot3_autorace_detect.cfg import DetectLaneParamsConfig
+from turtlebot3_autorace_msgs.msg import LaneCenterline
+
+class DetectLane():
+    RAW_IMAGE_BUFFER_SIZE = 1 << 24
+
+    def __init__(self):
+        self.opencv_threads = max(
+            1, int(rospy.get_param("~opencv_threads", 1)))
+        cv2.setNumThreads(self.opencv_threads)
+        self.hue_white_l = rospy.get_param("~detect/lane/white/hue_l", 0)
+        self.hue_white_h = rospy.get_param("~detect/lane/white/hue_h", 179)
+        self.saturation_white_l = rospy.get_param("~detect/lane/white/saturation_l", 0)
+        self.saturation_white_h = rospy.get_param("~detect/lane/white/saturation_h", 70)
+        self.lightness_white_l = rospy.get_param("~detect/lane/white/lightness_l", 105)
+        self.lightness_white_h = rospy.get_param("~detect/lane/white/lightness_h", 255)
+
+        self.hue_yellow_l = rospy.get_param("~detect/lane/yellow/hue_l", 10)
+        self.hue_yellow_h = rospy.get_param("~detect/lane/yellow/hue_h", 127)
+        self.saturation_yellow_l = rospy.get_param("~detect/lane/yellow/saturation_l", 70)
+        self.saturation_yellow_h = rospy.get_param("~detect/lane/yellow/saturation_h", 255)
+        self.lightness_yellow_l = rospy.get_param("~detect/lane/yellow/lightness_l", 95)
+        self.lightness_yellow_h = rospy.get_param("~detect/lane/yellow/lightness_h", 255)
+
+        self.is_calibration_mode = rospy.get_param("~is_detection_calibration_mode", False)
+        if self.is_calibration_mode == True:
+            srv_detect_lane = Server(DetectLaneParamsConfig, self.cbGetDetectLaneParam)
+
+        self.sub_image_type = "raw"         # you can choose image type "compressed", "raw"
+        self.pub_image_type = "compressed"  # you can choose image type "compressed", "raw"
+        self.process_every_n_frames = max(
+            1, int(rospy.get_param("~process_every_n_frames", 1)))
+        # Detection runs on every 30 Hz frame, while the original adaptive HSV
+        # thresholds and reliability integrators intentionally keep their
+        # former 10 Hz time constant.
+        self.temporal_state_every_n_frames = max(
+            1, int(rospy.get_param("~temporal_state_every_n_frames", 3)))
+        self.temporal_state_counter = 0
+        self.update_temporal_state = False
+        # The annotated JPEG is observational only.  Keep control outputs on
+        # every input frame, but bound the expensive overlay/JPEG work when a
+        # recorder or dashboard subscribes to the debug image.
+        # Zero disables action-mode debug output. Calibration mode still
+        # renders every frame below, regardless of this value.
+        self.debug_every_n_frames = max(
+            0, int(rospy.get_param("~debug_every_n_frames", 0)))
+        self.debug_frame_counter = 0
+
+        if self.sub_image_type == "compressed":
+            # subscribes compressed image
+            self.sub_image_original = rospy.Subscriber('/detect/image_input/compressed', CompressedImage, self.cbFindLane, queue_size=1, buff_size=self.RAW_IMAGE_BUFFER_SIZE, tcp_nodelay=True)
+        elif self.sub_image_type == "raw":
+            # subscribes raw image
+            self.sub_image_original = rospy.Subscriber('/detect/image_input', Image, self.cbFindLane, queue_size=1, buff_size=self.RAW_IMAGE_BUFFER_SIZE, tcp_nodelay=True)
+
+        if self.pub_image_type == "compressed":
+            # publishes lane image in compressed type 
+            self.pub_image_lane = rospy.Publisher('/detect/image_output/compressed', CompressedImage, queue_size = 1)
+        elif self.pub_image_type == "raw":
+            # publishes lane image in raw type
+            self.pub_image_lane = rospy.Publisher('/detect/image_output', Image, queue_size = 1)
+
+        if self.is_calibration_mode == True:
+            if self.pub_image_type == "compressed":
+                # publishes lane image in compressed type 
+                self.pub_image_white_lane = rospy.Publisher('/detect/image_output_sub1/compressed', CompressedImage, queue_size = 1)
+                self.pub_image_yellow_lane = rospy.Publisher('/detect/image_output_sub2/compressed', CompressedImage, queue_size = 1)
+            elif self.pub_image_type == "raw":
+                # publishes lane image in raw type
+                self.pub_image_white_lane = rospy.Publisher('/detect/image_output_sub1', Image, queue_size = 1)
+                self.pub_image_yellow_lane = rospy.Publisher('/detect/image_output_sub2', Image, queue_size = 1)
+
+        self.pub_lane = rospy.Publisher('/detect/lane', Float64, queue_size = 1)
+
+        # Publish same-frame yellow/white boundary measurements from the masks
+        # already computed here. Downstream controllers must not threshold the
+        # same camera image a second time.
+        self.boundary_output_topic = rospy.get_param(
+            "~boundary/output_topic", "/detect/lane_boundaries")
+        self.boundary_sample_y = int(rospy.get_param(
+            "~boundary/sample_y", 350))
+        self.boundary_band_height = max(1, int(rospy.get_param(
+            "~boundary/band_height", 50)))
+        self.boundary_minimum_pixels = max(1, int(rospy.get_param(
+            "~boundary/minimum_pixels", 100)))
+        self.minimum_lane_pixels = max(3, int(rospy.get_param(
+            "~minimum_lane_pixels", 3000)))
+        self.fit_history_length = max(1, int(rospy.get_param(
+            "~fit_history_length", 5)))
+        self.pub_lane_boundaries = rospy.Publisher(
+            self.boundary_output_topic, Float64MultiArray, queue_size=1)
+
+        # Publish a short, camera-relative centreline without thresholding the
+        # image again. Rows are ordered from the bottom (near) to the top (far).
+        # A fitted point is emitted only when its own mask has local support, so
+        # the polynomial is never extrapolated through an unseen image region.
+        configured_rows = rospy.get_param(
+            "~centerline/sample_rows", [552, 480, 400, 320, 240, 160, 80, 0])
+        try:
+            self.centerline_sample_rows = sorted(
+                set(
+                    [self.boundary_sample_y]
+                    + [int(round(float(row))) for row in configured_rows]
+                ),
+                reverse=True)
+        except (TypeError, ValueError):
+            rospy.logwarn(
+                "Invalid centerline/sample_rows; using the built-in near-to-far rows")
+            self.centerline_sample_rows = [552, 480, 400, 320, 240, 160, 80, 0]
+        self.centerline_support_half_height = max(1, int(rospy.get_param(
+            "~centerline/support_half_height", 12)))
+        self.centerline_support_half_width = max(1, int(rospy.get_param(
+            "~centerline/support_half_width", 40)))
+        self.centerline_minimum_support_pixels = max(1, int(rospy.get_param(
+            "~centerline/minimum_support_pixels", 20)))
+        # Trace one current-frame, 8-connected painted branch from near to far.
+        # One short mask break may be reconnected, but a distant component is
+        # never allowed to reappear after the active branch has ended.
+        self.centerline_branch_maximum_gap_bands = max(0, int(rospy.get_param(
+            "~centerline/branch_maximum_gap_bands", 1)))
+        self.centerline_branch_maximum_innovation = max(1.0, float(
+            rospy.get_param(
+                "~centerline/branch_maximum_innovation_pixels", 80.0)))
+        self.centerline_branch_reversal_maximum_innovation = max(
+            1.0,
+            min(
+                self.centerline_branch_maximum_innovation,
+                float(rospy.get_param(
+                    "~centerline/branch_reversal_maximum_innovation_pixels",
+                    60.0)),
+            ),
+        )
+        self.centerline_lane_half_width = max(1.0, float(rospy.get_param(
+            "~centerline/lane_half_width", 320.0)))
+        self.centerline_minimum_lane_width = max(1.0, float(rospy.get_param(
+            "~centerline/minimum_lane_width", 400.0)))
+        self.centerline_maximum_lane_width = max(
+            self.centerline_minimum_lane_width,
+            float(rospy.get_param("~centerline/maximum_lane_width", 900.0)))
+        self.pub_lane_centerline = rospy.Publisher(
+            "/detect/lane_centerline", LaneCenterline, queue_size=1)
+
+        # subscribes state : yellow line reliability
+        self.pub_yellow_line_reliability = rospy.Publisher('/detect/yellow_line_reliability', UInt8, queue_size=1)
+ 
+        # subscribes state : white line reliability
+        self.pub_white_line_reliability = rospy.Publisher('/detect/white_line_reliability', UInt8, queue_size=1)
+ 
+        self.cvBridge = CvBridge()
+        self.cv_image_header = None
+        # A camera frame must produce at most one centreline update.  ROS may
+        # occasionally deliver the same queued image twice while publishers
+        # reconnect; processing it again would advance the temporal filters
+        # without adding new visual evidence.
+        self.last_input_stamp_ns = None
+
+        self.counter = 1
+
+        self.window_width = 1000.
+        self.window_height = 600.
+
+        self.reliability_white_line = 100
+        self.reliability_yellow_line = 100
+        self.left_fit = None
+        self.right_fit = None
+        self.left_fitx = None
+        self.right_fitx = None
+        self.left_fit_history = []
+        self.right_fit_history = []
+
+    def cbGetDetectLaneParam(self, config, level):
+        rospy.loginfo("[Detect Lane] Detect Lane Calibration Parameter reconfigured to")
+        rospy.loginfo("hue_white_l : %d", config.hue_white_l)
+        rospy.loginfo("hue_white_h : %d", config.hue_white_h)
+        rospy.loginfo("saturation_white_l : %d", config.saturation_white_l)
+        rospy.loginfo("saturation_white_h : %d", config.saturation_white_h)
+        rospy.loginfo("lightness_white_l : %d", config.lightness_white_l)
+        rospy.loginfo("lightness_white_h : %d", config.lightness_white_h)
+        rospy.loginfo("hue_yellow_l : %d", config.hue_yellow_l)
+        rospy.loginfo("hue_yellow_h : %d", config.hue_yellow_h)
+        rospy.loginfo("saturation_yellow_l : %d", config.saturation_yellow_l)
+        rospy.loginfo("saturation_yellow_h : %d", config.saturation_yellow_h)
+        rospy.loginfo("lightness_yellow_l : %d", config.lightness_yellow_l)
+        rospy.loginfo("lightness_yellow_h : %d", config.lightness_yellow_h)
+
+        self.hue_white_l = config.hue_white_l
+        self.hue_white_h = config.hue_white_h
+        self.saturation_white_l = config.saturation_white_l
+        self.saturation_white_h = config.saturation_white_h
+        self.lightness_white_l = config.lightness_white_l
+        self.lightness_white_h = config.lightness_white_h
+
+        self.hue_yellow_l = config.hue_yellow_l
+        self.hue_yellow_h = config.hue_yellow_h
+        self.saturation_yellow_l = config.saturation_yellow_l
+        self.saturation_yellow_h = config.saturation_yellow_h
+        self.lightness_yellow_l = config.lightness_yellow_l
+        self.lightness_yellow_h = config.lightness_yellow_h
+
+        return config
+
+    def cbFindLane(self, image_msg):
+        stamp = getattr(getattr(image_msg, "header", None), "stamp", None)
+        stamp_ns = None
+        if stamp is not None:
+            try:
+                stamp_ns = int(stamp.to_nsec())
+            except AttributeError:
+                try:
+                    stamp_ns = int(round(float(stamp) * 1.0e9))
+                except (TypeError, ValueError, OverflowError):
+                    stamp_ns = None
+        if stamp_ns is not None and stamp_ns > 0:
+            last_stamp_ns = getattr(self, "last_input_stamp_ns", None)
+            if last_stamp_ns is not None and stamp_ns <= last_stamp_ns:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "Ignoring duplicate or out-of-order lane camera frame",
+                )
+                return
+            self.last_input_stamp_ns = stamp_ns
+
+        # Keep only the configured frames. A value of 1 processes every frame.
+        if self.counter % self.process_every_n_frames != 0:
+            self.counter += 1
+            return
+        else:
+            self.counter = 1
+
+        if self.sub_image_type == "compressed":
+            #converting compressed image to opencv image
+            np_arr = np.frombuffer(image_msg.data, np.uint8)
+            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        elif self.sub_image_type == "raw":
+            cv_image = self.cvBridge.imgmsg_to_cv2(image_msg, "bgr8")
+        self.cv_image_header = image_msg.header
+        self.temporal_state_counter += 1
+        self.update_temporal_state = (
+            self.temporal_state_counter >= self.temporal_state_every_n_frames
+        )
+        if self.update_temporal_state:
+            self.temporal_state_counter = 0
+
+        # Convert once, then derive both masks and every lane output from the
+        # same frame. This keeps 30 Hz processing bounded on the D405 pipeline.
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        white_fraction, cv_white_lane = self.maskWhiteLane(cv_image, hsv)
+        yellow_fraction, cv_yellow_lane = self.maskYellowLane(cv_image, hsv)
+        self.publish_lane_boundaries(cv_white_lane, cv_yellow_lane)
+
+        yellow_current = yellow_fraction > self.minimum_lane_pixels
+        white_current = white_fraction > self.minimum_lane_pixels
+        if yellow_current:
+            self.left_fitx, self.left_fit, self.left_fit_history = self.update_lane_fit(
+                cv_yellow_lane, self.left_fit, self.left_fit_history, 'left')
+            yellow_current = self.left_fitx is not None
+        if white_current:
+            self.right_fitx, self.right_fit, self.right_fit_history = self.update_lane_fit(
+                cv_white_lane, self.right_fit, self.right_fit_history, 'right')
+            white_current = self.right_fitx is not None
+
+        self.publish_lane_centerline(
+            cv_white_lane, cv_yellow_lane, white_current, yellow_current)
+        # The visualization is not part of detection or control. Avoid its
+        # full-frame drawing and JPEG encoding unless somebody is observing it,
+        # and then publish it at its independent diagnostic rate. This keeps
+        # every 30 Hz frame available to the centreline/control path even while
+        # an all-topic bag or dashboard is connected.
+        self.debug_frame_counter += 1
+        publish_debug = (
+            self.debug_every_n_frames > 0
+            and self.debug_frame_counter >= self.debug_every_n_frames
+        )
+        if publish_debug:
+            self.debug_frame_counter = 0
+        if (
+                self.is_calibration_mode
+                or (
+                    publish_debug
+                    and self.pub_image_lane.get_num_connections() > 0
+                )):
+            self.make_lane(cv_image, white_current, yellow_current)
+
+    def publish_lane_boundaries(self, white_mask, yellow_mask):
+        """Publish per-colour x positions without repeating HSV conversion."""
+        image_height = white_mask.shape[0]
+        sample_y = max(0, min(self.boundary_sample_y, image_height - 1))
+        y0 = max(0, sample_y - self.boundary_band_height // 2)
+        y1 = min(image_height, y0 + self.boundary_band_height)
+        yellow_x, yellow_valid = self.boundary_position(yellow_mask[y0:y1, :])
+        white_x, white_valid = self.boundary_position(white_mask[y0:y1, :])
+
+        message = Float64MultiArray()
+        message.data = [
+            yellow_x,
+            white_x,
+            1.0 if yellow_valid else 0.0,
+            1.0 if white_valid else 0.0,
+        ]
+        self.pub_lane_boundaries.publish(message)
+
+    def boundary_position(self, mask):
+        _, x_positions = np.nonzero(mask)
+        if x_positions.size < self.boundary_minimum_pixels:
+            return float('nan'), False
+        return float(np.median(x_positions)), True
+
+    def maskWhiteLane(self, image, hsv=None):
+        # Convert BGR to HSV
+        if hsv is None:
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+        Hue_l = self.hue_white_l
+        Hue_h = self.hue_white_h
+        Saturation_l = self.saturation_white_l
+        Saturation_h = self.saturation_white_h
+        Lightness_l = self.lightness_white_l
+        Lightness_h = self.lightness_white_h
+
+        # define range of white color in HSV
+        lower_white = np.array([Hue_l, Saturation_l, Lightness_l])
+        upper_white = np.array([Hue_h, Saturation_h, Lightness_h])
+
+        # Threshold the HSV image to get only white colors
+        mask = cv2.inRange(hsv, lower_white, upper_white)
+
+        fraction_num = np.count_nonzero(mask)
+
+        if self.is_calibration_mode == False and self.update_temporal_state:
+            if fraction_num > 35000:
+                if self.lightness_white_l < 250:
+                    self.lightness_white_l += 5
+            elif fraction_num < 5000:
+                if self.lightness_white_l > 50:
+                    self.lightness_white_l -= 5
+
+        supported_rows = int(np.count_nonzero(np.any(mask != 0, axis=1)))
+        how_much_short = int(mask.shape[0]) - supported_rows
+
+        if self.update_temporal_state:
+            if how_much_short > 100:
+                if self.reliability_white_line >= 5:
+                    self.reliability_white_line -= 5
+            elif how_much_short <= 100:
+                if self.reliability_white_line <= 99:
+                    self.reliability_white_line += 5
+
+        msg_white_line_reliability = UInt8()
+        msg_white_line_reliability.data = self.reliability_white_line
+        self.pub_white_line_reliability.publish(msg_white_line_reliability)
+
+        if self.is_calibration_mode == True:
+            if self.pub_image_type == "compressed":
+                # publishes white lane filtered image in compressed type
+                self.pub_image_white_lane.publish(
+                    self.make_image_message(mask, "mono8"))
+
+            elif self.pub_image_type == "raw":
+                # publishes white lane filtered image in raw type
+                self.pub_image_white_lane.publish(
+                    self.make_image_message(mask, "mono8"))
+
+        return fraction_num, mask
+
+    def maskYellowLane(self, image, hsv=None):
+        # Convert BGR to HSV
+        if hsv is None:
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+        Hue_l = self.hue_yellow_l
+        Hue_h = self.hue_yellow_h
+        Saturation_l = self.saturation_yellow_l
+        Saturation_h = self.saturation_yellow_h
+        Lightness_l = self.lightness_yellow_l
+        Lightness_h = self.lightness_yellow_h
+
+        # define range of yellow color in HSV
+        lower_yellow = np.array([Hue_l, Saturation_l, Lightness_l])
+        upper_yellow = np.array([Hue_h, Saturation_h, Lightness_h])
+
+        # Threshold the HSV image to get only yellow colors
+        mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+
+        fraction_num = np.count_nonzero(mask)
+
+        if self.is_calibration_mode == False and self.update_temporal_state:
+            if fraction_num > 35000:
+                if self.lightness_yellow_l < 250:
+                    self.lightness_yellow_l += 20
+            elif fraction_num < 5000:
+                if self.lightness_yellow_l > 90:
+                    self.lightness_yellow_l -= 20
+
+        supported_rows = int(np.count_nonzero(np.any(mask != 0, axis=1)))
+        how_much_short = int(mask.shape[0]) - supported_rows
+
+        if self.update_temporal_state:
+            if how_much_short > 100:
+                if self.reliability_yellow_line >= 5:
+                    self.reliability_yellow_line -= 5
+            elif how_much_short <= 100:
+                if self.reliability_yellow_line <= 99:
+                    self.reliability_yellow_line += 5
+
+        msg_yellow_line_reliability = UInt8()
+        msg_yellow_line_reliability.data = self.reliability_yellow_line
+        self.pub_yellow_line_reliability.publish(msg_yellow_line_reliability)
+
+        if self.is_calibration_mode == True:
+            if self.pub_image_type == "compressed":
+                # publishes yellow lane filtered image in compressed type
+                self.pub_image_yellow_lane.publish(
+                    self.make_image_message(mask, "mono8"))
+
+            elif self.pub_image_type == "raw":
+                # publishes yellow lane filtered image in raw type
+                self.pub_image_yellow_lane.publish(
+                    self.make_image_message(mask, "mono8"))
+
+        return fraction_num, mask
+
+    def update_lane_fit(self, mask, previous_fit, history, lane_side):
+        """Fit one colour independently and retain only a short valid history."""
+        nonzero_y, nonzero_x = mask.nonzero()
+        if nonzero_x.size < 3:
+            return None, previous_fit, history
+
+        selected = None
+        if previous_fit is not None:
+            predicted_x = (
+                previous_fit[0] * nonzero_y ** 2
+                + previous_fit[1] * nonzero_y
+                + previous_fit[2]
+            )
+            selected = np.abs(nonzero_x - predicted_x) < 100
+
+        if selected is None or np.count_nonzero(selected) < 3:
+            selected = self.initial_lane_indices(
+                mask, nonzero_x, nonzero_y, lane_side)
+        if np.count_nonzero(selected) < 3:
+            return None, previous_fit, history
+
+        try:
+            fit = np.polyfit(nonzero_y[selected], nonzero_x[selected], 2)
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            return None, previous_fit, history
+
+        history = (history + [fit])[-self.fit_history_length:]
+        smoothed_fit = np.mean(np.asarray(history), axis=0)
+        plot_y = np.linspace(0, mask.shape[0] - 1, mask.shape[0])
+        fit_x = (
+            smoothed_fit[0] * plot_y ** 2
+            + smoothed_fit[1] * plot_y
+            + smoothed_fit[2]
+        )
+        return fit_x, smoothed_fit, history
+
+    def _row_cluster_candidates(
+            self, labels, sample_row, predicted_x, half_width,
+            required_label=None):
+        """Fit locally supported x-clusters near one predicted row position."""
+        height, width = labels.shape[:2]
+        if (
+                not 0 <= sample_row < height
+                or not np.isfinite(predicted_x)
+                or predicted_x < -half_width
+                or predicted_x > float(width - 1) + half_width):
+            return []
+        y0 = max(0, sample_row - self.centerline_support_half_height)
+        y1 = min(height, sample_row + self.centerline_support_half_height + 1)
+        x0 = max(0, int(np.floor(predicted_x - half_width)))
+        x1 = min(width, int(np.ceil(predicted_x + half_width)) + 1)
+        if x1 <= x0:
+            return []
+        label_roi = labels[y0:y1, x0:x1]
+        if required_label is None:
+            binary = np.asarray(label_roi > 0, dtype=np.uint8)
+        else:
+            binary = np.asarray(label_roi == int(required_label), dtype=np.uint8)
+        local_count, local_labels = cv2.connectedComponents(binary, connectivity=8)
+        candidates = []
+        for local_label in range(1, local_count):
+            local_y, local_x = np.nonzero(local_labels == local_label)
+            if local_x.size < self.centerline_minimum_support_pixels:
+                continue
+            absolute_y = local_y.astype(np.float64) + float(y0)
+            absolute_x = local_x.astype(np.float64) + float(x0)
+            unique_y = np.unique(absolute_y)
+            if unique_y.size < 2:
+                continue
+            row_centres = np.asarray([
+                np.median(absolute_x[absolute_y == row]) for row in unique_y
+            ], dtype=np.float64)
+            try:
+                local_fit = np.polyfit(unique_y, row_centres, 1)
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                continue
+            measured_x = float(np.polyval(local_fit, float(sample_row)))
+            if not np.isfinite(measured_x) or not 0.0 <= measured_x < float(width):
+                continue
+            innovation = abs(measured_x - float(predicted_x))
+            if innovation > float(half_width):
+                continue
+
+            # Confidence combines vertical continuity with the current pixels'
+            # residual from this local line.  It never rewards an unsupported
+            # full-image polynomial.
+            supported_rows = float(unique_y.size) / float(max(1, y1 - y0))
+            fitted_x = np.polyval(local_fit, absolute_y)
+            median_residual = float(np.median(np.abs(absolute_x - fitted_x)))
+            residual_score = max(
+                0.0,
+                1.0 - median_residual
+                / float(self.centerline_support_half_width),
+            )
+            confidence = min(1.0, supported_rows * residual_score)
+            global_values = label_roi[
+                local_labels == local_label
+            ].astype(np.int64)
+            global_values = global_values[global_values > 0]
+            if global_values.size == 0:
+                continue
+            global_label = int(np.bincount(global_values).argmax())
+            if required_label is not None and global_label != int(required_label):
+                continue
+            candidates.append((
+                innovation,
+                -confidence,
+                -int(local_x.size),
+                global_label,
+                measured_x,
+                confidence,
+            ))
+        candidates.sort()
+        return candidates
+
+    def _components_can_reconnect(
+            self, stats, previous_label, next_label,
+            previous_row, next_row):
+        """Allow only the component break spanned by this sampled transition.
+
+        ``missed_bands`` in ``trace_connected_boundary`` limits how many
+        sampled row bands may be absent.  This geometric check additionally
+        requires the new component to be wholly farther in the image and its
+        pixel gap to fit between the last accepted and current sample bands.
+        """
+        previous_top = int(stats[previous_label, cv2.CC_STAT_TOP])
+        next_top = int(stats[next_label, cv2.CC_STAT_TOP])
+        next_bottom = next_top + int(
+            stats[next_label, cv2.CC_STAT_HEIGHT]) - 1
+        band_height = 2 * self.centerline_support_half_height + 1
+        if next_bottom >= previous_top:
+            # A vertically competing component is not a broken continuation.
+            return False
+        vertical_gap = previous_top - next_bottom - 1
+        sampled_span = abs(int(previous_row) - int(next_row)) + band_height
+        return 0 <= vertical_gap <= sampled_span
+
+    def trace_connected_boundary(self, mask, fit_x):
+        """Trace one colour branch near-to-far without distant reacquisition.
+
+        The historical full-image polynomial is used only to acquire the near
+        anchor and its first transition.  Once two current-frame points exist,
+        their image-space slope predicts every farther row.  Local x clusters
+        must stay inside the configured innovation gate even when two branches
+        belong to the same global 8-connected component.
+        """
+        if fit_x is None:
+            return {}
+        height, width = mask.shape[:2]
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            np.asarray(mask != 0, dtype=np.uint8), connectivity=8)
+        if component_count <= 1:
+            return {}
+
+        accepted = []
+        active_label = None
+        missed_bands = 0
+        result = {}
+
+        def locally_supported_direction(candidates):
+            if len(accepted) < 2:
+                return candidates
+            previous_delta = accepted[-1][1] - accepted[-2][1]
+            return [
+                candidate for candidate in candidates
+                if previous_delta * (candidate[4] - accepted[-1][1]) >= 0.0
+                or candidate[0]
+                <= self.centerline_branch_reversal_maximum_innovation
+            ]
+
+        for row in self.centerline_sample_rows:
+            row = int(row)
+            if not 0 <= row < height or row >= len(fit_x):
+                continue
+            if len(accepted) < 2:
+                predicted_x = float(fit_x[row])
+                half_width = self.centerline_support_half_width
+            else:
+                previous_row, previous_x, _, _ = accepted[-2]
+                latest_row, latest_x, _, _ = accepted[-1]
+                row_delta = float(latest_row - previous_row)
+                if abs(row_delta) <= 1e-9:
+                    predicted_x = latest_x
+                else:
+                    slope = (latest_x - previous_x) / row_delta
+                    predicted_x = latest_x + slope * (row - latest_row)
+                half_width = self.centerline_branch_maximum_innovation
+                if (
+                        predicted_x < -half_width
+                        or predicted_x > float(width - 1) + half_width):
+                    # End only when the tangent prediction and its complete
+                    # innovation gate have left the image.  On a real tight
+                    # bend the secant from the two preceding row bands can
+                    # point a few pixels outside the image while the same
+                    # connected painted branch is still visible just inside
+                    # the edge.  _row_cluster_candidates applies the exact
+                    # innovation limit below, so keeping that overlap is not
+                    # a distant-component reacquisition.
+                    break
+
+            candidates = []
+            if active_label is not None:
+                candidates = locally_supported_direction(
+                    self._row_cluster_candidates(
+                        labels,
+                        row,
+                        predicted_x,
+                        half_width,
+                        required_label=active_label,
+                    )
+                )
+            if not candidates:
+                alternatives = locally_supported_direction(
+                    self._row_cluster_candidates(
+                        labels, row, predicted_x, half_width
+                    )
+                )
+                if active_label is None:
+                    candidates = alternatives
+                else:
+                    candidates = [
+                        candidate for candidate in alternatives
+                        if candidate[3] != active_label
+                        and self._components_can_reconnect(
+                            stats,
+                            active_label,
+                            candidate[3],
+                            accepted[-1][0],
+                            row,
+                        )
+                    ]
+
+            if not candidates:
+                if active_label is None:
+                    # Leading rows without this colour do not constitute a
+                    # branch gap; acquire the nearest actual visible segment.
+                    continue
+                missed_bands += 1
+                if missed_bands > self.centerline_branch_maximum_gap_bands:
+                    break
+                continue
+
+            selected = candidates[0]
+            active_label = selected[3]
+            measured_x = selected[4]
+            confidence = selected[5]
+            accepted.append((row, measured_x, active_label, confidence))
+            result[row] = (measured_x, True, confidence)
+            missed_bands = 0
+        return result
+
+    def publish_lane_centerline(
+            self, white_mask, yellow_mask, white_current, yellow_current):
+        """Publish supported near-to-far lane centres from this camera frame."""
+        height, width = white_mask.shape[:2]
+        message = LaneCenterline()
+        message.header = self.cv_image_header
+        message.image_width = width
+        message.image_height = height
+
+        # ``reliability_*`` is the original full-image vertical-coverage
+        # diagnostic.  It is not a validity gate: after extending the bird-eye
+        # view, a real boundary that bends out of the far half of the image can
+        # legitimately cover fewer than 500 of 600 rows.  Current-frame mask
+        # area plus the connected current-frame branch trace is the
+        # authoritative evidence for each emitted path point.
+        yellow_usable = bool(yellow_current)
+        white_usable = bool(white_current)
+        yellow_points = (
+            self.trace_connected_boundary(yellow_mask, self.left_fitx)
+            if yellow_usable else {}
+        )
+        white_points = (
+            self.trace_connected_boundary(white_mask, self.right_fitx)
+            if white_usable else {}
+        )
+        for row in self.centerline_sample_rows:
+            if not 0 <= row < height:
+                continue
+            yellow_x, yellow_valid, yellow_confidence = yellow_points.get(
+                int(row), (float('nan'), False, 0.0))
+            white_x, white_valid, white_confidence = white_points.get(
+                int(row), (float('nan'), False, 0.0))
+
+            if yellow_valid and white_valid:
+                lane_width = white_x - yellow_x
+                if (
+                        self.centerline_minimum_lane_width
+                        <= lane_width
+                        <= self.centerline_maximum_lane_width):
+                    center_x = 0.5 * (yellow_x + white_x)
+                else:
+                    # On a bend, intersections with one image row are not a
+                    # physical lane-normal cross section.  Their horizontal
+                    # separation can therefore exceed the straight-lane gate
+                    # even though both colour masks contain genuine, locally
+                    # supported boundary points.  Preserve those independent
+                    # observations for the downstream metric normal-offset
+                    # candidates, but do not invent a scalar midpoint.
+                    center_x = float('nan')
+                confidence = min(yellow_confidence, white_confidence)
+            elif yellow_valid:
+                center_x = yellow_x + self.centerline_lane_half_width
+                confidence = 0.5 * yellow_confidence
+            elif white_valid:
+                center_x = white_x - self.centerline_lane_half_width
+                confidence = 0.5 * white_confidence
+            else:
+                continue
+
+            # Preserve a locally supported boundary even when the provisional
+            # horizontal half-width puts its centre outside the image.  On a
+            # tight bend the physical lane centre is a metric normal offset,
+            # not an x-only pixel offset; the rolling-path generator performs
+            # that calibrated construction from these raw boundary samples.
+            message.sample_rows.append(float(row))
+            message.center_x.append(float(center_x))
+            message.yellow_x.append(float(yellow_x))
+            message.white_x.append(float(white_x))
+            message.confidence.append(float(confidence))
+            message.yellow_valid.append(bool(yellow_valid))
+            message.white_valid.append(bool(white_valid))
+
+        # Publish empty arrays as an explicit current-frame invalid observation;
+        # consumers can stop on freshness without mistaking an old path as new.
+        self.pub_lane_centerline.publish(message)
+
+        # Preserve the scalar compatibility topic from the exact same
+        # current-frame, locally-supported sample used by the rolling path.
+        # This replaces the former unconstrained global-fit extrapolation and
+        # therefore leaves only one centre calculation path in the detector.
+        for index, row in enumerate(message.sample_rows):
+            if (
+                    int(round(row)) == self.boundary_sample_y
+                    and 0.0 <= message.center_x[index] < float(width)):
+                self.pub_lane.publish(
+                    Float64(data=float(message.center_x[index])))
+                break
+        return message
+
+    @staticmethod
+    def initial_lane_indices(mask, nonzero_x, nonzero_y, lane_side):
+        """Initialize a line with sliding windows and no shared fallback."""
+        histogram = np.sum(mask[mask.shape[0] // 2:, :], axis=0)
+        midpoint = histogram.shape[0] // 2
+        if lane_side == 'left':
+            lane_base = int(np.argmax(histogram[:midpoint]))
+        else:
+            lane_base = int(np.argmax(histogram[midpoint:])) + midpoint
+
+        window_count = 20
+        window_height = max(1, mask.shape[0] // window_count)
+        current_x = lane_base
+        selected_indices = []
+        for window in range(window_count):
+            y_low = mask.shape[0] - (window + 1) * window_height
+            y_high = mask.shape[0] - window * window_height
+            candidates = np.flatnonzero(
+                (nonzero_y >= y_low)
+                & (nonzero_y < y_high)
+                & (nonzero_x >= current_x - 50)
+                & (nonzero_x < current_x + 50)
+            )
+            if candidates.size:
+                selected_indices.append(candidates)
+            if candidates.size > 50:
+                current_x = int(np.mean(nonzero_x[candidates]))
+
+        selected = np.zeros(nonzero_x.shape, dtype=bool)
+        if selected_indices:
+            selected[np.concatenate(selected_indices)] = True
+        return selected
+
+    def make_lane(self, cv_image, white_current, yellow_current):
+        """Publish a centre only from lines valid in the current frame."""
+        warp_zero = np.zeros(
+            (cv_image.shape[0], cv_image.shape[1], 1), dtype=np.uint8)
+        color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+        color_warp_lines = np.dstack((warp_zero, warp_zero, warp_zero))
+        plot_y = np.linspace(0, cv_image.shape[0] - 1, cv_image.shape[0])
+
+        left_points = None
+        right_points = None
+        if yellow_current:
+            left_points = np.transpose(
+                np.vstack([self.left_fitx, plot_y])).astype(np.int32)
+            cv2.polylines(
+                color_warp_lines, [left_points], False, (0, 0, 255), 25)
+        if white_current:
+            right_points = np.transpose(
+                np.vstack([self.right_fitx, plot_y])).astype(np.int32)
+            cv2.polylines(
+                color_warp_lines, [right_points], False, (255, 255, 0), 25)
+
+        # Keep the legacy reliability values as diagnostics only.  A sharp,
+        # visible curve naturally leaves many far image rows and must not be
+        # discarded solely for lacking full-height coverage.
+        yellow_usable = bool(yellow_current)
+        white_usable = bool(white_current)
+        center_x = None
+        if yellow_usable and white_usable:
+            center_x = np.mean([self.left_fitx, self.right_fitx], axis=0)
+            polygon = np.vstack([left_points, np.flipud(right_points)])
+            cv2.fillPoly(color_warp, [polygon], (0, 255, 0))
+        elif white_usable:
+            center_x = np.subtract(self.right_fitx, 320)
+        elif yellow_usable:
+            center_x = np.add(self.left_fitx, 320)
+
+        self.is_center_x_exist = center_x is not None
+        if self.is_center_x_exist:
+            center_points = np.transpose(
+                np.vstack([center_x, plot_y])).astype(np.int32)
+            cv2.polylines(
+                color_warp_lines, [center_points], False, (0, 255, 255), 12)
+
+        final = cv2.addWeighted(cv_image, 1, color_warp, 0.2, 0)
+        final = cv2.addWeighted(final, 1, color_warp_lines, 1, 0)
+        if self.pub_image_type == "compressed":
+            self.pub_image_lane.publish(self.make_image_message(final, "bgr8"))
+        else:
+            self.pub_image_lane.publish(self.make_image_message(final, "bgr8"))
+
+    def make_image_message(self, image, raw_encoding):
+        if self.pub_image_type == "compressed":
+            message = self.cvBridge.cv2_to_compressed_imgmsg(image, "jpg")
+        else:
+            message = self.cvBridge.cv2_to_imgmsg(image, raw_encoding)
+        message.header = self.cv_image_header
+        return message
+
+    def main(self):
+        rospy.spin()
+
+if __name__ == '__main__':
+    rospy.init_node('detect_lane')
+    node = DetectLane()
+    node.main()

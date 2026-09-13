@@ -1,0 +1,69 @@
+<launch>
+  <arg name="x_pos" default="0.8"/>
+  <arg name="y_pos" default="-1.747"/>
+  <arg name="z_pos" default="0.01"/>
+  <arg name="yaw_pos" default="0.0"/>
+  <arg name="gui" default="true"/>
+  <!-- from_model keeps the upstream world unchanged. An absolute PNG path
+       stages a digest-specific course model without modifying package files. -->
+  <arg name="course_texture" default="from_model"/>
+  <arg name="use_mesh" default="true"/>
+  <arg name="simulate_imu" default="true"/>
+  <arg name="simulate_lidar" default="true"/>
+  <arg name="simulate_camera" default="true"/>
+  <arg name="odometry_source" default="encoder"/>
+  <arg name="fuse_imu" default="true"/>
+  <!-- Avoid competing odom -> base_footprint publishers. The raw Gazebo TF is
+       only restored automatically when the EKF is explicitly disabled. -->
+  <arg name="publish_raw_odom_tf" default="$(eval not arg('fuse_imu'))"/>
+  <arg name="publish_trajectories" default="true"/>
+  <arg name="trajectory_max_points" default="20000"/>
+
+  <env name="GAZEBO_RESOURCE_PATH" value="$(find turtlebot3_gazebo)/models/autorace/ground_picture"/>
+  <!-- Use a project-local geometry so gzclient opens as a normal window
+       instead of inheriting a maximized ~/.gazebo/gui.ini state. -->
+  <env name="GAZEBO_GUI_INI_FILE"
+       value="$(find custom_autorace_description)/config/gazebo_gui.ini"/>
+  <include unless="$(eval arg('course_texture') != 'from_model')"
+           file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find turtlebot3_gazebo)/worlds/turtlebot3_autorace_2020.world"/>
+    <arg name="paused" value="false"/><arg name="use_sim_time" value="true"/><arg name="gui" value="$(arg gui)"/>
+  </include>
+  <group if="$(eval arg('course_texture') != 'from_model')">
+    <param name="/use_sim_time" value="true"/>
+    <param name="gazebo/enable_ros_network" value="true"/>
+    <node name="gazebo" pkg="custom_autorace_description"
+          type="gazebo_course_server.py" output="screen"
+          args="-e ode $(find turtlebot3_gazebo)/worlds/turtlebot3_autorace_2020.world">
+      <env name="CUSTOM_AUTORACE_COURSE_TEXTURE"
+           value="$(arg course_texture)"/>
+    </node>
+    <node if="$(arg gui)" name="gazebo_gui"
+          pkg="custom_autorace_description" type="gazebo_course_server.py"
+          args="--client" output="screen">
+      <env name="CUSTOM_AUTORACE_COURSE_TEXTURE"
+           value="$(arg course_texture)"/>
+    </node>
+  </group>
+  <param name="robot_description" command="$(find xacro)/xacro $(find custom_autorace_description)/urdf/custom_autorace.urdf.xacro use_mesh:=$(arg use_mesh) simulate_imu:=$(arg simulate_imu) simulate_lidar:=$(arg simulate_lidar) simulate_camera:=$(arg simulate_camera) odometry_source:=$(arg odometry_source) publish_odom_tf:=$(arg publish_raw_odom_tf)"/>
+  <node pkg="gazebo_ros" type="spawn_model" name="spawn_custom_autorace" args="-urdf -model custom_autorace -x $(arg x_pos) -y $(arg y_pos) -z $(arg z_pos) -Y $(arg yaw_pos) -param robot_description"/>
+  <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher"/>
+  <node if="$(arg fuse_imu)" pkg="custom_autorace_description"
+        type="encoder_covariance_adapter.py" name="encoder_covariance_adapter" output="screen">
+    <param name="input_topic" value="/odom"/>
+    <param name="output_topic" value="/odom/encoder_with_covariance"/>
+    <param name="linear_velocity_stddev" value="0.02"/>
+    <param name="angular_velocity_stddev" value="0.05"/>
+  </node>
+  <node if="$(arg fuse_imu)" pkg="robot_localization" type="ekf_localization_node"
+        name="ekf_encoder_imu" clear_params="true" output="screen">
+    <rosparam command="load" file="$(find custom_autorace_description)/config/ekf_encoder_imu.yaml"/>
+  </node>
+  <node if="$(arg publish_trajectories)" pkg="custom_autorace_description"
+        type="trajectory_comparison.py" name="trajectory_comparison" output="screen">
+    <param name="model_name" value="custom_autorace"/>
+    <param name="frame_id" value="odom"/>
+    <param name="filtered_topic" value="/odometry/filtered"/>
+    <param name="max_points" value="$(arg trajectory_max_points)"/>
+  </node>
+</launch>

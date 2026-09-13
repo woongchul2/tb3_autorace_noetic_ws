@@ -1,0 +1,211 @@
+# Gazebo-only tunnel navigation. Hardware needs a separately surveyed wall map,
+# entrance/exit poses, Mid-360 transform and footprint margins.
+tunnel:
+  frames:
+    map: map
+
+  topics:
+    scan: /scan_mid360_raw
+    static_map: /map
+    odometry: /odometry/filtered
+    map_pose: /mission/map_pose
+    zone_gate: /mission/enable/tunnel
+    lane_path_diagnostics: /control/lane_path_diagnostics
+    signs: /detect/signs
+    manual_stop: /control/manual_stop
+    cmd_vel: /cmd_vel
+    lane_speed_limit: /control/max_vel
+    lane_control_service: /control/lane_mission_handoff
+    lane_stop_service: /control/lane_following
+
+  map:
+    # Crop the full AMCL map to the fixed tunnel walls plus both portals. The
+    # three cylinders are deliberately absent from the static map.
+    planning_bounds: [-2.02, -2.02, 0.30, 0.55]
+    static_occupied_threshold: 65
+    unknown_is_occupied: true
+    # Official-start runs measured up to 77.9 mm between the north-west wall
+    # end return and its nominal static cell after AMCL/grid offset. The Gazebo
+    # LiDAR has 10 mm Gaussian range noise, so retain about 2.2 sigma reserve.
+    # This remains inside the 100.3 mm padded half-width; the closest observed
+    # cylinder surface was still 440 mm from the static layer.
+    static_hit_exclusion_radius: 0.100
+    # Keep already-confirmed surface cells from flickering when a noisy hit
+    # moves to an adjacent 2 cm cell; neighbours are never newly marked.
+    endpoint_clear_guard_radius: 0.030
+    # Raw endpoints remain lethal at 100. The surrounding 60 mm is a graded
+    # 64/43/21 clearance preference, below the lethal threshold, so a newly
+    # revealed flank can make the stopped robot leave the band instead of
+    # trapping its valid start pose. Full 170 mm regressions remain feasible.
+    dynamic_occupied_value: 100
+    dynamic_inflation_value: 64
+    dynamic_inflation_radius: 0.060
+    mark_observations: 2
+    clear_observations: 2
+    decay_updates: 0
+    minimum_initial_scans: 3
+
+  scan:
+    maximum_planning_range: 3.0
+    # Freeze map <- odom at the entrance, then project each scan through the
+    # acquisition-time odom <- message.header.frame_id transform. This keeps
+    # unmapped obstacles from pulling the AMCL reference during the mission.
+    transform_timeout: 0.05
+    maximum_age: 0.25
+    maximum_future_stamp: 0.06
+
+  footprint:
+    # The exit is too narrow for circumscribed-radius inflation. Hybrid A*
+    # sweeps this asymmetric oriented rectangle at every primitive sample.
+    front: 0.067645
+    rear: 0.118073
+    half_width: 0.0903
+    padding: 0.010
+
+  goal:
+    # Hybrid A* stops inside the east portal. The controller then aligns yaw
+    # while the complete footprint is still protected by the tunnel walls and
+    # follows the surveyed straight exit separately.
+    x: -0.180
+    y: -1.748373
+    yaw_deg: 0.0
+
+  entry:
+    # The observed full-course gate poses can be about 64 mm off the aperture
+    # centre, which is outside the padded footprint's 42.6 mm lateral margin.
+    # Follow one continuous low-speed path: a quintic centres the robot at the
+    # surveyed pose, then a straight suffix holds -90 degrees through the gap.
+    staging_pose: [-1.7475895, 0.140, -90.0]
+    inside_pose: [-1.7475895, -0.280, -90.0]
+    portal_plane_y: -0.105857
+    clearance_margin: 0.010
+    velocity: 0.035
+    sample_step: 0.010
+    connector_tangent_ratio: 0.20
+    minimum_tangent_length: 0.008
+    maximum_tangent_length: 0.055
+    path_position_tolerance: 0.015
+    path_heading_tolerance_deg: 2.0
+    path_remaining_tolerance: 0.015
+
+  planner:
+    # Base-centre regions for the surveyed north-west portal, wall-bounded
+    # interior and south-east portal. This planner-only keep-in prevents an
+    # exterior wall bypass without inventing obstacles in AMCL or the live
+    # costmap; the exact footprint still checks all physical walls.
+    keep_in_rectangles:
+      - [-2.02, -0.20, -1.54, 0.56]  # north-west entrance staging
+      - [-1.90, -1.94, 0.02, 0.02]   # tunnel interior
+      - [-0.16, -2.02, 0.32, -1.50]  # south-east exit staging
+    heading_bins: 36
+    minimum_turning_radius: 0.18
+    primitive_step: 0.10
+    # The intermediate curvatures keep the 0.10 m primitive's smallest yaw
+    # step below the 8 degree goal tolerance, including a near-exit replan.
+    steering_samples: 5
+    state_xy_resolution: 0.050
+    goal_position_tolerance: 0.035
+    goal_heading_tolerance_deg: 8.0
+    goal_curvature_tolerance: 0.000001
+    non_straight_penalty: 0.08
+    steering_change_penalty: 0.04
+    # Do not circularly inflate the fixed walls. Footprint padding above is
+    # applied by the exact oriented-box collision test instead.
+    static_inflation_radius: 0.0
+    obstacle_cost_weight: 0.12
+    obstacle_cost_distance: 0.30
+    # Integrate max graded-band risk under the exact padded footprint over the
+    # complete primitive sweep. One metre at full risk adds one metre of cost.
+    soft_obstacle_cost_weight: 1.0
+    soft_cost_check_step: 0.020
+    heading_heuristic_weight: 0.25
+    collision_check_step: 0.010
+    collision_check_angle_deg: 3.0
+    path_sample_step: 0.020
+    maximum_iterations: 60000
+
+  control:
+    period: 0.05
+    entry_velocity_cap: 0.04
+    lane_resume_max_velocity: 0.30
+    cruise_velocity: 0.075
+    minimum_velocity: 0.035
+    entry_velocity: 0.035
+    exit_velocity: 0.040
+    maximum_angular_velocity: 0.55
+    maximum_lateral_acceleration: 0.030
+    linear_acceleration: 0.15
+    linear_deceleration: 0.40
+    angular_acceleration: 0.55
+    # Conservative measured-motion bounds used by the reaction-and-stop sweep.
+    safety_linear_deceleration: 0.15
+    safety_angular_deceleration: 0.55
+    planning_stopped_linear: 0.008
+    planning_stopped_angular: 0.03
+    lookahead_distance: 0.065
+    heading_gain: 0.30
+    path_curvature_weight: 0.20
+    nearest_search_ahead: 0.40
+    # Replan for newly enlarged 21/43/64 bands only after their first exact
+    # swept-footprint contact is within this much remaining route distance.
+    # official_007 left 10.8 s before hard contact at the 0.50 m crossing.
+    soft_replan_lookahead_distance: 0.50
+    # A plan may escape a newly enlarged band already under the stopped robot,
+    # but not follow that connected delta indefinitely. Recorded valid escape
+    # prefixes reached 0.320 m; retain 30 mm measured reserve.
+    soft_start_prefix_max_distance: 0.35
+    tracking_position_tolerance: 0.030
+    tracking_heading_tolerance_deg: 20.0
+    # The published command is accepted only when the actual footprint remains
+    # free through this reaction interval and a complete rate-limited stop.
+    safety_reaction_time: 0.10
+    safety_distance_margin: 0.010
+
+  exit:
+    handoff_remaining_distance: 0.035
+    position_tolerance: 0.060
+    heading_tolerance_deg: 10.0
+    staging_remaining_tolerance: 0.025
+    staging_position_tolerance: 0.025
+    staging_heading_tolerance_deg: 10.0
+    # Hybrid A* targets the centre but may legally end within its 35 mm goal
+    # radius. Preserve that actual y during the straight exit; 45 mm rejects
+    # tracking excursions that would consume the complete physical margin.
+    staging_lateral_tolerance: 0.045
+    outside_pose: [0.200, -1.748373, 0.0]
+    portal_plane_x: 0.003697
+    clearance_margin: 0.010
+    straight_velocity: 0.040
+    # Before following the straight exit, holding yaw within one degree at
+    # the worst legal 35 mm lateral goal error keeps the padded footprint
+    # inside the 295.6 mm aperture.  Once the rear has cleared the portal,
+    # handoff safety comes from the rolling path's full-footprint clearance.
+    alignment_tolerance_deg: 1.0
+    alignment_gain: 2.0
+    alignment_max_angular_velocity: 0.30
+    alignment_min_angular_velocity: 0.08
+    # Confirm the already-generated, swept-footprint-safe camera rolling path.
+    # 6 frames at 30 Hz preserves the former 2-frame/10 Hz confirmation.
+    confirmation_frames: 6
+    confirmation_max_gap: 0.20
+    lane_path_timeout: 0.35
+    join_velocity_cap: 0.06
+    join_minimum_distance: 0.04
+    join_confirmation_frames: 6
+
+  timeouts:
+    map_pose: 0.40
+    pose_stamp_skew: 0.05
+    odometry: 0.35
+    scan: 0.40
+    acquisition: 2.0
+    entry_alignment: 12.0
+    entry_straight: 15.0
+    planning: 15.0
+    plan_retry_period: 0.50
+    mission: 120.0
+    exit_alignment: 3.0
+    exit_straight: 12.0
+    exit_confirmation: 3.0
+    lane_join: 2.0
+    handoff: 0.30

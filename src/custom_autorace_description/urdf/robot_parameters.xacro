@@ -1,0 +1,155 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+  <!--
+    사용자 입력 파일 (단위: m, kg, rad, Hz)
+    실측 기구값은 반영 완료했으며, 센서 시뮬레이션값은 실물 시험 후 미세 조정할 수 있습니다.
+    wheel_separation은 타이어 중심선 사이 거리입니다.
+    센서 xyz/rpy는 base_link 원점 기준입니다(+x 전방, +y 좌측, +z 위).
+  -->
+
+  <!-- 바퀴/구동부 -->
+  <xacro:property name="wheel_radius" value="0.04775"/>     <!-- 실측 지름 95.5 mm -->
+  <xacro:property name="wheel_width" value="0.0113"/>       <!-- 실측 고무 폭 11.3 mm -->
+  <xacro:property name="wheel_separation" value="0.1482"/> <!-- 159.5 - 11.3 = 148.2 mm -->
+  <xacro:property name="wheel_x" value="0.0"/>              <!-- base_link가 바퀴 축 중앙이므로 0 -->
+  <xacro:property name="wheel_mass" value="0.115"/>         <!-- 한쪽 전체 회전부 실측 115 g -->
+
+  <!--
+    왼쪽 회전부 Onshape 값을 COM 기준으로 평행축 변환한 뒤 wheel link 축으로 회전.
+    wheel link는 joint의 -90 deg roll 때문에 local +z가 base_link +y(바퀴축)이다.
+    오른쪽 회전부는 base_link x-z 평면에 대한 좌우 대칭으로 생성한다.
+  -->
+  <xacro:property name="wheel_com_x" value="0.000004"/>
+  <xacro:property name="wheel_com_y" value="0.000004"/>
+  <xacro:property name="wheel_com_axial_offset" value="0.001011"/>
+  <xacro:property name="wheel_ixx" value="0.000077083887245"/>
+  <xacro:property name="wheel_ixy" value="0.000000000001840"/>
+  <xacro:property name="wheel_ixz_abs" value="0.000000007585060"/>
+  <xacro:property name="wheel_iyy" value="0.000077083887245"/>
+  <xacro:property name="wheel_iyz_abs" value="0.000000007581060"/>
+  <xacro:property name="wheel_izz" value="0.000145643797320"/>
+
+  <!--
+    Onshape에서 계산한 바퀴 제외 고정부 전체의 질량 특성.
+    카메라, LiDAR, 캐스터, 배터리, NUC, OpenCR 등이 모두 포함되어 있으므로
+    각 고정 센서 링크에는 별도 inertial을 두지 않고 base_link에 합산한다.
+    관성행렬은 base_link 기준 Onshape 값을 평행축 정리로 COM 기준 변환한 값이다.
+  -->
+  <xacro:property name="base_mass" value="1.939969"/>
+  <xacro:property name="base_com_x" value="-0.031713"/>
+  <xacro:property name="base_com_y" value="0.000047"/>
+  <xacro:property name="base_com_z" value="0.040927"/>
+  <xacro:property name="base_ixx" value="0.005943510141947677"/>
+  <xacro:property name="base_ixy" value="-0.000005376651134159"/>
+  <xacro:property name="base_ixz" value="-0.000309920589483520"/>
+  <xacro:property name="base_iyy" value="0.007039459728624638"/>
+  <xacro:property name="base_iyz" value="-0.000009725224770639"/>
+  <xacro:property name="base_izz" value="0.004035941015893918"/>
+  <xacro:property name="robot_model_mass" value="${base_mass + 2.0*wheel_mass}"/>
+
+  <!--
+    base_link 기준 로봇 전체 수평 외곽. 바퀴 볼트, 카메라 등 돌출부 포함.
+    비대칭 직사각형 footprint의 가장 먼 뒤쪽 모서리는 약 0.148645 m이다.
+  -->
+  <xacro:property name="footprint_front" value="0.067645"/>
+  <xacro:property name="footprint_rear" value="0.118073"/>
+  <xacro:property name="footprint_left" value="0.0903"/>
+  <xacro:property name="footprint_right" value="0.0903"/>
+  <xacro:property name="robot_radius" value="0.149"/>       <!-- 보수적으로 mm 단위 올림 -->
+
+  <!-- 차체: 실측한 여섯 방향 외곽을 감싸는 보수적인 단일 box collision -->
+  <xacro:property name="base_length" value="0.185718"/>     <!-- 앞 67.645 + 뒤 118.073 mm -->
+  <xacro:property name="base_width" value="0.1222"/>        <!-- 좌 61.1 + 우 61.1 mm -->
+  <xacro:property name="base_height" value="0.159081"/>     <!-- 위 118.531 + 아래 40.55 mm -->
+  <xacro:property name="base_x" value="-0.025214"/>         <!-- (앞 67.645 - 뒤 118.073) / 2 -->
+  <xacro:property name="base_y" value="0.0"/>               <!-- 좌우 대칭 -->
+  <xacro:property name="base_z" value="0.0389905"/>         <!-- (위 118.531 - 아래 40.55) / 2 -->
+
+  <!--
+    Onshape Assembly 원점 기준 STL을 base_link 좌표로 변환하는 visual 전용 pose.
+    Assembly 기준 base_link = (-165.482, -186.000, 58.854) mm.
+    축 대응: robot +X = Assembly -Y, robot +Y = Assembly +X, +Z는 동일.
+    STL 정점은 이미 m 단위이므로 mesh scale은 1이다.
+  -->
+  <xacro:property name="base_visual_mesh_x" value="-0.186"/>
+  <xacro:property name="base_visual_mesh_y" value="0.165482"/>
+  <xacro:property name="base_visual_mesh_z" value="-0.058854"/>
+  <xacro:property name="base_visual_mesh_roll" value="0.0"/>
+  <xacro:property name="base_visual_mesh_pitch" value="0.0"/>
+  <xacro:property name="base_visual_mesh_yaw" value="${pi/2.0}"/>
+  <xacro:property name="base_visual_mesh_scale" value="1.0"/>
+
+  <!-- 후방 캐스터 접촉부 -->
+  <xacro:property name="caster_x" value="-0.079073"/>       <!-- 바퀴축 중심선에서 뒤로 79.073 mm -->
+  <xacro:property name="caster_y" value="0.0"/>             <!-- 로봇 좌우 정중앙 -->
+  <xacro:property name="caster_radius" value="0.00238125"/> <!-- 실측 볼 지름 4.7625 mm -->
+  <!-- base_link는 바퀴축 높이이며, 볼의 아랫점이 바닥에 닿도록 중심 z 계산 -->
+  <xacro:property name="caster_z" value="${-wheel_radius + caster_radius}"/>
+
+  <!-- LiDAR 장착 위치/자세 및 외형 -->
+  <!-- 밑면 중심 (-33.073, 0, 96.9) mm + 원점 높이 47 mm -->
+  <xacro:property name="lidar_x" value="-0.033073"/>
+  <xacro:property name="lidar_y" value="0.0"/>
+  <xacro:property name="lidar_z" value="0.1439"/>
+  <!-- M12 커넥터 후방, 수평 정방향: Mid-360 XYZ와 base_link XYZ가 일치 -->
+  <xacro:property name="lidar_roll" value="0.0"/>
+  <xacro:property name="lidar_pitch" value="0.0"/>
+  <xacro:property name="lidar_yaw" value="0.0"/>
+  <!-- Livox Mid-360: 외형은 65 x 65 x 60 mm, 원통 collision으로 근사 -->
+  <xacro:property name="lidar_radius" value="0.0325"/>
+  <xacro:property name="lidar_height" value="0.060"/>
+  <!-- 점군 원점은 밑면에서 47 mm, 본체 중심은 밑면에서 30 mm -->
+  <xacro:property name="lidar_body_center_z_from_origin" value="-0.017"/>
+
+  <!--
+    D405 장착 기준점: 뒤쪽 M3 두 구멍의 정중앙(뒤쪽 외장면).
+    사용자가 한쪽 M3 구멍에서 측정했지만 정상 장착에서는 두 구멍의 x/z가 같고,
+    카메라 본체가 로봇 중앙에 있으므로 정중앙의 y는 0으로 둔다.
+  -->
+  <xacro:property name="camera_mount_x" value="0.039665"/>
+  <xacro:property name="camera_mount_y" value="0.0"/>
+  <xacro:property name="camera_mount_z" value="0.089248"/>
+  <xacro:property name="camera_roll" value="0.0"/>
+  <xacro:property name="camera_pitch" value="${17.0*pi/180.0}"/> <!-- 아래보기 17 deg -->
+  <xacro:property name="camera_yaw" value="0.0"/>
+
+  <!-- M3 정중앙에서 left-imager 깊이 원점까지의 D405 본체 좌표 오프셋 -->
+  <xacro:property name="camera_optical_offset_x" value="0.0192"/> <!-- 후면에서 전면 유리 안쪽 깊이 원점까지 -->
+  <xacro:property name="camera_optical_offset_y" value="0.009"/>  <!-- 본체 중앙에서 카메라 왼쪽 -->
+  <xacro:property name="camera_optical_offset_z" value="0.0"/>
+
+  <!-- Rz(yaw) * Ry(pitch) * Rx(roll)로 장착 오프셋을 base_link 좌표로 변환 -->
+  <xacro:property name="camera_x" value="${camera_mount_x + cos(camera_yaw)*cos(camera_pitch)*camera_optical_offset_x + (cos(camera_yaw)*sin(camera_pitch)*sin(camera_roll)-sin(camera_yaw)*cos(camera_roll))*camera_optical_offset_y + (cos(camera_yaw)*sin(camera_pitch)*cos(camera_roll)+sin(camera_yaw)*sin(camera_roll))*camera_optical_offset_z}"/>
+  <xacro:property name="camera_y" value="${camera_mount_y + sin(camera_yaw)*cos(camera_pitch)*camera_optical_offset_x + (sin(camera_yaw)*sin(camera_pitch)*sin(camera_roll)+cos(camera_yaw)*cos(camera_roll))*camera_optical_offset_y + (sin(camera_yaw)*sin(camera_pitch)*cos(camera_roll)-cos(camera_yaw)*sin(camera_roll))*camera_optical_offset_z}"/>
+  <xacro:property name="camera_z" value="${camera_mount_z - sin(camera_pitch)*camera_optical_offset_x + cos(camera_pitch)*sin(camera_roll)*camera_optical_offset_y + cos(camera_pitch)*cos(camera_roll)*camera_optical_offset_z}"/>
+
+  <!-- RealSense D405: x=깊이, y=폭, z=높이 -->
+  <xacro:property name="camera_body_x" value="0.023"/>
+  <xacro:property name="camera_body_y" value="0.042"/>
+  <xacro:property name="camera_body_z" value="0.042"/>
+  <!-- camera_frame은 광학 원점이므로 본체 중심을 광학 원점 기준으로 되돌린다. -->
+  <xacro:property name="camera_body_center_x_from_optical" value="${camera_body_x/2.0-camera_optical_offset_x}"/>
+  <xacro:property name="camera_body_center_y_from_optical" value="${-camera_optical_offset_y}"/>
+  <xacro:property name="camera_body_center_z_from_optical" value="0.0"/>
+
+  <!-- Gazebo LiDAR 사양 -->
+  <!-- 실제 Mid-360 비반복 점군이 아닌 /scan_mid360_raw용 Gazebo 2D 근사 -->
+  <xacro:property name="lidar_samples" value="360"/>
+  <xacro:property name="lidar_min_angle" value="-${pi}"/>
+  <xacro:property name="lidar_max_angle" value="${pi}"/>
+  <xacro:property name="lidar_min_range" value="0.10"/>
+  <xacro:property name="lidar_max_range" value="40.0"/>
+  <xacro:property name="lidar_range_resolution" value="0.02"/>
+  <xacro:property name="lidar_update_rate" value="10.0"/>
+
+  <!-- Gazebo IMU의 1-sigma 백색잡음. 플러그인은 이 값의 제곱을 공분산으로 발행한다. -->
+  <xacro:property name="imu_gaussian_noise" value="0.002"/> <!-- rad/s 및 센서 출력용 초기값 -->
+
+  <!-- Gazebo 카메라 사양: 수평 FOV는 rad -->
+  <xacro:property name="camera_horizontal_fov" value="1.5184364"/> <!-- D405 RGB 약 87 deg -->
+  <!-- Docker/Gazebo에서 안정적으로 30 Hz를 유지하기 위한 시뮬레이션 해상도 -->
+  <xacro:property name="camera_width" value="640"/>
+  <xacro:property name="camera_height" value="480"/>
+  <xacro:property name="camera_update_rate" value="30.0"/>
+
+</robot>

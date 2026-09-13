@@ -1,0 +1,25 @@
+# UNCALIBRATED STARTING TEMPLATE FOR THE PHYSICAL D405.
+#
+# These values are the upstream AutoRace 320x240 projection defaults. They are
+# intentionally separate from gazebo_projection.yaml and are not evidence of
+# calibration on the assembled D405. Measure the four trapezoid points after
+# mounting the camera, extend the top edge only as far as both physical lane
+# boundaries remain stable, and pass the resulting file with
+# projection_config:=/absolute/path/to/measured_d405_projection.yaml.
+calibration_status: unverified_template
+opencv_threads: 1
+input_width: 320
+input_height: 240
+
+center_x: 160.0
+top_x: 72.0
+top_y: 4.0
+bottom_x: 115.0
+bottom_y: 120.0
+
+output_width: 1000
+output_height: 600
+destination_left_x: 200.0
+destination_right_x: 800.0
+destination_bottom_y: 600.0
+output_shift_x: 0.0

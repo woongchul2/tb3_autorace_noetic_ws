@@ -1,0 +1,147 @@
+# Gazebo-only mission polygons in turtlebot3_autorace_2020 world coordinates.
+# Hardware must use a separately surveyed file; do not copy these coordinates.
+
+pose:
+  # AMCL owns map -> odom. Read its standard map -> base transform directly.
+  map_frame: map
+  base_frame: base_footprint
+  transform_timeout: 0.03
+
+zone:
+  # Activate the expected mission as soon as AMCL is this far inside it.
+  # Completion always comes from that mission controller.
+  enter_margin: 0.03
+  # Publish the AMCL-owned pose and polygon signals at 10 Hz.
+  signal_period: 0.10
+
+# Only the expected polygon can activate; later polygons are ignored until the
+# preceding mission completes.
+sequence: [intersection, obstacle, parking, zigzag, level_crossing, tunnel]
+
+missions:
+  intersection:
+    # Keep mission ordering independent from the upstream direction window
+    # below. The global 0.03 m enter margin opens this gate at x=1.62. Actual
+    # cmd_vel handoff is still delayed to the measured entry-path start plane.
+    polygon:
+      - [1.18, -0.86]
+      - [1.65, -0.86]
+      - [1.65, -0.54]
+      - [1.18, -0.54]
+    gate_topic: /mission/enable/intersection
+    inside_topic: /mission/inside/intersection
+    # Mission completion uses the direction-specific exit path logic, not this
+    # generic polygon clearance.
+    clearance_margin: 0.15
+    clearance_topic: /mission/clear/intersection_observation
+    completion_topic: /intersection/state
+    completion_values: [COMPLETE]
+
+  obstacle:
+    # Construction barriers are centred near x=1.49..1.74, y=0.54..1.46.
+    # In the official-start bag the approach stayed straight until map x=1.36.
+    # With the global 0.03 m enter margin, this west edge opens the gate near
+    # x=1.31: about 50 mm before that measured turn, without limiting the
+    # preceding straight to the 0.09 m/s acquisition speed.
+    polygon:
+      - [1.28, -0.10]
+      - [2.00, -0.10]
+      - [2.00, 1.60]
+      - [1.28, 1.60]
+    gate_topic: /mission/enable/obstacle
+    inside_topic: /mission/inside/obstacle
+    # The fixed exit is yaw 180 deg, so the polygon's +y normal sees the
+    # rectangular half-width (0.0903 m), not the circumscribed corner radius.
+    # Add the 0.009 m line margin and 0.0107 m for AMCL error. The integrated
+    # run left the physical rectangle 38.9 mm beyond the polygon.
+    clearance_margin: 0.11
+    clearance_topic: /mission/clear/obstacle
+    completion_topic: /obstacle/state
+    completion_values: [COMPLETE]
+
+  parking:
+    # Covers the parking sign and the two randomized parked-car positions.
+    polygon:
+      - [-0.10, 0.55]
+      - [1.03, 0.55]
+      - [1.03, 2.10]
+      - [-0.10, 2.10]
+    gate_topic: /mission/enable/parking
+    inside_topic: /mission/inside/parking
+    clearance_margin: 0.15
+    clearance_topic: /mission/clear/parking
+    completion_topic: /parking/state
+    completion_values: [COMPLETE]
+
+  zigzag:
+    # This intentionally overlaps the parking exit because sequence ordering
+    # prevents early activation. Its east/north edges include the AMCL poses
+    # recorded at both parking-branch completions, so the gate opens on the
+    # next 10 Hz sample instead of letting lane control reach the first bend.
+    polygon:
+      - [-1.24, 1.50]
+      - [0.65, 1.50]
+      - [0.65, 2.10]
+      - [-1.24, 2.10]
+    gate_topic: /mission/enable/zigzag
+    inside_topic: /mission/inside/zigzag
+    # The cropped route ends near x=-1.392 m, leaving the complete footprint
+    # beyond this trigger polygon before the low-speed lane join.
+    clearance_margin: 0.12
+    clearance_topic: /mission/clear/zigzag
+    completion_topic: /zigzag/state
+    completion_values: [COMPLETE]
+
+  level_crossing:
+    # After the zigzag exit and the following left bend, arm LiDAR before the
+    # simulator lowers the barrier near x=-1.0, y=1.2. Sequence ordering keeps
+    # the static stop sign and earlier construction barriers from activating
+    # this detector.
+    polygon:
+      - [-1.70, 1.08]
+      - [-0.65, 1.08]
+      - [-0.65, 1.42]
+      - [-1.70, 1.42]
+    gate_topic: /mission/enable/level_crossing
+    inside_topic: /mission/inside/level_crossing
+    clearance_margin: 0.15
+    clearance_topic: /mission/clear/level_crossing
+    completion_topic: /level_crossing/state
+    completion_values: [COMPLETE]
+
+  tunnel:
+    # Gate only at the surveyed north-west portal. A rectangle covering the
+    # whole tunnel used to acquire cmd_vel above the north wall at x=-0.31,
+    # forcing a 4.2 m approach detour instead of entering at the known portal.
+    # The portal is only 0.286 m wide, so acquire while its approach lane is
+    # still visible and align before crossing the wall end.
+    polygon:
+      - [-1.90, 0.08]
+      - [-1.60, 0.08]
+      - [-1.60, 0.40]
+      - [-1.90, 0.40]
+    gate_topic: /mission/enable/tunnel
+    inside_topic: /mission/inside/tunnel
+    # This clearance signal describes departure from the entrance gate only
+    # and is mission-manager diagnostics. The tunnel controller verifies its
+    # own frozen-map exit clearance_x before lane handoff.
+    clearance_margin: 0.13
+    clearance_topic: /mission/clear/tunnel
+    completion_topic: /tunnel/state
+    completion_values: [COMPLETE]
+
+# Auxiliary AMCL regions publish observations only; they do not alter the
+# ordered mission sequence or transfer cmd_vel ownership.
+regions:
+  intersection_direction_observation:
+    # Extend only the incoming/east side. With this region's 0.03 m inside
+    # margin, westbound observation starts at x=1.69: about 0.58 s before the
+    # first direction frame in the official-start trace. The narrow y range
+    # excludes unrelated course signs and contains the entry handoff plane.
+    polygon:
+      - [1.18, -0.86]
+      - [1.72, -0.86]
+      - [1.72, -0.54]
+      - [1.18, -0.54]
+    inside_margin: 0.03
+    inside_topic: /mission/inside/intersection_direction_observation

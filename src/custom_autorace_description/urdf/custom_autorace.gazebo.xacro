@@ -1,0 +1,97 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:arg name="laser_visual" default="false"/>
+  <xacro:arg name="camera_visual" default="false"/>
+  <xacro:arg name="simulate_imu" default="true"/>
+  <xacro:arg name="simulate_lidar" default="true"/>
+  <xacro:arg name="simulate_camera" default="true"/>
+  <xacro:arg name="odometry_source" default="encoder"/>
+  <!-- The EKF owns odom -> base_footprint during normal operation. -->
+  <xacro:arg name="publish_odom_tf" default="false"/>
+
+  <gazebo reference="base_link"><material>Gazebo/DarkGrey</material></gazebo>
+  <gazebo reference="wheel_left_link"><material>Gazebo/FlatBlack</material><mu1>1.0</mu1><mu2>1.0</mu2></gazebo>
+  <gazebo reference="wheel_right_link"><material>Gazebo/FlatBlack</material><mu1>1.0</mu1><mu2>1.0</mu2></gazebo>
+  <gazebo reference="caster_back_link"><material>Gazebo/FlatBlack</material><mu1>0.1</mu1><mu2>0.1</mu2></gazebo>
+  <gazebo>
+    <plugin name="custom_autorace_diff_drive" filename="libgazebo_ros_diff_drive.so">
+      <commandTopic>cmd_vel</commandTopic>
+      <odometryTopic>odom</odometryTopic>
+      <odometryFrame>odom</odometryFrame>
+      <odometrySource>$(arg odometry_source)</odometrySource>
+      <publishOdomTF>$(arg publish_odom_tf)</publishOdomTF>
+      <publishTf>true</publishTf>
+      <robotBaseFrame>base_footprint</robotBaseFrame>
+      <publishWheelTF>false</publishWheelTF>
+      <publishWheelJointState>true</publishWheelJointState>
+      <legacyMode>false</legacyMode>
+      <updateRate>30</updateRate>
+      <leftJoint>wheel_left_joint</leftJoint>
+      <rightJoint>wheel_right_joint</rightJoint>
+      <wheelSeparation>${wheel_separation}</wheelSeparation>
+      <wheelDiameter>${2.0 * wheel_radius}</wheelDiameter>
+      <wheelAcceleration>1.0</wheelAcceleration>
+      <wheelTorque>10.0</wheelTorque>
+      <rosDebugLevel>na</rosDebugLevel>
+    </plugin>
+  </gazebo>
+
+  <xacro:if value="$(arg simulate_imu)">
+  <!-- libgazebo_ros_imu.so is a ModelPlugin, so it must be attached to the model.
+       Nesting it inside an IMU <sensor> makes Gazebo load a ModelPlugin as a
+       SensorPlugin and crashes gzserver while the URDF is being spawned. -->
+  <gazebo>
+    <plugin name="imu_plugin" filename="libgazebo_ros_imu.so">
+      <alwaysOn>true</alwaysOn>
+      <bodyName>imu_link</bodyName>
+      <frameName>imu_link</frameName>
+      <topicName>imu</topicName>
+      <serviceName>imu_service</serviceName>
+      <gaussianNoise>${imu_gaussian_noise}</gaussianNoise>
+      <updateRate>100.0</updateRate>
+    </plugin>
+  </gazebo>
+  </xacro:if>
+
+  <xacro:if value="$(arg simulate_lidar)">
+  <gazebo reference="base_scan">
+    <sensor type="ray" name="lidar_sensor">
+      <always_on>true</always_on>
+      <visualize>$(arg laser_visual)</visualize>
+      <update_rate>${lidar_update_rate}</update_rate>
+      <ray>
+        <scan><horizontal>
+          <samples>${lidar_samples}</samples><resolution>1</resolution>
+          <min_angle>${lidar_min_angle}</min_angle><max_angle>${lidar_max_angle}</max_angle>
+        </horizontal></scan>
+        <range><min>${lidar_min_range}</min><max>${lidar_max_range}</max><resolution>${lidar_range_resolution}</resolution></range>
+        <noise><type>gaussian</type><mean>0.0</mean><stddev>0.01</stddev></noise>
+      </ray>
+      <plugin name="lidar_plugin" filename="libgazebo_ros_laser.so">
+        <topicName>scan_mid360_raw</topicName><frameName>base_scan</frameName>
+      </plugin>
+    </sensor>
+  </gazebo>
+  </xacro:if>
+
+  <xacro:if value="$(arg simulate_camera)">
+  <gazebo reference="camera_frame">
+    <sensor name="camera_sensor" type="camera">
+      <always_on>true</always_on><visualize>$(arg camera_visual)</visualize>
+      <update_rate>${camera_update_rate}</update_rate>
+      <camera>
+        <horizontal_fov>${camera_horizontal_fov}</horizontal_fov>
+        <image><width>${camera_width}</width><height>${camera_height}</height><format>R8G8B8</format></image>
+        <clip><near>0.05</near><far>100</far></clip>
+      </camera>
+      <plugin name="camera_plugin" filename="libgazebo_ros_camera.so">
+        <!-- The sensor already runs at camera_update_rate. 0 disables a second
+             plugin-side throttle that otherwise drops alternating frames. -->
+        <alwaysOn>true</alwaysOn><updateRate>0.0</updateRate>
+        <cameraName>camera</cameraName><frameName>camera_optical_frame</frameName>
+        <imageTopicName>color/image_raw</imageTopicName><cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
+      </plugin>
+    </sensor>
+  </gazebo>
+  </xacro:if>
+</robot>

@@ -1,0 +1,131 @@
+# Safe lane-following controller parameters.
+# Units: linear velocity [m/s], angular velocity [rad/s], timeout [s].
+
+# Desired horizontal center in the 1000 px projected lane image. It is used
+# when the detected yellow/white boundaries are converted to a metric path.
+target_center: 500.0
+
+# Runtime speed ceiling. /control/max_vel may lower this while a mission owns
+# the course-level speed policy.
+maximum_velocity: 0.30
+
+# Stop when /detect/lane_centerline is stale this long.
+lane_timeout: 0.5
+
+# Camera-derived rolling path. No map, AMCL pose, course texture, or surveyed
+# knots are inputs to this path.
+lane_path:
+  odom_timeout: 0.35
+  maximum_pose_stamp_skew: 0.06
+  odom_buffer_size: 120
+  control_period: 0.0333333333
+
+  # Metric bird-eye calibration in base_footprint. Image row 0 is the far top
+  # edge and image_height-1 is the near bottom edge. The Gazebo camera
+  # extrinsic is already included; do not add its translation again. These
+  # values must be replaced by a separately measured D405 calibration before
+  # real-course activation.
+  top_forward_distance: 0.60
+  bottom_forward_distance: 0.16
+  # The detector's 640 px is the complete yellow-to-white lane width. Static
+  # 20 mm lateral shifts move the projected centre by about 51 px, and the
+  # stock texture independently measures 0.250 m between paint centres.
+  lane_width_m: 0.25
+  lane_width_pixels: 640.0
+  minimum_confidence: 0.20
+  # Three current-frame rows over 0.10 m are enough to recover the detector's
+  # local quadratic when a tight bend leaves only one painted side visible.
+  minimum_samples: 3
+  minimum_forward_span: 0.10
+  # A horizon-only fragment cannot define the unobserved route from the ego
+  # pose. 0.37 m includes the calibrated row-320 mid sample (0.365 m).
+  maximum_near_support_distance: 0.37
+  # Hermite control knots remain dense because wider values increased the
+  # recorded-frame peak curvature (0.02 m: 19.96/m vs 0.01 m: 17.04/m).
+  # Output resampling stays independently controlled by sample_spacing.
+  sample_spacing: 0.01
+  shape_control_spacing: 0.01
+  # Treat sub-pixel endpoint motion as a plateau when constraining the
+  # smoothed boundary/centre tangent.
+  endpoint_plateau_pixels: 1.0
+  # Fresh 0.20 m/s active data placed the raw-knot residual and endpoint
+  # displacement p95 near 23.3 px and 19.9 px respectively. These limits keep
+  # that measured envelope while rejecting larger fit-created motion.
+  maximum_fit_residual_pixels: 25.0
+  maximum_endpoint_displacement_pixels: 20.0
+  # Curvature, yaw-rate and angular-acceleration limits may lower the common
+  # per-point profile below the 0.06 m/s nominal minimum. Reject a candidate
+  # only when it would need less than this measured controllable crawl speed.
+  # Run-8 replay needs 0.0401 m/s through its tightest valid transition and
+  # 0.0555 m/s at the captured stop pose; contradictory white connectors need
+  # only 0.0256-0.0333 m/s and remain invalid.
+  minimum_executable_velocity: 0.04
+
+  # Yellow- and white-derived centre candidates are averaged only when both
+  # have broad shared support and agree geometrically. Otherwise each eligible
+  # same-frame candidate must pass the complete ego-connected path checks.
+  fusion_minimum_samples: 4
+  fusion_minimum_overlap: 0.20
+  fusion_maximum_disagreement: 0.03
+  # Do not average two position-close boundaries whose tangents describe
+  # different upcoming turns. For single-boundary paths, the nearest current-
+  # frame support is tried first; this avoids a farther return-lane branch.
+  fusion_maximum_heading_disagreement_deg: 5.0
+  # Keep the measured course-side preference only as a final exact tie-break.
+  preferred_boundary: white
+
+  # The selected current-frame paint is carried inside CommonPath as its line
+  # safety boundary. The shared validator checks the complete asymmetric
+  # rectangle between path samples and through reaction plus full braking.
+  safety:
+    footprint:
+      front: 0.067645
+      rear: 0.118073
+      half_width: 0.0903
+    # Detector samples are paint-centre estimates. The 5 mm radius represents
+    # the Gazebo stripe half-width; measure it again with the physical course.
+    line_half_width: 0.005
+    boundary_sample_spacing: 0.004
+    line_margin: 0.0
+    obstacle_margin: 0.0
+    localization_margin: 0.002
+    tracking_margin: 0.002
+    reaction_time: 0.10
+    stopping_distance_margin: 0.005
+    lookahead_distance: 0.45
+    swept_translation_step: 0.004
+    swept_heading_step_deg: 1.0
+
+  control:
+    # Gazebo-only validated profile. The physical D405 projection, OpenCR
+    # response, and real-course speed profile remain unverified; measure and
+    # configure them separately before enabling this controller on hardware.
+    cruise_velocity: 0.28
+    minimum_velocity: 0.06
+    # The rolling path is rebuilt at the vehicle each frame, so its entry
+    # target equals cruise instead of repeatedly imposing a startup speed.
+    entry_velocity: 0.28
+    exit_velocity: 0.10
+    maximum_linear_velocity: 0.30
+    maximum_angular_velocity: 2.0
+    maximum_lateral_acceleration: 0.08
+    linear_acceleration: 0.20
+    linear_deceleration: 0.35
+    angular_acceleration: 2.50
+    # The target grows from the proven close-range distance with measured
+    # speed. At 0.28 m/s the unclamped value is 0.163 m and the validated
+    # 0.160 m cap avoids a long chord across the tight U.  Curvature braking
+    # moves the target nearer again as the robot slows.
+    lookahead_distance: 0.065
+    lookahead_time: 0.35
+    minimum_lookahead_distance: 0.08
+    maximum_lookahead_distance: 0.16
+    # Curvature braking is already propagated backward through the per-point
+    # speed profile.  Sample that profile at the current projection instead
+    # of coupling speed to the farther steering target.
+    speed_preview_distance: 0.0
+    heading_gain: 0.30
+    curvature_feedforward_weight: 0.15
+    lateral_feedback_gain: 1.0
+    search_back: 3
+    search_ahead_distance: 0.50

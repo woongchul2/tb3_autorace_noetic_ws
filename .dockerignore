@@ -1,0 +1,7 @@
+build/
+devel/
+.catkin_tools/
+.git/
+*.bag
+*.log
+

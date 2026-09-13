@@ -1,0 +1,50 @@
+# UNCALIBRATED STARTING THRESHOLDS FOR THE PHYSICAL D405.
+# Validate the masks in the actual course lighting and keep the sample rows in
+# sync with the measured projection_config. These values are deliberately not
+# loaded from the extended Gazebo projection setup.
+calibration_status: unverified_template
+opencv_threads: 1
+
+detect:
+  lane:
+    white:
+      hue_l: 0
+      hue_h: 179
+      saturation_l: 0
+      saturation_h: 70
+      lightness_l: 105
+      lightness_h: 255
+    yellow:
+      hue_l: 10
+      hue_h: 127
+      saturation_l: 70
+      saturation_h: 255
+      lightness_l: 95
+      lightness_h: 255
+
+boundary:
+  output_topic: /detect/lane_boundaries
+  sample_y: 350
+  band_height: 50
+  minimum_pixels: 100
+
+centerline:
+  sample_rows: [552, 480, 400, 350, 320, 240, 160, 80, 0]
+  support_half_height: 12
+  support_half_width: 40
+  minimum_support_pixels: 20
+  branch_maximum_gap_bands: 1
+  branch_maximum_innovation_pixels: 80.0
+  branch_reversal_maximum_innovation_pixels: 60.0
+  # The uncalibrated destination width is 600 pixels between boundaries.
+  lane_half_width: 300.0
+  minimum_lane_width: 400.0
+  maximum_lane_width: 850.0
+
+minimum_lane_pixels: 3000
+fit_history_length: 5
+temporal_state_every_n_frames: 3
+
+# Preserve every D405 frame for control. The optional annotated JPEG is off in
+# action mode and remains per-frame in calibration mode.
+debug_every_n_frames: 0

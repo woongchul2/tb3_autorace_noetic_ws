@@ -1,0 +1,32 @@
+# Catkin and ROS generated state
+/build/
+/devel/
+/install/
+/logs/
+/.catkin_tools/
+/.ros/
+/src/CMakeLists.txt
+
+# Runtime recordings and local analysis artifacts
+/diagnostics/
+/tmp/
+/official007_deadlock.png
+/%.6f
+*.bag
+*.bag.*
+*.active
+
+# Python and test caches
+**/__pycache__/
+*.py[cod]
+/.pytest_cache/
+**/.pytest_cache/
+
+# Local Codex workspace state
+/.agents/
+/.codex/
+
+# Editor and OS files
+*~
+*.swp
+.DS_Store

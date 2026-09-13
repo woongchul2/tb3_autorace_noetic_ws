@@ -1,0 +1,64 @@
+# AMCL parameters for the 4 m AutoRace Gazebo course. Keep localization on the
+# single conventional [-pi, pi] Mid-360 scan stream.
+
+min_particles: 300
+max_particles: 1500
+kld_err: 0.02
+kld_z: 0.99
+update_min_d: 0.03
+update_min_a: 0.05
+resample_interval: 1
+transform_tolerance: 0.20
+recovery_alpha_slow: 0.0
+recovery_alpha_fast: 0.0
+gui_publish_rate: 10.0
+
+# The parking TurtleBot is intentionally absent from the static map. The
+# probabilistic likelihood-field model can reject beams that disagree with a
+# converged particle set, preventing that dynamic obstacle from dragging the
+# map -> odom estimate during the reverse parking arc.
+laser_model_type: likelihood_field_prob
+do_beamskip: true
+beam_skip_distance: 0.20
+beam_skip_threshold: 0.30
+# Noetic falls back to integrating every observation when skipped_beams >=
+# total_beams * this value. The deterministic Gazebo start and exact world
+# odometry do not need kidnapped-robot recovery, so 1.01 disables that fallback
+# even when the unmapped parking TurtleBot occludes every usable map return.
+# Keep the standard in-range recovery threshold in a separate hardware file.
+beam_skip_error_threshold: 1.01
+laser_max_range: 4.0
+laser_min_range: 0.10
+laser_max_beams: 180
+laser_z_hit: 0.80
+laser_z_short: 0.05
+laser_z_max: 0.05
+laser_z_rand: 0.10
+laser_sigma_hit: 0.08
+laser_lambda_short: 0.10
+laser_likelihood_max_dist: 0.50
+
+# Use the workspace AMCL model that preserves reverse travel below the stock
+# diff model's 1 cm near-zero bearing guard. BACK_OUT finishes with
+# sub-centimetre odom increments, which stock Noetic otherwise applies in the
+# forward direction.
+odom_model_type: diff-signed
+# The integrated Gazebo launch supplies the simulator's exact signed world
+# odometry and starts at a surveyed pose. Keep only a small non-zero particle
+# spread; larger wheel-slip values let the unmapped parking robot form a false
+# localization mode in the otherwise sparse north parking area.
+odom_alpha1: 0.00001
+odom_alpha2: 0.00001
+odom_alpha3: 0.00001
+odom_alpha4: 0.00001
+odom_alpha5: 0.00001
+odom_frame_id: odom
+base_frame_id: base_footprint
+global_frame_id: map
+tf_broadcast: true
+
+# Variances correspond to about 2 mm and 0.2 degree standard deviations. They
+# remain non-zero so the filter can score neighbouring map cells.
+initial_cov_xx: 0.000004
+initial_cov_yy: 0.000004
+initial_cov_aa: 0.000012

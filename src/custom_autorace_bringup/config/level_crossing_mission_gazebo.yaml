@@ -1,0 +1,40 @@
+# Gazebo-only level-crossing LiDAR geometry. Hardware must use a separately
+# measured file for the real barrier, Mid-360 mounting pose and stopping range.
+level_crossing:
+  topics:
+    scan: /scan_mid360_raw
+    zone_gate: /mission/enable/level_crossing
+    zone_clearance: /mission/clear/level_crossing
+    manual_stop: /control/manual_stop
+    cmd_vel: /cmd_vel
+    lane_control_service: /control/lane_mission_handoff
+    lane_stop_service: /control/lane_following
+
+  detection:
+    # base_scan coordinates: +x forward and +y left. A closed barrier spans
+    # most of the lane; the 0.12 m stop sign is intentionally too narrow.
+    minimum_forward_distance: 0.10
+    # Delay the LiDAR stop until the official Gazebo approach carries the robot
+    # inside the simulator's x > -1.45 barrier-open timer zone. Scan noise and
+    # heading make this a calibrated operating value, not a position guarantee.
+    maximum_forward_distance: 0.45
+    corridor_half_width: 0.24
+    maximum_adjacent_beam_gap: 2
+    maximum_point_gap: 0.08
+    minimum_cluster_points: 6
+    minimum_lateral_span: 0.18
+    maximum_depth_spread: 0.09
+    minimum_valid_scan_points: 10
+
+  confirmation:
+    closed_scans: 3
+    open_scans: 5
+    maximum_scan_gap: 0.25
+
+  control:
+    period: 0.05
+
+  timeouts:
+    scan: 0.40
+    handoff: 0.30
+    lane_stop: 0.30

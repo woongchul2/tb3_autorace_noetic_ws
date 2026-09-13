@@ -1,0 +1,208 @@
+# Gazebo construction-course controller. Hardware must use a separately
+# measured footprint, camera scale and course heading file.
+obstacle:
+  topics:
+    scan: /scan_mid360_raw
+    lane_boundaries: /detect/lane_boundaries
+    odometry: /odometry/filtered
+    map_pose: /mission/map_pose
+    zone_gate: /mission/enable/obstacle
+    zone_inside: /mission/inside/obstacle
+    zone_clearance: /mission/clear/obstacle
+    manual_stop: /control/manual_stop
+    cmd_vel: /cmd_vel
+    lane_speed_limit: /control/max_vel
+    lane_control_service: /control/lane_mission_handoff
+    lane_stop_service: /control/lane_following
+
+  course:
+    # The construction straight runs in map +y. AMCL opens the polygon and
+    # seeds LiDAR registration; the resulting course frame is then held in odom.
+    heading_deg: 90.0
+    lane_width: 0.495
+    # Three-point Gazebo calibration at x=1.6275/1.6375/1.6475 m and y=0.05 m
+    # measured about 1850 px/m.  This virtual lane-frame reference removes the
+    # remaining entry offset at the physical sample formerly projected to
+    # y=350 (now y=552); it is not the fitted-line steering target of 500 px.
+    boundary_image_center: 383.0
+    boundary_pixels_per_meter: 1850.0
+    boundary_sample_forward: 0.14
+    minimum_boundary_gap_px: 380.0
+    maximum_boundary_gap_px: 850.0
+    scale_filter_alpha: 0.20
+    line_position_filter_alpha: 0.12
+    boundary_max_heading_deg: 12.0
+    # The mission polygon begins on the horizontal approach. Do not interpret
+    # its camera/LiDAR data as this +map-y corridor until the turn is complete.
+    acquisition_max_heading_deg: 12.0
+    camera_timeout: 0.50
+    # Two visible painted lines may refine the mapped corridor only when their
+    # centre agrees with AMCL. A one-line view beside a barrier is validation
+    # evidence, not permission to translate the surveyed obstacle path.
+    map_corridor_max_residual: 0.004
+
+  footprint:
+    # Measured base_link extents. A circular radius would close barrier 2's
+    # legal opening, so the fixed path uses this oriented rectangle directly.
+    front: 0.067645
+    rear: 0.118073
+    half_width: 0.0903
+    # Keep the previous 14 mm obstacle and 9 mm line envelopes while naming
+    # the localization and tracking contributions used by the common sweep.
+    obstacle_padding: 0.010
+    line_margin: 0.005
+    localization_margin: 0.002
+    tracking_margin: 0.002
+    # This planner-only override is not the runtime LiDAR margin. Runtime
+    # validation uses obstacle_padding above plus localization/tracking margins.
+    validation_obstacle_padding: 0.0
+    validation_line_margin: 0.005
+    # Full margins above remain on the committed-path diagnostic.  During
+    # execution the world-odom pose is checked with the actual rectangle:
+    # contact, rather than consuming the same tracking reserve twice, is the
+    # stop boundary in this geometrically tight construction channel.
+    runtime_obstacle_padding: 0.0
+    runtime_line_margin: 0.0
+    runtime_localization_margin: 0.0
+    runtime_tracking_margin: 0.0
+
+  safety:
+    # Physical extent of the 4 m Gazebo course texture in map coordinates.
+    # It is frozen into odom with the same AMCL snapshot as the committed path
+    # and reported separately from painted-line clearance.
+    map_bounds: [-2.0, 2.0, -2.0, 2.0]
+
+  planner:
+    tracking_position_tolerance: 0.055
+    tracking_heading_tolerance_deg: 28.0
+    collision_check_step: 0.008
+    collision_check_angle_deg: 3.0
+
+  template:
+    # Gazebo-only surveyed map template. Local +x is course-forward (+map y)
+    # and local +y is course-left (-map x). AMCL is only the registration seed;
+    # every path is checked against live LiDAR with the oriented rectangle.
+    map_anchor_x: 1.6375
+    map_anchor_y: 0.0200
+    barriers:
+      - [0.5200, 0.1475, 0.1000, 0.2500]
+      - [0.9800, -0.1025, 0.1000, 0.2500]
+      - [1.4440, 0.1475, 0.1000, 0.2500]
+    barrier_surface_spacing: 0.004
+    # The slalom is a clamped cubic spline. A single quintic continuation then
+    # follows the measured 90-degree left turn to the normal camera lane.
+    start_slope: 0.0
+    end_slope: 0.4474660154
+    knots:
+      # Straight lead-in covers the polygon gate at map y=-0.10; without it,
+      # the full-course handoff would begin ahead of the robot.
+      - [-0.150000, 0.000000]
+      - [-0.100000, 0.000000]
+      - [-0.050000, 0.000000]
+      - [0.000000, 0.000000]
+      - [0.105000, -0.012692]
+      - [0.210000, -0.047079]
+      - [0.311940, -0.088073]
+      - [0.407814, -0.115380]
+      - [0.507104, -0.118394]
+      - [0.611669, -0.082870]
+      - [0.708317, -0.006555]
+      - [0.779888, 0.064114]
+      - [0.851459, 0.111396]
+      - [0.950573, 0.134701]
+      - [1.055573, 0.129651]
+      - [1.159320, 0.107308]
+      - [1.246706, 0.043315]
+      - [1.301016, -0.035646]
+      - [1.375855, -0.095477]
+      - [1.480008, -0.110553]
+      - [1.584751, -0.080402]
+    # The last slalom samples move inward after barrier 3 so the asymmetric
+    # rear corner stays inside the outer white line throughout the left turn.
+    # Keep 20 mm of longitudinal exit reserve after LiDAR registration so the
+    # complete asymmetric footprint clears the mission polygon before the
+    # common follower reaches its terminal sample.  The small westward shift
+    # also increases measured white-paint clearance through the turn.
+    # The nominal endpoint becomes map (1.4883, 1.7550), yaw 180 deg.
+    exit_curve:
+      endpoint: [1.735000, 0.150000000]
+      heading_deg: 90.0
+      start_tangent_length: 0.180
+      end_tangent_length: 0.350
+    lateral_scale: 0.9950
+    sample_spacing: 0.004
+    # Full rectangular margin expansion leaves 3.391 mm on the surveyed path;
+    # the separately sampled course texture remains at least 4 mm clear.
+    minimum_nominal_clearance: 0.0033
+    # Nominal barriers are checked over the full map path once. Live LiDAR
+    # checks the next 0.45 m on every scan, leaving over five seconds to stop
+    # for an unexpected object without rejecting distant noisy surfaces.
+    live_validation_distance: 0.45
+    # AMCL opens the mission and seeds this bounded search. Two obstacle-face
+    # directions in one LiDAR scan then fix the surveyed course frame in odom;
+    # collision checking continues to use every point, not just match inliers.
+    registration:
+      longitudinal_search: 0.18
+      lateral_search: 0.14
+      coarse_step: 0.02
+      fine_window: 0.012
+      fine_step: 0.002
+      inlier_distance: 0.025
+      minimum_inliers: 15
+      maximum_rms: 0.015
+      line_exclusion: 0.025
+    cruise_velocity: 0.070
+    minimum_velocity: 0.035
+    entry_velocity: 0.070
+    exit_velocity: 0.070
+
+  scan:
+    maximum_planning_range: 1.40
+    rear_limit: 0.20
+    cluster_link_distance: 0.08
+    cluster_minimum_points: 3
+    obstacle_point_spacing: 0.012
+    median_window: 5
+    # base_scan origin in base_link, from robot_parameters.xacro.
+    lidar_x: -0.033073
+    lidar_y: 0.0
+    # A scan is transformed only with an odom pose at the scan source stamp.
+    # Nearest-pose use is bounded; wider gaps invalidate the scan and hold zero.
+    maximum_odom_skew: 0.075
+    odom_history_duration: 0.75
+    # Scans may arrive just before their right-hand odom bracket. Keep only a
+    # short bounded queue until exact timestamp interpolation is possible.
+    pending_scan_limit: 4
+
+  control:
+    period: 0.05
+    entry_velocity_cap: 0.09
+    lane_resume_max_velocity: 0.30
+    maximum_angular_velocity: 0.85
+    maximum_lateral_acceleration: 0.035
+    linear_acceleration: 0.25
+    linear_deceleration: 0.80
+    # Gazebo wheelAcceleration=1.0 rad/s^2 limits body yaw acceleration to
+    # about 0.64 rad/s^2; stay below it so the planned curvature is trackable.
+    angular_acceleration: 0.55
+    lookahead_distance: 0.06
+    search_ahead_distance: 0.30
+    heading_gain: 0.35
+    curvature_feedforward_weight: 0.25
+    lateral_feedback_gain: 1.0
+    safety_reaction_time: 0.10
+    safety_stop_margin: 0.005
+    goal_position_tolerance: 0.04
+    goal_heading_tolerance_deg: 10.0
+    goal_crossing_max_distance: 0.10
+
+  timeouts:
+    scan: 0.35
+    odometry: 0.35
+    # AMCL pose source time and callback receipt must both stay fresh. The
+    # future tolerance only absorbs normal ROS timestamp scheduling jitter.
+    map_pose: 0.35
+    map_pose_future_tolerance: 0.05
+    # A map pose is combined only with exact or bracketed odometry at its
+    # source time; both bracket endpoints must lie within this interval.
+    map_pose_odom_skew: 0.075

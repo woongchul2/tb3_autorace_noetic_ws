@@ -1,0 +1,10 @@
+<launch>
+  <arg name="use_gui" default="false"/>
+  <arg name="laser_visual" default="false"/>
+  <arg name="camera_visual" default="false"/>
+  <param name="robot_description" command="$(find xacro)/xacro --inorder $(find custom_autorace_description)/urdf/custom_autorace.urdf.xacro laser_visual:=$(arg laser_visual) camera_visual:=$(arg camera_visual)"/>
+  <node pkg="joint_state_publisher" type="joint_state_publisher" name="joint_state_publisher" unless="$(arg use_gui)"/>
+  <node pkg="joint_state_publisher_gui" type="joint_state_publisher_gui" name="joint_state_publisher_gui" if="$(arg use_gui)"/>
+  <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher"/>
+</launch>
+

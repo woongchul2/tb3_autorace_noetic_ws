@@ -1,0 +1,25 @@
+# Gazebo regression profile for starting just before the level crossing.
+pose:
+  map_frame: map
+  base_frame: base_footprint
+  transform_timeout: 0.03
+
+zone:
+  enter_margin: 0.03
+  signal_period: 0.10
+
+sequence: [level_crossing]
+
+missions:
+  level_crossing:
+    polygon:
+      - [-1.70, 1.08]
+      - [-0.65, 1.08]
+      - [-0.65, 1.42]
+      - [-1.70, 1.42]
+    gate_topic: /mission/enable/level_crossing
+    inside_topic: /mission/inside/level_crossing
+    clearance_margin: 0.15
+    clearance_topic: /mission/clear/level_crossing
+    completion_topic: /level_crossing/state
+    completion_values: [COMPLETE]

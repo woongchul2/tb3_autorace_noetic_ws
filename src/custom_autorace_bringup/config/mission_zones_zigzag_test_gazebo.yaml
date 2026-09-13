@@ -1,0 +1,25 @@
+# Gazebo regression profile for starting on the parking-to-zigzag lead-in.
+pose:
+  map_frame: map
+  base_frame: base_footprint
+  transform_timeout: 0.03
+
+zone:
+  enter_margin: 0.03
+  signal_period: 0.10
+
+sequence: [zigzag]
+
+missions:
+  zigzag:
+    polygon:
+      - [-1.24, 1.50]
+      - [0.65, 1.50]
+      - [0.65, 2.10]
+      - [-1.24, 2.10]
+    gate_topic: /mission/enable/zigzag
+    inside_topic: /mission/inside/zigzag
+    clearance_margin: 0.12
+    clearance_topic: /mission/clear/zigzag
+    completion_topic: /zigzag/state
+    completion_values: [COMPLETE]

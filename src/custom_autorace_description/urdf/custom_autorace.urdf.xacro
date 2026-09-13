@@ -1,0 +1,73 @@
+<?xml version="1.0"?>
+<robot name="custom_autorace" xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:arg name="use_mesh" default="true"/>
+  <xacro:include filename="$(find custom_autorace_description)/urdf/robot_parameters.xacro"/>
+  <xacro:include filename="$(find custom_autorace_description)/urdf/custom_autorace.gazebo.xacro"/>
+
+  <material name="base_color"><color rgba="0.15 0.15 0.15 1"/></material>
+  <material name="wheel_color"><color rgba="0.03 0.03 0.03 1"/></material>
+  <material name="sensor_color"><color rgba="0.25 0.25 0.25 1"/></material>
+
+  <link name="base_footprint"/>
+  <joint name="base_joint" type="fixed">
+    <parent link="base_footprint"/><child link="base_link"/>
+    <origin xyz="0 0 ${wheel_radius}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="base_link">
+    <xacro:if value="$(arg use_mesh)">
+      <visual>
+        <origin xyz="${base_visual_mesh_x} ${base_visual_mesh_y} ${base_visual_mesh_z}" rpy="${base_visual_mesh_roll} ${base_visual_mesh_pitch} ${base_visual_mesh_yaw}"/>
+        <geometry><mesh filename="package://custom_autorace_description/meshes/custom_autorace_fixed.stl" scale="${base_visual_mesh_scale} ${base_visual_mesh_scale} ${base_visual_mesh_scale}"/></geometry>
+        <material name="base_color"/>
+      </visual>
+    </xacro:if>
+    <xacro:unless value="$(arg use_mesh)">
+      <visual><origin xyz="${base_x} ${base_y} ${base_z}"/><geometry><box size="${base_length} ${base_width} ${base_height}"/></geometry><material name="base_color"/></visual>
+    </xacro:unless>
+    <collision><origin xyz="${base_x} ${base_y} ${base_z}"/><geometry><box size="${base_length} ${base_width} ${base_height}"/></geometry></collision>
+    <inertial><origin xyz="${base_com_x} ${base_com_y} ${base_com_z}"/><mass value="${base_mass}"/><inertia ixx="${base_ixx}" ixy="${base_ixy}" ixz="${base_ixz}" iyy="${base_iyy}" iyz="${base_iyz}" izz="${base_izz}"/></inertial>
+  </link>
+
+  <xacro:macro name="wheel" params="side y side_sign">
+    <joint name="wheel_${side}_joint" type="continuous">
+      <parent link="base_link"/><child link="wheel_${side}_link"/>
+      <origin xyz="${wheel_x} ${y} 0" rpy="${-pi/2} 0 0"/><axis xyz="0 0 1"/>
+    </joint>
+    <link name="wheel_${side}_link">
+      <visual><geometry><cylinder radius="${wheel_radius}" length="${wheel_width}"/></geometry><material name="wheel_color"/></visual>
+      <collision><geometry><cylinder radius="${wheel_radius}" length="${wheel_width}"/></geometry></collision>
+      <inertial>
+        <origin xyz="${wheel_com_x} ${wheel_com_y} ${-side_sign*wheel_com_axial_offset}"/>
+        <mass value="${wheel_mass}"/>
+        <inertia ixx="${wheel_ixx}" ixy="${wheel_ixy}" ixz="${-side_sign*wheel_ixz_abs}" iyy="${wheel_iyy}" iyz="${-side_sign*wheel_iyz_abs}" izz="${wheel_izz}"/>
+      </inertial>
+    </link>
+  </xacro:macro>
+  <xacro:wheel side="left" y="${wheel_separation/2.0}" side_sign="1.0"/>
+  <xacro:wheel side="right" y="${-wheel_separation/2.0}" side_sign="-1.0"/>
+
+  <joint name="caster_back_joint" type="fixed"><parent link="base_link"/><child link="caster_back_link"/><origin xyz="${caster_x} ${caster_y} ${caster_z}"/></joint>
+  <link name="caster_back_link">
+    <visual><geometry><sphere radius="${caster_radius}"/></geometry><material name="wheel_color"/></visual>
+    <collision><geometry><sphere radius="${caster_radius}"/></geometry></collision>
+  </link>
+
+  <joint name="imu_joint" type="fixed"><parent link="base_link"/><child link="imu_link"/><origin xyz="0 0 0"/></joint>
+  <link name="imu_link"/>
+
+  <joint name="scan_joint" type="fixed"><parent link="base_link"/><child link="base_scan"/><origin xyz="${lidar_x} ${lidar_y} ${lidar_z}" rpy="${lidar_roll} ${lidar_pitch} ${lidar_yaw}"/></joint>
+  <link name="base_scan">
+    <visual><origin xyz="0 0 ${lidar_body_center_z_from_origin}"/><geometry><cylinder radius="${lidar_radius}" length="${lidar_height}"/></geometry><material name="sensor_color"/></visual>
+    <collision><origin xyz="0 0 ${lidar_body_center_z_from_origin}"/><geometry><cylinder radius="${lidar_radius}" length="${lidar_height}"/></geometry></collision>
+  </link>
+
+  <joint name="camera_joint" type="fixed"><parent link="base_link"/><child link="camera_frame"/><origin xyz="${camera_x} ${camera_y} ${camera_z}" rpy="${camera_roll} ${camera_pitch} ${camera_yaw}"/></joint>
+  <link name="camera_frame">
+    <visual><origin xyz="${camera_body_center_x_from_optical} ${camera_body_center_y_from_optical} ${camera_body_center_z_from_optical}"/><geometry><box size="${camera_body_x} ${camera_body_y} ${camera_body_z}"/></geometry><material name="sensor_color"/></visual>
+    <collision><origin xyz="${camera_body_center_x_from_optical} ${camera_body_center_y_from_optical} ${camera_body_center_z_from_optical}"/><geometry><box size="${camera_body_x} ${camera_body_y} ${camera_body_z}"/></geometry></collision>
+  </link>
+  <!-- REP-103 optical frame: +z forward, +x right, +y down -->
+  <joint name="camera_optical_joint" type="fixed"><parent link="camera_frame"/><child link="camera_optical_frame"/><origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/></joint>
+  <link name="camera_optical_frame"/>
+</robot>

@@ -1,0 +1,83 @@
+<launch>
+  <arg name="gui" default="false"/>
+  <arg name="rviz" default="false"/>
+  <arg name="x_pos" default="0.8"/>
+  <arg name="y_pos" default="-1.747"/>
+  <arg name="yaw_pos" default="0.0"/>
+  <arg name="result_file" default="/tmp/lane_path_result.json"/>
+  <arg name="startup_timeout" default="60.0"/>
+  <arg name="run_timeout" default="30.0"/>
+  <arg name="maximum_velocity" default="0.30"/>
+  <arg name="test_velocity" default="0.28"/>
+  <arg name="controller_label" default="camera_rolling_path"/>
+  <arg name="trial_id" default="single"/>
+  <arg name="oracle_config"
+       default="$(find custom_autorace_bringup)/config/lane_lookahead_gazebo.yaml"/>
+  <arg name="straight_length" default="from_yaml"/>
+  <arg name="course_texture"
+       default="$(find turtlebot3_gazebo)/models/turtlebot3_autorace_2020/course/materials/textures/course.png"/>
+  <!-- Match the fixed evaluation-oracle environment while starting the
+       camera rolling-path controller as the sole /cmd_vel publisher. -->
+  <include file="$(find custom_autorace_bringup)/launch/gazebo.launch">
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="course_texture" value="$(arg course_texture)"/>
+    <arg name="rviz" value="$(arg rviz)"/>
+    <arg name="x_pos" value="$(arg x_pos)"/>
+    <arg name="y_pos" value="$(arg y_pos)"/>
+    <arg name="yaw_pos" value="$(arg yaw_pos)"/>
+    <arg name="odometry_source" value="world"/>
+    <arg name="fuse_imu" value="false"/>
+    <arg name="wait_for_green" value="false"/>
+    <arg name="detect_signs" value="false"/>
+    <arg name="drive_lane" value="false"/>
+    <arg name="mission_models" value="false"/>
+    <arg name="intersection_mission" value="false"/>
+    <arg name="obstacle_mission" value="false"/>
+    <arg name="parking_mission" value="false"/>
+    <arg name="zigzag_mission" value="false"/>
+    <arg name="level_crossing_mission" value="false"/>
+    <arg name="tunnel_mission" value="false"/>
+    <arg name="mission_zones" value="false"/>
+    <arg name="localization" value="false"/>
+  </include>
+
+  <node pkg="custom_autorace_bringup" type="safe_lane_controller.py"
+        name="safe_lane_controller" output="screen">
+    <rosparam command="load"
+              file="$(find custom_autorace_bringup)/config/lane_controller.yaml"/>
+    <param name="enabled" value="false"/>
+    <param name="wait_for_green" value="false"/>
+    <param name="centerline_topic" value="/detect/lane_centerline"/>
+    <param name="odometry_topic" value="/odom"/>
+    <param name="diagnostics_topic"
+           value="/control/lane_path_diagnostics"/>
+    <param name="cmd_vel_topic" value="/cmd_vel"/>
+    <param name="maximum_velocity" value="$(arg maximum_velocity)"/>
+    <param name="lane_path/control/cruise_velocity"
+           value="$(arg test_velocity)"/>
+    <param name="lane_path/control/entry_velocity"
+           value="$(arg test_velocity)"/>
+  </node>
+
+  <!-- Enable only after camera-path diagnostics and benchmark sensors are
+       ready, write one JSON result, then tear down the trial. -->
+  <node pkg="custom_autorace_bringup" type="lane_benchmark_monitor.py"
+        name="lane_benchmark_monitor" output="screen" required="true">
+    <rosparam command="load" file="$(arg oracle_config)"/>
+    <param name="lane_lookahead/geometry/straight/length_override"
+           value="$(arg straight_length)"/>
+    <param name="lane_lookahead/texture/file_override"
+           value="$(arg course_texture)"/>
+    <param name="controller" value="$(arg controller_label)"/>
+    <param name="requested_cruise_velocity" value="$(arg test_velocity)"/>
+    <param name="path_diagnostics_topic"
+           value="/control/lane_path_diagnostics"/>
+    <param name="trial_id" value="$(arg trial_id)"/>
+    <param name="result_file" value="$(arg result_file)"/>
+    <param name="expected_start/x" value="$(arg x_pos)"/>
+    <param name="expected_start/y" value="$(arg y_pos)"/>
+    <param name="expected_start/yaw" value="$(arg yaw_pos)"/>
+    <param name="startup_timeout" value="$(arg startup_timeout)"/>
+    <param name="run_timeout" value="$(arg run_timeout)"/>
+  </node>
+</launch>

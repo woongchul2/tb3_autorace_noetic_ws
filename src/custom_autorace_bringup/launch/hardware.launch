@@ -1,0 +1,71 @@
+<launch>
+  <arg name="opencr_device" default="/dev/ttyACM0"/>
+  <arg name="opencr_baud" default="115200"/>
+  <arg name="start_opencr" default="true"/>
+  <arg name="start_camera" default="true"/>
+  <arg name="start_lidar" default="true"/>
+  <arg name="start_perception" default="$(arg start_camera)"/>
+  <arg name="camera_serial_no" default=""/>
+  <arg name="camera_color_width" default="1280"/>
+  <arg name="camera_color_height" default="720"/>
+  <arg name="camera_color_fps" default="30"/>
+
+  <arg name="projection_config"
+       default="$(find custom_autorace_bringup)/config/d405_projection_uncalibrated.yaml"/>
+  <arg name="lane_detector_config"
+       default="$(find custom_autorace_bringup)/config/lane_detector_d405_uncalibrated.yaml"/>
+  <arg name="traffic_light_config"
+       default="$(find turtlebot3_autorace_detect)/param/traffic_light/traffic_light.yaml"/>
+  <arg name="sign_detector_config"
+       default="$(find custom_autorace_bringup)/config/sign_detector_d405.yaml"/>
+  <arg name="lane_process_every_n_frames" default="1"/>
+  <arg name="lane_temporal_state_every_n_frames" default="3"/>
+  <arg name="traffic_light_process_every_n_frames" default="1"/>
+  <arg name="traffic_light_processing_rate_hz" default="30.0"/>
+  <arg name="sign_process_every_n_frames" default="1"/>
+  <arg name="sign_debug_every_n_frames" default="3"/>
+
+  <param name="robot_description" command="$(find xacro)/xacro --inorder $(find custom_autorace_description)/urdf/custom_autorace.urdf.xacro"/>
+  <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher"/>
+
+  <group if="$(arg start_opencr)">
+    <node pkg="rosserial_python" type="serial_node.py" name="turtlebot3_core" output="screen">
+      <param name="port" value="$(arg opencr_device)"/>
+      <param name="baud" value="$(arg opencr_baud)"/>
+    </node>
+  </group>
+
+  <group if="$(arg start_camera)">
+    <include file="$(find custom_autorace_bringup)/launch/realsense_d405.launch">
+      <arg name="serial_no" value="$(arg camera_serial_no)"/>
+      <arg name="color_width" value="$(arg camera_color_width)"/>
+      <arg name="color_height" value="$(arg camera_color_height)"/>
+      <arg name="color_fps" value="$(arg camera_color_fps)"/>
+    </include>
+  </group>
+
+  <group if="$(arg start_perception)">
+    <include file="$(find custom_autorace_bringup)/launch/hardware_perception.launch">
+      <arg name="projection_config" value="$(arg projection_config)"/>
+      <arg name="lane_detector_config" value="$(arg lane_detector_config)"/>
+      <arg name="traffic_light_config" value="$(arg traffic_light_config)"/>
+      <arg name="sign_detector_config" value="$(arg sign_detector_config)"/>
+      <arg name="lane_process_every_n_frames"
+           value="$(arg lane_process_every_n_frames)"/>
+      <arg name="lane_temporal_state_every_n_frames"
+           value="$(arg lane_temporal_state_every_n_frames)"/>
+      <arg name="traffic_light_process_every_n_frames"
+           value="$(arg traffic_light_process_every_n_frames)"/>
+      <arg name="traffic_light_processing_rate_hz"
+           value="$(arg traffic_light_processing_rate_hz)"/>
+      <arg name="sign_process_every_n_frames"
+           value="$(arg sign_process_every_n_frames)"/>
+      <arg name="sign_debug_every_n_frames"
+           value="$(arg sign_debug_every_n_frames)"/>
+    </include>
+  </group>
+
+  <group if="$(arg start_lidar)">
+    <include file="$(find custom_autorace_bringup)/launch/livox_mid360.launch"/>
+  </group>
+</launch>

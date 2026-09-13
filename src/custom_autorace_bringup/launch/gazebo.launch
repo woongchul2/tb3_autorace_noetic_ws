@@ -1,0 +1,238 @@
+<launch>
+  <arg name="x_pos" default="0.8"/>
+  <arg name="y_pos" default="-1.747"/>
+  <arg name="z_pos" default="0.01"/>
+  <arg name="yaw_pos" default="0.0"/>
+  <arg name="gui" default="true"/>
+  <arg name="course_texture" default="from_model"/>
+  <!-- Gazebo's encoder-mode diff-drive odometry publishes reverse speed as a
+       positive magnitude. Use the plugin's signed world pose/twist as the EKF
+       input, while keeping the EKF as the sole odom -> base_footprint TF
+       authority. Encoder odometry remains an explicit diagnostic option;
+       hardware keeps its separate OpenCR odometry path. -->
+  <arg name="fuse_imu" default="true"/>
+  <arg name="odometry_source" default="world"/>
+  <!-- Mission controllers follow the odometry publisher selected above. This
+       also keeps the explicit fuse_imu:=false diagnostic mode operable. -->
+  <arg name="mission_odometry_topic"
+       default="$(eval '/odometry/filtered' if arg('fuse_imu') else '/odom')"/>
+  <arg name="detect_lane" default="true"/>
+  <arg name="lane_process_every_n_frames" default="1"/>
+  <arg name="lane_temporal_state_every_n_frames" default="3"/>
+  <arg name="traffic_light_process_every_n_frames" default="1"/>
+  <arg name="traffic_light_processing_rate_hz" default="30.0"/>
+  <arg name="detect_signs" default="true"/>
+  <arg name="drive_lane" default="true"/>
+  <arg name="intersection_mission" default="true"/>
+  <arg name="obstacle_mission" default="true"/>
+  <arg name="parking_mission" default="true"/>
+  <arg name="zigzag_mission" default="true"/>
+  <arg name="level_crossing_mission" default="true"/>
+  <arg name="tunnel_mission" default="true"/>
+  <arg name="mission_zones" default="true"/>
+  <arg name="mission_zone_config"
+       default="$(find custom_autorace_bringup)/config/mission_zones_gazebo.yaml"/>
+  <arg name="localization" default="true"/>
+  <arg name="map_file"
+       default="$(find custom_autorace_bringup)/maps/autorace_gazebo.yaml"/>
+  <arg name="amcl_config"
+       default="$(find custom_autorace_bringup)/config/amcl_gazebo.yaml"/>
+  <!-- Test hook: 0=camera result, 2=force left, 3=force right. -->
+  <arg name="forced_direction" default="0"/>
+  <arg name="mission_models" default="true"/>
+  <!-- Regression hook: 1=normal full-course timing, 6=start with the barrier. -->
+  <arg name="mission_models_initial_state" default="1"/>
+  <!-- Regression hook: random, 0.23 (right occupied), or 0.73 (left occupied). -->
+  <arg name="parking_obstacle_x" default="random"/>
+  <arg name="wait_for_green" default="true"/>
+  <arg name="rviz" default="true"/>
+  <arg name="rviz_config" default="/workspace/autorace_sim.rviz"/>
+
+  <include file="$(find custom_autorace_description)/launch/gazebo_autorace.launch">
+    <arg name="x_pos" value="$(arg x_pos)"/>
+    <arg name="y_pos" value="$(arg y_pos)"/>
+    <arg name="z_pos" value="$(arg z_pos)"/>
+    <arg name="yaw_pos" value="$(arg yaw_pos)"/>
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="course_texture" value="$(arg course_texture)"/>
+    <arg name="fuse_imu" value="$(arg fuse_imu)"/>
+    <arg name="odometry_source" value="$(arg odometry_source)"/>
+  </include>
+
+  <!-- Spawn and update the original AutoRace mission environment:
+       traffic light, intersection direction, level-crossing bar and parking car. -->
+  <include if="$(arg mission_models)"
+           file="$(find turtlebot3_autorace_core)/launch/turtlebot3_autorace_mission.launch">
+    <arg name="parking_obstacle_x" value="$(arg parking_obstacle_x)"/>
+    <arg name="initial_traffic_state" value="$(arg mission_models_initial_state)"/>
+  </include>
+
+  <!-- Resize the Gazebo camera once for the AutoRace vision pipeline. -->
+  <node pkg="custom_autorace_bringup" type="autorace_image_adapter.py"
+        name="autorace_image_adapter" output="screen">
+    <param name="input_image" value="/camera/color/image_raw"/>
+    <param name="input_camera_info" value="/camera/color/camera_info"/>
+    <param name="output_width" value="320"/>
+    <param name="output_height" value="240"/>
+    <param name="output_frame" value="camera_optical_frame"/>
+    <param name="raw_output_topic" value="/camera/image_rect_color"/>
+    <param name="output_topic" value="/camera/image_rect_color/compressed"/>
+  </node>
+
+  <!-- Run bird-eye projection and the unified lane detector. The detector
+       publishes both /detect/lane and /detect/lane_boundaries from one mask. -->
+  <include if="$(arg detect_lane)"
+           file="$(find custom_autorace_bringup)/launch/gazebo_lane_detection.launch">
+    <arg name="process_every_n_frames"
+         value="$(arg lane_process_every_n_frames)"/>
+    <arg name="temporal_state_every_n_frames"
+         value="$(arg lane_temporal_state_every_n_frames)"/>
+  </include>
+
+  <!-- Detect the simulated traffic light from the camera image. -->
+  <include if="$(arg wait_for_green)"
+           file="$(find custom_autorace_bringup)/launch/gazebo_traffic_light_detection.launch">
+    <arg name="process_every_n_frames"
+         value="$(arg traffic_light_process_every_n_frames)"/>
+    <arg name="processing_rate_hz"
+         value="$(arg traffic_light_processing_rate_hz)"/>
+  </include>
+
+  <!-- Follow the camera-derived /detect/lane_centerline rolling path.
+       /control/lane_following remains the immediate manual stop/resume
+       service; mission handoff uses a separate service so it does not inject
+       a zero cmd_vel. -->
+  <node if="$(arg drive_lane)"
+        pkg="custom_autorace_bringup" type="safe_lane_controller.py"
+        name="safe_lane_controller" output="screen">
+    <rosparam command="load"
+              file="$(find custom_autorace_bringup)/config/lane_controller.yaml"/>
+    <param name="enabled" value="true"/>
+    <param name="wait_for_green" value="$(arg wait_for_green)"/>
+    <param name="traffic_light_topic" value="/detect/traffic_light"/>
+    <param name="green_signal_value" value="2"/>
+    <param name="centerline_topic" value="/detect/lane_centerline"/>
+    <param name="odometry_topic" value="$(arg mission_odometry_topic)"/>
+    <param name="cmd_vel_topic" value="/cmd_vel"/>
+  </node>
+
+  <!-- One shared camera-facing detector publishes typed results for every
+       mission. It is intentionally independent of any mission controller. -->
+  <node if="$(arg detect_signs)"
+        pkg="custom_autorace_bringup" type="sign_detector.py"
+        name="sign_detector" output="screen">
+    <rosparam command="load"
+              file="$(find custom_autorace_bringup)/config/sign_detector.yaml"/>
+  </node>
+
+  <!-- Intersection flow: AMCL observation and direction read, common entry
+       path, normal lane following around the painted semicircle, direct AMCL
+       map-pose takeover, common exit path, and final lane handoff. -->
+  <group if="$(arg intersection_mission)">
+    <node pkg="custom_autorace_bringup" type="intersection_mission_controller.py"
+          name="intersection_mission_controller" output="screen">
+      <rosparam command="load"
+                file="$(find custom_autorace_bringup)/config/intersection_mission.yaml"/>
+      <param name="mission/forced_direction" value="$(arg forced_direction)"/>
+      <param name="mission/odom_topic" value="$(arg mission_odometry_topic)"/>
+    </node>
+  </group>
+
+  <!-- After the ordered AMCL gate opens, LiDAR registers the surveyed course
+       and latches it in odom. One curvature-continuous path crosses all three
+       barriers; camera lines and live LiDAR validate its oriented rectangular
+       sweep. cmd_vel returns after AMCL reports the measured exit clearance. -->
+  <group if="$(arg obstacle_mission)">
+    <node pkg="custom_autorace_bringup" type="obstacle_mission_controller.py"
+          name="obstacle_mission_controller" output="screen">
+      <rosparam command="load"
+                file="$(find custom_autorace_bringup)/config/obstacle_mission_gazebo.yaml"/>
+      <param name="obstacle/topics/odometry" value="$(arg mission_odometry_topic)"/>
+    </node>
+  </group>
+
+  <!-- AMCL validates the ordered parking gate and start pose. The first
+       post-handoff map-to-odom relation immutably anchors every
+       route target. Fresh raw odom drives the manoeuvre and evaluates the final
+       VERIFY/JOIN bounds. At the stopped decision pose AMCL projects Mid-360
+       returns into both bay ROIs,
+       and later provides only coarse parked/return checks. Symmetric parking
+       arcs use the uniquely clear dotted entrance. The northbound aisle exit,
+       zero-end-curvature left turn and westbound alignment tail form one
+       continuous path; fresh multi-frame lane confirmation transfers control
+       while the robot is still moving on that straight tail. -->
+  <group if="$(arg parking_mission)">
+    <node pkg="custom_autorace_bringup" type="parking_mission_controller.py"
+          name="parking_mission_controller" output="screen">
+      <rosparam command="load"
+                file="$(find custom_autorace_bringup)/config/parking_mission_gazebo.yaml"/>
+    </node>
+  </group>
+
+  <!-- Parking leaves lane control while moving on the westbound alignment tail.
+       The ordered
+       zigzag gate then projects the live odom pose onto one texture-surveyed
+       C2 path, tracks a
+       lookahead target with curvature pre-braking, and checks the swept
+       footprint against both actual paint edges. It returns cmd_vel through a
+       verified low-speed lane join before the following U-turn. -->
+  <group if="$(arg zigzag_mission)">
+    <node pkg="custom_autorace_bringup" type="zigzag_mission_controller.py"
+          name="zigzag_mission_controller" output="screen">
+      <rosparam command="load"
+                file="$(find custom_autorace_bringup)/config/zigzag_mission_gazebo.yaml"/>
+    </node>
+  </group>
+
+  <!-- In the ordered level-crossing zone, inspect the raw LiDAR scan for the
+       broad horizontal barrier. Only after consecutive closed observations
+       does this controller take cmd_vel ownership and hold zero; consecutive
+       clear scans return ownership to normal lane following. -->
+  <group if="$(arg level_crossing_mission)">
+    <node pkg="custom_autorace_bringup"
+          type="level_crossing_lidar_controller.py"
+          name="level_crossing_lidar_controller" output="screen"
+          required="true">
+      <rosparam command="load"
+                file="$(find custom_autorace_bringup)/config/level_crossing_mission_gazebo.yaml"/>
+    </node>
+  </group>
+
+  <!-- The ordered tunnel gate transfers cmd_vel before camera lanes disappear.
+       AMCL anchors map-to-odom once at the entrance so unmapped obstacles
+       cannot pull the mission frame. Timestamped Mid-360 returns build a
+       separate dynamic layer, and forward Hybrid A* sweeps the measured
+       asymmetric footprint around obstacles whose positions were not mapped. -->
+  <group if="$(arg tunnel_mission)">
+    <node pkg="custom_autorace_bringup"
+          type="tunnel_mission_controller.py"
+          name="tunnel_mission_controller" output="screen" required="true">
+      <rosparam command="load"
+                file="$(find custom_autorace_bringup)/config/tunnel_mission_gazebo.yaml"/>
+      <param name="tunnel/topics/odometry" value="$(arg mission_odometry_topic)"/>
+    </node>
+  </group>
+
+  <!-- Compare AMCL's global map pose with fixed course polygons, activate only
+       the next expected mission, and publish per-mission enable gates. -->
+  <node if="$(arg mission_zones)"
+        pkg="custom_autorace_bringup" type="mission_zone_manager.py"
+        name="mission_zone_manager" output="screen">
+    <rosparam command="load"
+              file="$(arg mission_zone_config)"/>
+  </node>
+
+  <!-- AMCL is the only map -> odom authority and consumes the raw scan. -->
+  <include if="$(arg localization)"
+           file="$(find custom_autorace_bringup)/launch/amcl_localization.launch">
+    <arg name="map_file" value="$(arg map_file)"/>
+    <arg name="amcl_config" value="$(arg amcl_config)"/>
+    <arg name="initial_pose_x" value="$(arg x_pos)"/>
+    <arg name="initial_pose_y" value="$(arg y_pos)"/>
+    <arg name="initial_pose_a" value="$(arg yaw_pos)"/>
+    <arg name="scan_topic" value="/scan_mid360_raw"/>
+  </include>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="rviz"
+        args="-d $(arg rviz_config)" output="screen"/>
+</launch>

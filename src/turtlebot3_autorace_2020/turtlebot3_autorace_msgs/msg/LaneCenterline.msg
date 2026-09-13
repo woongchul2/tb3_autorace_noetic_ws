@@ -1,0 +1,10 @@
+std_msgs/Header header
+uint32 image_width
+uint32 image_height
+float32[] sample_rows
+float32[] center_x
+float32[] yellow_x
+float32[] white_x
+float32[] confidence
+bool[] yellow_valid
+bool[] white_valid

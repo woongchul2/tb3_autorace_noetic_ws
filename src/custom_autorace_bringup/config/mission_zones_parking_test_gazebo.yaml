@@ -1,0 +1,24 @@
+# Gazebo regression profile for starting at the parking approach. Normal races
+# use mission_zones_gazebo.yaml and retain intersection -> obstacle -> parking.
+pose:
+  map_frame: map
+  base_frame: base_footprint
+  transform_timeout: 0.03
+
+zone:
+  enter_margin: 0.03
+  signal_period: 0.10
+
+sequence: [parking]
+
+missions:
+  parking:
+    polygon:
+      - [-0.10, 0.55]
+      - [1.03, 0.55]
+      - [1.03, 2.10]
+      - [-0.10, 2.10]
+    gate_topic: /mission/enable/parking
+    inside_topic: /mission/inside/parking
+    completion_topic: /parking/state
+    completion_values: [COMPLETE]

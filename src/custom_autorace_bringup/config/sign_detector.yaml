@@ -1,0 +1,118 @@
+sign_detector:
+  input_topic: /camera/color/image_raw
+  output_topic: /detect/signs
+  debug_image_topic: /detect/image_signs
+  # The D405 publishes at 30 Hz. Process every frame and cap ORB work to a
+  # 448-pixel-wide, aspect-preserving image (1280x720 becomes 448x252).
+  process_every_n_frames: 1
+  # Each vision stage is a separate process. One OpenCV worker per process
+  # avoids all stages independently expanding to every host core.
+  opencv_threads: 1
+  processing_width: 448
+  # Debug remains available at 10 Hz without serializing a full-resolution
+  # image for every 30 Hz classification result.
+  debug_every_n_frames: 3
+  minimum_confidence: 0.45
+
+  # Direction signs are needed only for Intersection and the warning sign is
+  # needed again for Tunnel. Suspend expensive ORB matching during the four
+  # intervening missions so the rolling lane path retains fresh 30 Hz input.
+  mission_gating:
+    enabled: true
+    topic: /mission/current
+    active_missions: [intersection, tunnel]
+    template_filter:
+      # Before the first /mission/current message, keep standalone camera
+      # testing bounded to the three templates used by integrated driving.
+      fail_open_without_mission: false
+      standalone_templates: [direction_left, direction_right, tunnel_warning]
+      mission_templates:
+        intersection: [direction_left, direction_right]
+        tunnel: [tunnel_warning]
+
+  # Templates share one classifier, while the mission filter above bounds the
+  # per-frame comparisons. The container OpenCV has no SIFT, so ORB
+  # descriptors and a RANSAC homography provide scale/perspective-tolerant
+  # matching.
+  classifiers:
+    # Close direction signs can extend outside the upper image boundary. ORB
+    # then loses the outer rim, so this classifier uses the blue disk and the
+    # horizontal white-arrow asymmetry. Positive asymmetry is LEFT because the
+    # curved arrow stem occupies the right half; negative is RIGHT.
+    direction_geometry:
+      enabled: true
+      blue_hsv_lower: [90, 70, 30]
+      blue_hsv_upper: [140, 255, 255]
+      white_saturation_max: 90
+      white_value_min: 120
+      minimum_blue_area_ratio: 0.015
+      maximum_blue_area_ratio: 0.50
+      minimum_hull_circularity: 0.70
+      # At 1% perimeter epsilon the rendered rounded-square parking panel has
+      # seven vertices; both measured clipped direction disks retain 9-10.
+      polygon_epsilon_ratio: 0.01
+      minimum_polygon_vertices: 8
+      minimum_aspect_ratio: 0.75
+      maximum_aspect_ratio: 2.00
+      interior_erode_ratio: 0.08
+      minimum_arrow_pixels: 200
+      asymmetry_deadband: 0.03
+
+    template:
+      enabled: true
+      package: turtlebot3_autorace_detect
+      directory: image
+      orb_nfeatures: 1200
+      orb_fast_threshold: 5
+      ratio_test: 0.75
+      ransac_reprojection_threshold: 4.0
+      minimum_inlier_ratio: 0.45
+      minimum_projected_area: 80.0
+      maximum_projected_area_ratio: 0.50
+      projection_margin_ratio: 0.20
+
+      entries:
+        intersection_warning:
+          enabled: true
+          file: intersection.png
+          min_good_matches: 9
+          min_inliers: 6
+          priority: 10
+        direction_left:
+          enabled: true
+          file: left.png
+          min_good_matches: 8
+          min_inliers: 5
+          priority: 20
+        direction_right:
+          enabled: true
+          file: right.png
+          min_good_matches: 8
+          min_inliers: 5
+          priority: 20
+        construction_warning:
+          enabled: true
+          file: construction.png
+          min_good_matches: 8
+          min_inliers: 5
+          priority: 10
+        tunnel_warning:
+          enabled: true
+          file: tunnel.png
+          min_good_matches: 6
+          min_inliers: 4
+          priority: 10
+        parking:
+          enabled: true
+          # Gazebo uses this exact texture; hardware needs its own calibrated
+          # template config rather than silently falling back to this asset.
+          file: package://turtlebot3_gazebo/models/turtlebot3_autorace_2020/traffic_parking/materials/textures/traffic_parking.png
+          min_good_matches: 6
+          min_inliers: 4
+          priority: 10
+        level_crossing_warning:
+          enabled: true
+          file: stop.png
+          min_good_matches: 6
+          min_inliers: 4
+          priority: 10

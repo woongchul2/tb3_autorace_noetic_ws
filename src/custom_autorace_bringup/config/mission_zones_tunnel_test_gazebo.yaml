@@ -1,0 +1,25 @@
+# Tunnel-only diagnostic gate. This is not an official-start completion test.
+pose:
+  map_frame: map
+  base_frame: base_footprint
+  transform_timeout: 0.03
+
+zone:
+  enter_margin: 0.03
+  signal_period: 0.10
+
+sequence: [tunnel]
+
+missions:
+  tunnel:
+    polygon:
+      - [-1.90, 0.08]
+      - [-1.60, 0.08]
+      - [-1.60, 0.40]
+      - [-1.90, 0.40]
+    gate_topic: /mission/enable/tunnel
+    inside_topic: /mission/inside/tunnel
+    clearance_margin: 0.13
+    clearance_topic: /mission/clear/tunnel
+    completion_topic: /tunnel/state
+    completion_values: [COMPLETE]

@@ -1,0 +1,50 @@
+---
+opencv_threads: 1
+detect:
+  lane:
+    white:
+      hue_l: 0
+      hue_h: 179
+      saturation_l: 0
+      saturation_h: 70
+      lightness_l: 105
+      lightness_h: 255
+    yellow:
+      hue_l: 10
+      hue_h: 127
+      saturation_l: 70
+      saturation_h: 255
+      lightness_l: 95
+      lightness_h: 255
+boundary:
+  output_topic: /detect/lane_boundaries
+  # Same physical ground point as row 350 in the former y=176..239
+  # projection. With the extended y=110..239 projection it maps to 551.85.
+  sample_y: 552
+  # The former 50-row band maps to 9.44 rows in the extended projection.
+  band_height: 10
+  minimum_pixels: 100
+
+# Minimum colour-mask area required before fitting a driving lane.
+minimum_lane_pixels: 3000
+
+# Number of valid polynomial fits averaged to suppress frame-to-frame jitter.
+fit_history_length: 5
+
+centerline:
+  # Track one current-frame 8-connected painted branch from near to far. A
+  # one-band mask break may reconnect only inside the measured x innovation;
+  # a farther component is never reacquired after the branch is lost.
+  branch_maximum_gap_bands: 1
+  branch_maximum_innovation_pixels: 80.0
+  branch_reversal_maximum_innovation_pixels: 60.0
+
+# Detection and path publication remain 30 Hz. Adaptive HSV thresholds and
+# reliability counters update every third frame to retain their former 10 Hz
+# response time rather than becoming three times more aggressive.
+temporal_state_every_n_frames: 3
+
+# The annotated JPEG is diagnostics only. Keep it disabled in action mode so
+# its drawing/compression cannot take frames from the 30 Hz control path.
+# Calibration mode still publishes it every frame.
+debug_every_n_frames: 0

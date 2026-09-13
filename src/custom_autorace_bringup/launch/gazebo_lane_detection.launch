@@ -1,0 +1,32 @@
+<launch>
+  <arg name="process_every_n_frames" default="1"/>
+  <arg name="temporal_state_every_n_frames" default="3"/>
+
+  <!-- One detector publishes the lane centre and same-frame colour boundaries. -->
+  <group ns="camera">
+    <node pkg="turtlebot3_autorace_camera" type="image_projection"
+          name="image_projection" output="screen">
+      <rosparam command="load"
+                file="$(find custom_autorace_bringup)/config/gazebo_projection.yaml"/>
+      <param name="input_image_type" value="raw"/>
+      <param name="input_topic" value="/camera/image_rect_color"/>
+      <param name="output_image_type" value="raw"/>
+      <param name="output_topic" value="/camera/image_projected"/>
+    </node>
+
+    <node pkg="turtlebot3_autorace_camera" type="image_compensation"
+          name="image_compensation_projection" output="screen">
+      <param name="input_image_type" value="raw"/>
+      <param name="input_topic" value="/camera/image_projected"/>
+      <param name="output_topic" value="/camera/image_projected_compensated"/>
+      <param name="clip_hist_percent" value="1.0"/>
+    </node>
+  </group>
+
+  <include file="$(find turtlebot3_autorace_detect)/launch/detect_lane.launch">
+    <arg name="mode" value="action"/>
+    <arg name="process_every_n_frames" value="$(arg process_every_n_frames)"/>
+    <arg name="temporal_state_every_n_frames"
+         value="$(arg temporal_state_every_n_frames)"/>
+  </include>
+</launch>

@@ -1,0 +1,20 @@
+<launch>
+  <arg name="process_every_n_frames" default="1"/>
+  <arg name="processing_rate_hz" default="30.0"/>
+
+  <!-- Reuse the ROBOTIS detector with the custom D405-compatible image topic. -->
+  <node pkg="turtlebot3_autorace_detect" type="detect_traffic_light"
+        name="detect_traffic_light" output="screen">
+    <rosparam command="load"
+              file="$(find turtlebot3_autorace_detect)/param/traffic_light/traffic_light.yaml"/>
+    <param name="is_detection_calibration_mode" value="false"/>
+    <param name="process_every_n_frames" value="$(arg process_every_n_frames)"/>
+    <param name="processing_rate_hz" value="$(arg processing_rate_hz)"/>
+
+    <remap from="/detect/image_input/compressed"
+           to="/camera/image_rect_color/compressed"/>
+    <remap from="/detect/image_output" to="/detect/image_traffic_light"/>
+    <remap from="/detect/image_output/compressed"
+           to="/detect/image_traffic_light/compressed"/>
+  </node>
+</launch>

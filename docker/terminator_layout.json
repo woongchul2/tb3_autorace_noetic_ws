@@ -1,0 +1,38 @@
+{
+  "profile": {
+    "scrollbar_position": "hidden",
+    "show_titlebar": true,
+    "use_system_font": true
+  },
+  "layout": {
+    "vertical": false,
+    "autorace": [
+      {
+        "children": [
+          {
+            "command": "docker exec -it custom-autorace-noetic /workspace/docker/enter_ros_shell.sh bringup"
+          },
+          {
+            "command": "docker exec -it custom-autorace-noetic /workspace/docker/enter_ros_shell.sh teleop"
+          },
+          {
+            "command": "docker exec -it custom-autorace-noetic /workspace/docker/enter_ros_shell.sh plot"
+          }
+        ]
+      },
+      {
+        "children": [
+          {
+            "command": "docker exec -it custom-autorace-noetic /workspace/docker/enter_ros_shell.sh shell"
+          },
+          {
+            "command": "docker exec -it custom-autorace-noetic /workspace/docker/enter_ros_shell.sh monitor"
+          },
+          {
+            "command": "docker exec -it custom-autorace-noetic /workspace/docker/enter_ros_shell.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

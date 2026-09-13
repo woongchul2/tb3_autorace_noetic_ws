@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+
+# Authors: Leon Jung, [AuTURBO] Ki Hoon Kim (https://github.com/auturbo), Gilbert
+
+import cv2
+import numpy as np
+import rospy
+from cv_bridge import CvBridge, CvBridgeError
+from dynamic_reconfigure.server import Server
+from sensor_msgs.msg import CompressedImage, Image
+from turtlebot3_autorace_camera.cfg import ImageProjectionParamsConfig
+
+
+def _projection_param(name, default):
+    """Read the flat runtime parameter before the legacy calibration tree."""
+    flat_name = "~{}".format(name)
+    if rospy.has_param(flat_name):
+        return rospy.get_param(flat_name)
+    legacy_name = "~camera/extrinsic_camera_calibration/{}".format(name)
+    return rospy.get_param(legacy_name, default)
+
+
+class ImageProjection:
+    RAW_IMAGE_BUFFER_SIZE = 1 << 24
+
+    def __init__(self):
+        self.cvBridge = CvBridge()
+        self.opencv_threads = max(
+            1, int(rospy.get_param("~opencv_threads", 1))
+        )
+        cv2.setNumThreads(self.opencv_threads)
+
+        # The four legacy calibration values remain compatible with the
+        # ROBOTIS YAML. The remaining values let calibrated environments use
+        # this same projection implementation instead of a wrapper node.
+        self.center_x = float(_projection_param("center_x", 160.0))
+        self.top_x = float(_projection_param("top_x", 72.0))
+        self.top_y = float(_projection_param("top_y", 4.0))
+        self.bottom_x = float(_projection_param("bottom_x", 115.0))
+        self.bottom_y = float(_projection_param("bottom_y", 120.0))
+        self.output_width = int(_projection_param("output_width", 1000))
+        self.output_height = int(_projection_param("output_height", 600))
+        self.destination_left_x = float(
+            _projection_param("destination_left_x", 200.0)
+        )
+        self.destination_right_x = float(
+            _projection_param("destination_right_x", 800.0)
+        )
+        self.destination_bottom_y = float(
+            _projection_param("destination_bottom_y", self.output_height)
+        )
+        self.output_shift_x = float(_projection_param("output_shift_x", 0.0))
+
+        self.is_calibration_mode = bool(
+            rospy.get_param(
+                "~is_extrinsic_camera_calibration_mode",
+                rospy.get_param("/is_extrinsic_camera_calibration_mode", False),
+            )
+        )
+
+        input_topic = rospy.get_param(
+            "~input_topic", "/camera/image_input/compressed"
+        )
+        self.input_image_type = str(
+            rospy.get_param("~input_image_type", "compressed")
+        ).strip().lower()
+        if self.input_image_type not in ("compressed", "raw"):
+            raise rospy.ROSInitException(
+                "input_image_type must be 'compressed' or 'raw'"
+            )
+        output_topic = rospy.get_param(
+            "~output_topic", "/camera/image_output/compressed"
+        )
+        self.output_image_type = str(
+            rospy.get_param("~output_image_type", "compressed")
+        ).strip().lower()
+        if self.output_image_type not in ("compressed", "raw"):
+            raise rospy.ROSInitException(
+                "output_image_type must be 'compressed' or 'raw'"
+            )
+        calibration_topic = rospy.get_param(
+            "~calibration_topic", "/camera/image_calib/compressed"
+        )
+
+        self.pub_image_projected = rospy.Publisher(
+            output_topic,
+            Image if self.output_image_type == "raw" else CompressedImage,
+            queue_size=1,
+        )
+        if self.is_calibration_mode:
+            self.pub_image_calib = rospy.Publisher(
+                calibration_topic, CompressedImage, queue_size=1
+            )
+            self.reconfigure_server = Server(
+                ImageProjectionParamsConfig, self.cbGetImageProjectionParam
+            )
+
+        self.homography = self._make_homography()
+        self.sub_image_original = rospy.Subscriber(
+            input_topic,
+            Image if self.input_image_type == "raw" else CompressedImage,
+            self.cbImageProjection,
+            queue_size=1,
+            buff_size=self.RAW_IMAGE_BUFFER_SIZE,
+            tcp_nodelay=True,
+        )
+
+        rospy.loginfo(
+            "[Image Projection] center_x=%.1f top_x=%.1f top_y=%.1f "
+            "bottom_x=%.1f bottom_y=%.1f output=%dx%d shift_x=%.1f",
+            self.center_x,
+            self.top_x,
+            self.top_y,
+            self.bottom_x,
+            self.bottom_y,
+            self.output_width,
+            self.output_height,
+            self.output_shift_x,
+        )
+
+    def cbGetImageProjectionParam(self, config, level):
+        rospy.loginfo(
+            "[Image Projection] top_x=%d top_y=%d bottom_x=%d bottom_y=%d",
+            config.top_x,
+            config.top_y,
+            config.bottom_x,
+            config.bottom_y,
+        )
+        self.top_x = float(config.top_x)
+        self.top_y = float(config.top_y)
+        self.bottom_x = float(config.bottom_x)
+        self.bottom_y = float(config.bottom_y)
+        self.homography = self._make_homography()
+        return config
+
+    def _source_points(self):
+        top_row = 180.0 - self.top_y
+        bottom_row = 120.0 + self.bottom_y
+        return np.float32(
+            [
+                [self.center_x - self.top_x, top_row],
+                [self.center_x + self.top_x, top_row],
+                [self.center_x + self.bottom_x, bottom_row],
+                [self.center_x - self.bottom_x, bottom_row],
+            ]
+        )
+
+    def _make_homography(self):
+        destination = np.float32(
+            [
+                [self.destination_left_x + self.output_shift_x, 0.0],
+                [self.destination_right_x + self.output_shift_x, 0.0],
+                [
+                    self.destination_right_x + self.output_shift_x,
+                    self.destination_bottom_y,
+                ],
+                [
+                    self.destination_left_x + self.output_shift_x,
+                    self.destination_bottom_y,
+                ],
+            ]
+        )
+        return cv2.getPerspectiveTransform(self._source_points(), destination)
+
+    def _calibration_image(self, image):
+        points = np.rint(self._source_points()).astype(np.int32)
+        calibration = np.copy(image)
+        for index in range(4):
+            start = tuple(points[index])
+            end = tuple(points[(index + 1) % 4])
+            calibration = cv2.line(calibration, start, end, (0, 0, 255), 1)
+        return calibration
+
+    def _project_image(self, image):
+        blurred = cv2.GaussianBlur(image, (5, 5), 0)
+        projected = cv2.warpPerspective(
+            blurred,
+            self.homography,
+            (self.output_width, self.output_height),
+        )
+
+        # Preserve the black masks used by the original AutoRace projection.
+        lower_mask_y = int(round(self.output_height * 340.0 / 600.0))
+        left_corner_x = int(
+            round(self.output_width * 200.0 / 1000.0 + self.output_shift_x)
+        )
+        right_corner_x = int(
+            round(self.output_width * 799.0 / 1000.0 + self.output_shift_x)
+        )
+        left_mask = np.array(
+            [
+                [0, self.output_height - 1],
+                [0, lower_mask_y],
+                [left_corner_x, self.output_height - 1],
+            ],
+            dtype=np.int32,
+        )
+        right_mask = np.array(
+            [
+                [self.output_width - 1, self.output_height - 1],
+                [self.output_width - 1, lower_mask_y],
+                [right_corner_x, self.output_height - 1],
+            ],
+            dtype=np.int32,
+        )
+        return cv2.fillPoly(projected, [left_mask, right_mask], (0, 0, 0))
+
+    def cbImageProjection(self, msg_img):
+        if self.input_image_type == "raw":
+            try:
+                image = self.cvBridge.imgmsg_to_cv2(
+                    msg_img, desired_encoding="bgr8"
+                )
+            except CvBridgeError as error:
+                rospy.logwarn_throttle(
+                    5.0, "Could not read raw AutoRace camera image: %s", error
+                )
+                return
+        else:
+            encoded = np.frombuffer(msg_img.data, dtype=np.uint8)
+            if encoded.size == 0:
+                rospy.logwarn_throttle(
+                    5.0, "Could not decode AutoRace camera image"
+                )
+                return
+            image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            if image is None:
+                rospy.logwarn_throttle(
+                    5.0, "Could not decode AutoRace camera image"
+                )
+                return
+
+        if self.is_calibration_mode:
+            calibration_msg = self.cvBridge.cv2_to_compressed_imgmsg(
+                self._calibration_image(image), dst_format="jpg"
+            )
+            calibration_msg.header = msg_img.header
+            self.pub_image_calib.publish(calibration_msg)
+
+        projected = self._project_image(image)
+        if self.output_image_type == "raw":
+            projected_msg = self.cvBridge.cv2_to_imgmsg(
+                projected, encoding="bgr8"
+            )
+        else:
+            projected_msg = self.cvBridge.cv2_to_compressed_imgmsg(
+                projected, dst_format="jpg"
+            )
+        projected_msg.header = msg_img.header
+        self.pub_image_projected.publish(projected_msg)
+
+    def main(self):
+        rospy.spin()
+
+
+if __name__ == "__main__":
+    rospy.init_node("image_projection")
+    node = ImageProjection()
+    node.main()

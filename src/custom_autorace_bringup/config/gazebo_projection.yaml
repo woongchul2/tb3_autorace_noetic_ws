@@ -1,0 +1,32 @@
+# Input trapezoid geometry for /camera/image_rect_color/compressed (320 x 240).
+# Keep center_x at the value that makes straight physical lines project as
+# straight lines. Do not use it for final horizontal centering.
+opencv_threads: 1
+center_x: 160.0
+
+# Half-width and vertical position of the sampled trapezoid.
+# Extend the projected ground plane to source row 110 (180 - top_y).
+# A straight official-start frame keeps both painted boundaries stable there;
+# top_x 28 preserves the calibrated lane-width ratio at the farther row.
+top_x: 28.0
+top_y: 70.0
+bottom_x: 115.0
+bottom_y: 119.0
+
+# Bird-eye output geometry. The detector assumes the two lane boundaries are
+# about 640 px apart (320 px from either boundary to the driving center).
+# The original calibration measured yellow=92 px and white=909.5 px at its
+# control sample. The destination span keeps that physical cross-section at
+# approximately 640 px after extending the forward view.
+output_width: 1000
+output_height: 600
+destination_left_x: 265.14
+destination_right_x: 734.86
+# Last valid output row. The legacy calibration keeps its original default 600.
+destination_bottom_y: 599.0
+
+# Translate the completed bird-eye image without changing its perspective.
+# Positive moves the projected image right; negative moves it left.
+# This offset keeps the measured lane midpoint at approximately x=500 after
+# the horizontal scale correction above.
+output_shift_x: -24.07
