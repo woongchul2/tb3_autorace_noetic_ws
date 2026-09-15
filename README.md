@@ -5,6 +5,55 @@
 workspace다. 프로젝트 고유 제어기와 설정은 `src/custom_autorace_bringup`, 로봇·센서
 구성은 `src/custom_autorace_description`에 있다.
 
+## 빠른 실행
+
+### Docker / Gazebo
+
+호스트에 Docker Compose v2, Terminator와 X11이 필요하다.
+
+```bash
+git clone https://github.com/woongchul2/tb3_autorace_noetic_ws.git
+cd tb3_autorace_noetic_ws
+./docker/start_sim_terminator.sh
+```
+
+열린 Terminator 패널에서 빌드 후 통합 launch를 실행한다.
+
+```bash
+./docker/build_workspace.sh
+source /workspace/devel/setup.bash
+roslaunch custom_autorace_bringup gazebo.launch
+```
+
+`gazebo.launch`가 Gazebo와 전체 미션을 함께 시작하므로 Gazebo를 별도로 실행하지 않는다.
+
+### 실물 로봇
+
+현재 `hardware.launch`는 OpenCR, D405, Mid-360과 인지만 실행한다. AMCL, 차선·미션
+제어기와 실물용 지도는 포함하지 않으며 `/cmd_vel`을 발행하지 않는다.
+
+실행 전에 다음 항목이 필요하다.
+
+- [`firmware/custom_autorace_core`](firmware/custom_autorace_core)를 OpenCR에 업로드
+- [`d405_projection_uncalibrated.yaml`](src/custom_autorace_bringup/config/d405_projection_uncalibrated.yaml)과
+  [`lane_detector_d405_uncalibrated.yaml`](src/custom_autorace_bringup/config/lane_detector_d405_uncalibrated.yaml)을
+  별도 측정 파일로 복사한 뒤 장착 상태에서 보정
+- [`MID360_config.json`](src/custom_autorace_bringup/config/MID360_config.json)의
+  호스트·LiDAR IP를 실제 값으로 변경
+- 컨테이너에 D405 USB와 `/dev/ttyACM0` 전달
+
+기본 `compose.noetic.yaml`에는 USB·serial 장치 전달이 설정되어 있지 않다.
+보정 파일을 만든 뒤 ROS Noetic 셸에서 센서·인지 bringup을 실행한다.
+
+```bash
+roslaunch custom_autorace_bringup hardware.launch \
+  projection_config:=/workspace/src/custom_autorace_bringup/config/d405_projection_measured.yaml \
+  lane_detector_config:=/workspace/src/custom_autorace_bringup/config/lane_detector_d405_measured.yaml
+```
+
+실물 전체 자동주행에는 실측 지도·AMCL 설정, 미션 구역·경로 YAML과 이를 묶는 실물
+통합 launch가 추가로 필요하다. Gazebo용 지도와 미션 YAML은 실물에 사용하지 않는다.
+
 ## 현재 검증 기준
 
 2026-09-13의 공식 시작점 통합 **run23**에서 실제 카메라가 선택한 LEFT 교차로부터
@@ -35,7 +84,8 @@ footprint 통과까지 확인했다.
 - [작업 원칙](AGENTS.md): 구현 및 최종 검증 기준
 - [Notion 작성 규칙](NOTION_GUIDE.md): AutoRace 관련 Notion 문서 규칙
 
-실행 명령은 여러 문서에 복제하지 않고 `DOCKER_NOETIC.md`를 단일 기준으로 유지한다.
+README에는 최초 실행만 두고, 나머지 실행 옵션과 시험 명령은 `DOCKER_NOETIC.md`를
+단일 기준으로 유지한다.
 
 ## 진단 자료 방침
 
