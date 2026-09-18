@@ -4,9 +4,14 @@
   <arg name="z_pos" default="0.01"/>
   <arg name="yaw_pos" default="0.0"/>
   <arg name="gui" default="true"/>
-  <!-- from_model keeps the upstream world unchanged. An absolute PNG path
-       stages a digest-specific course model without modifying package files. -->
+  <!-- from_model uses the upstream course texture. An absolute PNG path stages
+       a digest-specific course model without modifying package files. -->
   <arg name="course_texture" default="from_model"/>
+  <!-- auto advances layout_a/layout_b/layout_c once per roslaunch. An explicit
+       layout name keeps deterministic regression runs reproducible. -->
+  <arg name="tunnel_obstacle_layout" default="auto"/>
+  <arg name="tunnel_obstacle_layout_config"
+       default="$(find custom_autorace_description)/config/tunnel_obstacle_layouts.yaml"/>
   <arg name="use_mesh" default="true"/>
   <arg name="simulate_imu" default="true"/>
   <arg name="simulate_lidar" default="true"/>
@@ -24,12 +29,12 @@
        instead of inheriting a maximized ~/.gazebo/gui.ini state. -->
   <env name="GAZEBO_GUI_INI_FILE"
        value="$(find custom_autorace_description)/config/gazebo_gui.ini"/>
-  <include unless="$(eval arg('course_texture') != 'from_model')"
+  <include unless="$(eval arg('course_texture') != 'from_model' or arg('tunnel_obstacle_layout') != 'layout_a')"
            file="$(find gazebo_ros)/launch/empty_world.launch">
     <arg name="world_name" value="$(find turtlebot3_gazebo)/worlds/turtlebot3_autorace_2020.world"/>
     <arg name="paused" value="false"/><arg name="use_sim_time" value="true"/><arg name="gui" value="$(arg gui)"/>
   </include>
-  <group if="$(eval arg('course_texture') != 'from_model')">
+  <group if="$(eval arg('course_texture') != 'from_model' or arg('tunnel_obstacle_layout') != 'layout_a')">
     <param name="/use_sim_time" value="true"/>
     <param name="gazebo/enable_ros_network" value="true"/>
     <node name="gazebo" pkg="custom_autorace_description"
@@ -37,12 +42,20 @@
           args="-e ode $(find turtlebot3_gazebo)/worlds/turtlebot3_autorace_2020.world">
       <env name="CUSTOM_AUTORACE_COURSE_TEXTURE"
            value="$(arg course_texture)"/>
+      <env name="CUSTOM_AUTORACE_TUNNEL_LAYOUT"
+           value="$(arg tunnel_obstacle_layout)"/>
+      <env name="CUSTOM_AUTORACE_TUNNEL_LAYOUT_CONFIG"
+           value="$(arg tunnel_obstacle_layout_config)"/>
     </node>
     <node if="$(arg gui)" name="gazebo_gui"
           pkg="custom_autorace_description" type="gazebo_course_server.py"
           args="--client" output="screen">
       <env name="CUSTOM_AUTORACE_COURSE_TEXTURE"
            value="$(arg course_texture)"/>
+      <env name="CUSTOM_AUTORACE_TUNNEL_LAYOUT"
+           value="$(arg tunnel_obstacle_layout)"/>
+      <env name="CUSTOM_AUTORACE_TUNNEL_LAYOUT_CONFIG"
+           value="$(arg tunnel_obstacle_layout_config)"/>
     </node>
   </group>
   <param name="robot_description" command="$(find xacro)/xacro $(find custom_autorace_description)/urdf/custom_autorace.urdf.xacro use_mesh:=$(arg use_mesh) simulate_imu:=$(arg simulate_imu) simulate_lidar:=$(arg simulate_lidar) simulate_camera:=$(arg simulate_camera) odometry_source:=$(arg odometry_source) publish_odom_tf:=$(arg publish_raw_odom_tf)"/>

@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Park in the only empty bay using AMCL map poses and a live LaserScan."""
+"""Register the surveyed parking fixture locally, then park in the empty bay."""
 
 import math
 import threading
 from collections import OrderedDict, deque
+from dataclasses import replace
 
 import numpy as np
 import rospy
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Float64, Float64MultiArray, Int32MultiArray, String
+from std_msgs.msg import (
+    Bool,
+    Float64,
+    Float64MultiArray,
+    Header,
+    Int32MultiArray,
+    String,
+)
 from std_srvs.srv import SetBool
 
 from custom_autorace_bringup.parking_geometry import (
@@ -23,6 +31,18 @@ from custom_autorace_bringup.parking_geometry import (
     rectangle_corners,
     scan_points_in_map,
 )
+from custom_autorace_bringup.local_registration import (
+    EntryPlane,
+    MissionLocalTemplate,
+    OrientedSegmentLandmark,
+    OrientedSegmentObservation,
+    RegistrationConfig,
+    RegistrationObservation,
+    TemporalRegistrationConfig,
+    TemporalRegistrationFilter,
+    entry_plane_progress,
+    estimate_local_registration,
+)
 from custom_autorace_bringup.path_following import (
     AsymmetricFootprint,
     CallbackBoundary,
@@ -32,15 +52,18 @@ from custom_autorace_bringup.path_following import (
     PathSafety,
     Pose2D,
     RigidTransform2D,
+    SafetyDecision,
     SafetyMargins,
     SpeedProfile,
     SweptFootprintValidator,
     TrackingConfig,
     ValidationResult,
+    calculate_tracking,
     clamp,
     combine_validation_results,
     normalize_angle,
     path_from_poses,
+    project_to_path,
     footprint_points,
     in_place_rotation_command,
     sample_in_place_rotation,
@@ -85,6 +108,7 @@ class ParkingMissionController:
         TURN_TO_ZIGZAG,
     }
     ROTATION_STATES = {TURN_TO_SPACE, TURN_TO_EXIT}
+
     def __init__(self):
         get = rospy.get_param
         p = "~parking/"
@@ -99,6 +123,15 @@ class ParkingMissionController:
         self.gate_topic = str(
             get(p + "topics/zone_gate", "/mission/enable/parking")
         )
+        self.arm_topic = str(
+            get(p + "topics/arm", "/mission/arm/parking")
+        )
+        self.ready_topic = str(
+            get(p + "topics/ready", "/mission/ready/parking")
+        )
+        self.mission_name = str(get(p + "mission_name", "parking")).strip()
+        if not self.mission_name:
+            raise rospy.ROSInitException("parking mission_name is empty")
         self.lane_path_topic = str(
             get(
                 p + "topics/lane_path_diagnostics",
@@ -111,6 +144,18 @@ class ParkingMissionController:
         self.cmd_vel_topic = str(get(p + "topics/cmd_vel", "/cmd_vel"))
         self.diagnostics_topic = str(
             get(p + "topics/diagnostics", "/parking/diagnostics")
+        )
+        self.planned_left_path_topic = str(
+            get(
+                p + "topics/planned_path_left",
+                "/parking/planned_path/left",
+            )
+        )
+        self.planned_right_path_topic = str(
+            get(
+                p + "topics/planned_path_right",
+                "/parking/planned_path/right",
+            )
         )
         self.speed_limit_topic = str(
             get(p + "topics/lane_speed_limit", "/control/max_vel")
@@ -127,31 +172,25 @@ class ParkingMissionController:
 
         self.aisle_x = float(get(p + "route/aisle_x", 0.5000))
         self.entry_y = float(get(p + "route/entry_y", 1.7425))
-        self.entry_anchor_min_y = float(
-            get(p + "route/entry_anchor_min_y", 1.7425)
-        )
-        self.entry_anchor_max_y = float(
-            get(p + "route/entry_anchor_max_y", 1.7580)
-        )
         self.decision_y = float(get(p + "route/decision_y", 0.6920))
         self.zigzag_turn_start_x = float(
-            get(p + "route/zigzag_turn_start_x", 0.4960)
+            get(p + "route/zigzag_turn_start_x", 0.4930)
         )
         self.zigzag_straight_y = float(
             get(p + "route/zigzag_straight_y", 1.7500)
         )
-        self.zigzag_turn_offset = max(
-            0.01, float(get(p + "route/zigzag_turn_offset", 0.1500))
+        self.turn_curve_offset = max(
+            0.01, float(get(p + "route/turn_curve_offset", 0.1950))
         )
-        self.zigzag_turn_tangent = max(
-            0.001, float(get(p + "route/zigzag_turn_tangent", 0.0550))
+        self.turn_curve_tangent = max(
+            0.001, float(get(p + "route/turn_curve_tangent", 0.0780))
         )
         self.zigzag_alignment_tail = max(
             0.01,
-            float(get(p + "route/zigzag_alignment_tail", 0.1200)),
+            float(get(p + "route/zigzag_alignment_tail", 0.0720)),
         )
-        self.zigzag_turn_samples = max(
-            11, int(get(p + "route/zigzag_turn_samples", 101))
+        self.turn_curve_samples = max(
+            11, int(get(p + "route/turn_curve_samples", 101))
         )
         self.zigzag_approach_tangent_ratio = clamp(
             float(
@@ -162,18 +201,15 @@ class ParkingMissionController:
         )
         self.left_park_x = float(get(p + "route/left_park_x", 0.7741))
         self.right_park_x = float(get(p + "route/right_park_x", 0.2275))
-        self.entry_curve_offset = max(
-            0.01, float(get(p + "route/entry_curve_offset", 0.1950))
-        )
-        self.entry_curve_tangent = max(
-            0.001, float(get(p + "route/entry_curve_tangent", 0.0780))
-        )
-        self.entry_curve_samples = max(
-            11, int(get(p + "route/entry_curve_samples", 101))
-        )
-        self.odom_aligned_route = bool(
-            get(p + "route/odom_aligned", False)
-        )
+        self.route_frame = str(
+            get(p + "route/frame_id", "parking_local")
+        ).strip().lstrip("/")
+        if not self.route_frame:
+            raise rospy.ROSInitException("parking route/frame_id is empty")
+        if self.route_frame == "map":
+            raise rospy.ROSInitException(
+                "parking route/frame_id must be mission-local, not map"
+            )
         self.approach_heading = math.radians(
             float(get(p + "route/approach_heading_deg", 180.0))
         )
@@ -187,11 +223,272 @@ class ParkingMissionController:
             float(get(p + "route/zigzag_heading_deg", 180.0))
         )
 
+        self.fixed_obstacle_sample_spacing = max(
+            0.001,
+            float(get(p + "fixed_obstacles/sample_spacing", 0.004)),
+        )
+        self.fixed_obstacle_rectangles = self._rectangles_param(
+            get(
+                p + "fixed_obstacles/rectangles",
+                [
+                    [0.4400, 0.5600, 1.8875, 1.9125],
+                    [0.7275, 0.7525, 1.8900, 2.0100],
+                ],
+            ),
+            "fixed_obstacles/rectangles",
+        )
+        self.fixed_obstacle_points_route = self._sample_fixed_rectangles(
+            self.fixed_obstacle_rectangles,
+            self.fixed_obstacle_sample_spacing,
+        )
+
+        registration_local_frame = str(
+            get(p + "registration/local_frame", self.route_frame)
+        ).strip().lstrip("/")
+        if registration_local_frame != self.route_frame:
+            raise rospy.ROSInitException(
+                "parking registration/local_frame must match route/frame_id"
+            )
+        if bool(
+            get(p + "registration/use_fixed_obstacle_faces", True)
+        ):
+            visible_face_sides = get(
+                p + "registration/fixed_obstacle_visible_faces",
+                ["minimum_y", "maximum_x"],
+            )
+            self.registration_visible_faces = tuple(
+                str(value).strip().lower() for value in visible_face_sides
+            )
+            self.registration_landmarks = (
+                self._registration_landmarks_from_rectangles(
+                    self.fixed_obstacle_rectangles,
+                    self.registration_visible_faces,
+                )
+            )
+        else:
+            self.registration_visible_faces = tuple()
+            self.registration_landmarks = self._registration_segments_param(
+                get(p + "registration/segment_landmarks", [])
+            )
+        if len(self.registration_landmarks) != 2:
+            raise rospy.ROSInitException(
+                "parking registration requires exactly two nonparallel "
+                "fixture faces"
+            )
+        self.registration_template = MissionLocalTemplate(
+            mission=self.mission_name,
+            frame_id=self.route_frame,
+            segments=self.registration_landmarks,
+            entry_plane=EntryPlane(
+                point=tuple(
+                    float(value)
+                    for value in get(
+                        p + "registration/entry_plane_point",
+                        [self.aisle_x + self.turn_curve_offset, self.entry_y],
+                    )
+                ),
+                normal=tuple(
+                    float(value)
+                    for value in get(
+                        p + "registration/entry_plane_normal", [-1.0, 0.0]
+                    )
+                ),
+            ),
+        )
+        self.registration_config = RegistrationConfig(
+            position_inlier_threshold=max(
+                0.001,
+                float(
+                    get(
+                        p + "registration/position_inlier_threshold",
+                        0.025,
+                    )
+                ),
+            ),
+            heading_inlier_threshold=math.radians(
+                max(
+                    0.1,
+                    float(
+                        get(
+                            p + "registration/heading_inlier_threshold_deg",
+                            8.0,
+                        )
+                    ),
+                )
+            ),
+            minimum_inliers=2,
+            minimum_template_coverage=1.0,
+            minimum_inlier_coverage=1.0,
+        )
+        self.registration_filter = TemporalRegistrationFilter(
+            TemporalRegistrationConfig(
+                required_confirmations=max(
+                    2,
+                    int(get(p + "registration/confirmation_scans", 3)),
+                ),
+                maximum_gap=max(
+                    0.05,
+                    float(
+                        get(p + "registration/confirmation_max_gap", 0.25)
+                    ),
+                ),
+                maximum_position_delta=max(
+                    0.001,
+                    float(
+                        get(
+                            p + "registration/maximum_position_delta",
+                            0.020,
+                        )
+                    ),
+                ),
+                maximum_heading_delta=math.radians(
+                    max(
+                        0.1,
+                        float(
+                            get(
+                                p + "registration/maximum_heading_delta_deg",
+                                2.0,
+                            )
+                        ),
+                    )
+                ),
+            )
+        )
+        self.registration_source_max_age = max(
+            0.05, float(get(p + "registration/source_max_age", 0.35))
+        )
+        self.ready_republish_period = max(
+            0.05,
+            float(get(p + "registration/ready_republish_period", 0.15)),
+        )
+        self.registration_future_tolerance = max(
+            0.0, float(get(p + "registration/future_tolerance", 0.05))
+        )
+        self.registration_scan_maximum_range = max(
+            0.1, float(get(p + "registration/maximum_range", 1.20))
+        )
+        self.registration_cluster_gap = max(
+            0.005, float(get(p + "registration/cluster_gap", 0.035))
+        )
+        self.registration_line_residual = max(
+            0.001, float(get(p + "registration/line_residual", 0.008))
+        )
+        self.registration_minimum_points = max(
+            3, int(get(p + "registration/minimum_segment_points", 4))
+        )
+        self.registration_minimum_segment_length = max(
+            0.01,
+            float(get(p + "registration/minimum_segment_length", 0.045)),
+        )
+        self.registration_maximum_segment_length = max(
+            self.registration_minimum_segment_length,
+            float(get(p + "registration/maximum_segment_length", 0.18)),
+        )
+        self.registration_ambiguity_score = max(
+            0.0,
+            float(get(p + "registration/ambiguity_score", 0.002)),
+        )
+        self.registration_ambiguity_position = max(
+            0.001,
+            float(get(p + "registration/ambiguity_position", 0.04)),
+        )
+        self.registration_ambiguity_heading = math.radians(
+            max(
+                0.1,
+                float(get(p + "registration/ambiguity_heading_deg", 2.0)),
+            )
+        )
+        self.registration_face_heading_weight = clamp(
+            float(get(p + "registration/face_heading_weight", 0.0)),
+            0.0,
+            1.0,
+        )
+        self.registration_heading_class_tolerance = math.radians(
+            max(
+                1.0,
+                float(
+                    get(
+                        p
+                        + "registration/face_heading_class_tolerance_deg",
+                        40.0,
+                    )
+                ),
+            )
+        )
+        self.registration_heading_class_margin = math.radians(
+            max(
+                0.0,
+                float(
+                    get(
+                        p + "registration/face_heading_class_margin_deg",
+                        10.0,
+                    )
+                ),
+            )
+        )
+        self.registration_longitudinal_tolerance = max(
+            0.0,
+            float(
+                get(
+                    p + "registration/face_longitudinal_tolerance",
+                    0.025,
+                )
+            ),
+        )
+        self.registration_robot_local_bounds = self._box_param(
+            get(
+                p + "registration/robot_local_bounds",
+                [0.62, 1.60, 1.55, 1.90],
+            ),
+            "registration/robot_local_bounds",
+        )
+        self.registration_robot_heading_tolerance = math.radians(
+            max(
+                1.0,
+                float(
+                    get(
+                        p + "registration/robot_heading_tolerance_deg",
+                        25.0,
+                    )
+                ),
+            )
+        )
+        self.entry_lead_minimum = float(
+            get(p + "registration/entry_lead_minimum", -0.50)
+        )
+        self.entry_lead_maximum = float(
+            get(p + "registration/entry_lead_maximum", -0.06)
+        )
+        self.entry_lead_lateral_tolerance = max(
+            0.005,
+            float(
+                get(
+                    p + "registration/entry_lead_lateral_tolerance",
+                    0.06,
+                )
+            ),
+        )
+        self.entry_lead_heading_tolerance = math.radians(
+            max(
+                1.0,
+                float(
+                    get(
+                        p + "registration/entry_lead_heading_tolerance_deg",
+                        15.0,
+                    )
+                ),
+            )
+        )
+        if self.entry_lead_minimum >= self.entry_lead_maximum:
+            raise rospy.ROSInitException(
+                "parking entry lead longitudinal bounds are reversed"
+            )
+
         self.lane_path_timeout = max(
             0.1, float(get(p + "rejoin/lane_path_timeout", 0.35))
         )
         self.handoff_min_x = float(get(p + "rejoin/handoff_min_x", 0.215))
-        self.handoff_max_x = float(get(p + "rejoin/handoff_max_x", 0.310))
+        self.handoff_max_x = float(get(p + "rejoin/handoff_max_x", 0.298))
         self.handoff_min_y = float(get(p + "rejoin/handoff_min_y", 1.738))
         self.handoff_max_y = float(get(p + "rejoin/handoff_max_y", 1.762))
         self.handoff_heading_tolerance = math.radians(
@@ -211,7 +508,7 @@ class ParkingMissionController:
         self.rejoin_min_y = float(get(p + "rejoin/complete_min_y", 1.738))
         self.rejoin_max_y = float(get(p + "rejoin/complete_max_y", 1.762))
         self.rejoin_heading_tolerance = math.radians(
-            abs(float(get(p + "rejoin/complete_heading_tolerance_deg", 4.0)))
+            abs(float(get(p + "rejoin/complete_heading_tolerance_deg", 7.0)))
         )
         self.rejoin_confirm_frames = max(
             1, int(get(p + "rejoin/complete_confirmation_frames", 9))
@@ -273,24 +570,6 @@ class ParkingMissionController:
         )
         self.line_margin = max(
             0.0, float(get(p + "footprint/line_margin", 0.009))
-        )
-        self.fixed_obstacle_sample_spacing = max(
-            0.001,
-            float(get(p + "fixed_obstacles/sample_spacing", 0.004)),
-        )
-        self.fixed_obstacle_rectangles = self._rectangles_param(
-            get(
-                p + "fixed_obstacles/rectangles",
-                [
-                    [0.4400, 0.5600, 1.8875, 1.9125],
-                    [0.7275, 0.7525, 1.8900, 2.0100],
-                ],
-            ),
-            "fixed_obstacles/rectangles",
-        )
-        self.fixed_obstacle_points_route = self._sample_fixed_rectangles(
-            self.fixed_obstacle_rectangles,
-            self.fixed_obstacle_sample_spacing,
         )
         self.aisle_right_edge = float(
             get(p + "paint/aisle_right_edge", 0.3923)
@@ -406,6 +685,26 @@ class ParkingMissionController:
             ),
             0.0,
             self.line_margin,
+        )
+        self.entry_handoff_maximum_path_error = max(
+            0.0,
+            float(
+                get(
+                    p + "control/entry_handoff_maximum_path_error",
+                    0.015,
+                )
+            ),
+        )
+        self.entry_handoff_maximum_heading_error = math.radians(
+            abs(
+                float(
+                    get(
+                        p
+                        + "control/entry_handoff_maximum_heading_error_deg",
+                        8.0,
+                    )
+                )
+            )
         )
         self.entry_curve_end_position_tolerance = max(
             0.003,
@@ -698,9 +997,9 @@ class ParkingMissionController:
         self.path_sample_spacing = max(
             0.002, float(get(p + "route/path_sample_spacing", 0.004))
         )
-        self.map_safety_bounds = self._box_param(
-            get(p + "safety/map_bounds", [-2.0, 2.0, -2.0, 2.0]),
-            "safety/map_bounds",
+        self.local_safety_bounds = self._box_param(
+            get(p + "safety/local_bounds", [-2.0, 2.0, -2.0, 2.0]),
+            "safety/local_bounds",
         )
 
         self.common_tracking_config = TrackingConfig(
@@ -742,6 +1041,7 @@ class ParkingMissionController:
         # healthy 30 Hz odometry appear stale.  Keep only its newest deferred
         # mission-state sample; the safety history is still updated immediately.
         self.pending_odom_state = None
+        self.pending_registration_scan = None
         self.pending_selection_scan = None
         self.odom_arrival_generation = 0
         self.applied_odom_arrival_generation = 0
@@ -749,6 +1049,16 @@ class ParkingMissionController:
         self.zone_gate = False
         self.start_requested = False
         self.revoke_requested = False
+        self.arm_seq = None
+        self.arm_stamp = None
+        self.ready_published_seq = None
+        self.ready_source_stamp = None
+        self.registration_source_stamp = None
+        self.registration_confirmation_count = 0
+        self.registration_rejection_reason = "not armed"
+        self.registration_heading_prior = None
+        self.local_to_odom = None
+        self.registration_covariance = tuple()
         self.manual_stop = False
         self.mission_has_control = False
         self.handoff_ambiguous = False
@@ -790,11 +1100,9 @@ class ParkingMissionController:
         self.lane_confirmation_count = 0
         self.last_lane_confirmation_time = None
 
+        # Sole frozen transform used by every parking route and safety check.
         self.goal_map = None
         self.goal_odom = None
-        self.route_transform = None
-        self.route_anchor_map_pose = None
-        self.route_anchor_lateral_correction = 0.0
         self.parking_goal_map = None
         self.parking_return_map = None
         self.parking_return_odom = None
@@ -811,6 +1119,7 @@ class ParkingMissionController:
         self.entry_connector_speed = self.approach_speed
         self.entry_connector_path = None
         self.entry_curve_path = None
+        self.entry_preparation_error = ""
         self.zigzag_exit_curve_map = None
         self.zigzag_exit_curve_odom = None
         self.zigzag_exit_curve_path = None
@@ -835,7 +1144,17 @@ class ParkingMissionController:
         self.lane_command_generation = 0
         self.gate_lane_command_generation = 0
         self.gate_odom_generation = 0
+        self.bounded_lane_command_generation = None
+        self.bounded_lane_command_odom_generation = None
         self.shutting_down = False
+
+        try:
+            self.planned_left_route = self._planned_route_poses(LEFT)
+            self.planned_right_route = self._planned_route_poses(RIGHT)
+        except ValueError as error:
+            raise rospy.ROSInitException(
+                "cannot build parking preview paths: %s" % error
+            )
 
         self.cmd_pub = rospy.Publisher(self.cmd_vel_topic, Twist, queue_size=1)
         self.state_pub = rospy.Publisher(
@@ -853,6 +1172,15 @@ class ParkingMissionController:
             queue_size=1,
             latch=True,
         )
+        self.ready_pub = rospy.Publisher(
+            self.ready_topic, Header, queue_size=1, latch=True
+        )
+        self.planned_left_path_pub = rospy.Publisher(
+            self.planned_left_path_topic, Path, queue_size=1, latch=True
+        )
+        self.planned_right_path_pub = rospy.Publisher(
+            self.planned_right_path_topic, Path, queue_size=1, latch=True
+        )
         self.speed_limit_pub = rospy.Publisher(
             self.speed_limit_topic, Float64, queue_size=1
         )
@@ -866,6 +1194,9 @@ class ParkingMissionController:
 
         rospy.Subscriber(
             self.gate_topic, Bool, self.gate_callback, queue_size=1
+        )
+        rospy.Subscriber(
+            self.arm_topic, Header, self.arm_callback, queue_size=1
         )
         rospy.Subscriber(
             self.lane_path_topic,
@@ -905,10 +1236,18 @@ class ParkingMissionController:
         )
         rospy.on_shutdown(self.shutdown)
 
+        self._publish_planned_route(
+            self.planned_left_path_pub, self.planned_left_route
+        )
+        self._publish_planned_route(
+            self.planned_right_path_pub, self.planned_right_route
+        )
         self._publish_state()
         self.space_pub.publish(String(data="UNKNOWN"))
         rospy.loginfo(
-            "Parking controller ready: AMCL aisle x=%.4f, bay goals x=%.3f/%.3f",
+            "Parking controller waiting for local fixture registration on %s: "
+            "aisle x=%.4f, bay goals x=%.3f/%.3f",
+            self.arm_topic,
             self.aisle_x,
             self.left_park_x,
             self.right_park_x,
@@ -938,6 +1277,106 @@ class ParkingMissionController:
         )
 
     @staticmethod
+    def _registration_segments_param(raw):
+        if not isinstance(raw, (list, tuple)):
+            raise rospy.ROSInitException(
+                "parking registration/segment_landmarks must be a list"
+            )
+        landmarks = []
+        try:
+            for index, item in enumerate(raw):
+                if not isinstance(item, dict):
+                    raise ValueError("landmark %d is not a dictionary" % index)
+                landmarks.append(
+                    OrientedSegmentLandmark(
+                        name=item["name"],
+                        start=item["start"],
+                        end=item["end"],
+                        longitudinal_weight=1.0,
+                    )
+                )
+        except (KeyError, TypeError, ValueError) as error:
+            raise rospy.ROSInitException(
+                "invalid parking registration landmark: %s" % error
+            )
+        for index, first in enumerate(landmarks):
+            for second in landmarks[index + 1 :]:
+                angle = abs(normalize_angle(first.heading - second.heading))
+                angle = min(angle, abs(math.pi - angle))
+                if angle >= math.radians(20.0):
+                    return tuple(landmarks)
+        if len(landmarks) >= 2:
+            raise rospy.ROSInitException(
+                "parking registration landmarks are all parallel"
+            )
+        return tuple(landmarks)
+
+    @staticmethod
+    def _registration_landmarks_from_rectangles(rectangles, visible_faces):
+        """Use one approach-visible long face from each fixed rectangle."""
+        if not isinstance(visible_faces, (list, tuple)) or len(
+            visible_faces
+        ) != len(rectangles):
+            raise rospy.ROSInitException(
+                "parking registration/fixed_obstacle_visible_faces must "
+                "select one face for every fixed rectangle"
+            )
+        landmarks = []
+        for index, (rectangle, raw_face) in enumerate(
+            zip(rectangles, visible_faces)
+        ):
+            minimum_x, maximum_x, minimum_y, maximum_y = rectangle
+            width = maximum_x - minimum_x
+            height = maximum_y - minimum_y
+            face = str(raw_face).strip().lower()
+            if width >= height:
+                if face == "minimum_y":
+                    start = (minimum_x, minimum_y)
+                    end = (maximum_x, minimum_y)
+                elif face == "maximum_y":
+                    start = (minimum_x, maximum_y)
+                    end = (maximum_x, maximum_y)
+                else:
+                    raise rospy.ROSInitException(
+                        "parking rectangle %d long visible face must be "
+                        "minimum_y or maximum_y" % index
+                    )
+            else:
+                if face == "minimum_x":
+                    start = (minimum_x, minimum_y)
+                    end = (minimum_x, maximum_y)
+                elif face == "maximum_x":
+                    start = (maximum_x, minimum_y)
+                    end = (maximum_x, maximum_y)
+                else:
+                    raise rospy.ROSInitException(
+                        "parking rectangle %d long visible face must be "
+                        "minimum_x or maximum_x" % index
+                    )
+            landmarks.append(
+                OrientedSegmentLandmark(
+                    name="fixed_rectangle_%d_visible_face" % index,
+                    start=start,
+                    end=end,
+                    # LaserScan sees a range-quantized, partially occluded
+                    # portion of each finite face.  The two nonparallel face
+                    # lines still determine full SE(2); treating their cropped
+                    # midpoints as the surveyed midpoints would bias it.
+                    longitudinal_weight=0.0,
+                )
+            )
+        # Reuse the same nonparallel validation as explicit landmarks.
+        for index, first in enumerate(landmarks):
+            for second in landmarks[index + 1 :]:
+                angle = abs(normalize_angle(first.heading - second.heading))
+                angle = min(angle, abs(math.pi - angle))
+                if angle >= math.radians(20.0):
+                    return tuple(landmarks)
+        raise rospy.ROSInitException(
+            "parking fixed obstacle faces do not observe full SE(2)"
+        )
+
+    @staticmethod
     def _sample_fixed_rectangles(rectangles, spacing):
         """Represent fixed collision boxes as a dense occupied point set."""
         clouds = []
@@ -961,13 +1400,13 @@ class ParkingMissionController:
     def _zigzag_turn_start_pose(self):
         return (
             self.zigzag_turn_start_x,
-            self.zigzag_straight_y - self.zigzag_turn_offset,
+            self.zigzag_straight_y - self.turn_curve_offset,
             self.outgoing_heading,
         )
 
     def _zigzag_turn_end_pose(self):
         start_x, start_y, start_yaw = self._zigzag_turn_start_pose()
-        offset = self.zigzag_turn_offset
+        offset = self.turn_curve_offset
         return (
             start_x
             + offset
@@ -986,30 +1425,182 @@ class ParkingMissionController:
             end_yaw,
         )
 
-    def _validate_route_geometry(self):
-        if not (
-            math.isfinite(self.entry_anchor_min_y)
-            and math.isfinite(self.entry_anchor_max_y)
-            and self.entry_anchor_min_y <= self.entry_y
-            <= self.entry_anchor_max_y
-        ):
-            raise rospy.ROSInitException(
-                "parking entry anchor y bounds must contain entry_y"
+    def _quarter_turn_route_poses(self, start_pose, target_yaw):
+        """Return the one surveyed quarter-turn shape used by parking."""
+        return quintic_turn_path(
+            start_pose,
+            target_yaw,
+            self.turn_curve_offset,
+            self.turn_curve_tangent,
+            self.turn_curve_samples,
+        )
+
+    def _entry_curve_route_poses(self):
+        """Return the fixed surveyed entry turn in route coordinates."""
+        return self._quarter_turn_route_poses(
+            (
+                self.aisle_x + self.turn_curve_offset,
+                self.entry_y,
+                self.approach_heading,
+            ),
+            self.aisle_heading,
+        )
+
+    def _zigzag_exit_route_poses(self):
+        """Return the surveyed final left turn and alignment tail."""
+        curve = self._quarter_turn_route_poses(
+            self._zigzag_turn_start_pose(),
+            self.zigzag_heading,
+        )
+        turn_end = curve[-1]
+        tail_count = max(
+            2,
+            int(
+                math.ceil(
+                    self.zigzag_alignment_tail / self.path_sample_spacing
+                )
             )
+            + 1,
+        )
+        fraction = np.linspace(0.0, 1.0, tail_count)
+        tail = np.column_stack(
+            (
+                turn_end[0]
+                + fraction
+                * self.zigzag_alignment_tail
+                * math.cos(self.zigzag_heading),
+                turn_end[1]
+                + fraction
+                * self.zigzag_alignment_tail
+                * math.sin(self.zigzag_heading),
+                np.full(tail_count, self.zigzag_heading),
+            )
+        )
+        return np.vstack((curve, tail[1:]))
+
+    def _straight_route_poses(self, start, goal):
+        start = Pose2D.from_value(start)
+        goal = Pose2D.from_value(goal)
+        distance = math.hypot(goal.x - start.x, goal.y - start.y)
+        count = max(
+            2, int(math.ceil(distance / self.path_sample_spacing)) + 1
+        )
+        fraction = np.linspace(0.0, 1.0, count)
+        yaw_delta = normalize_angle(goal.yaw - start.yaw)
+        return np.column_stack(
+            (
+                start.x + fraction * (goal.x - start.x),
+                start.y + fraction * (goal.y - start.y),
+                start.yaw + fraction * yaw_delta,
+            )
+        )
+
+    def _rotation_route_poses(self, start, target_yaw):
+        poses = sample_in_place_rotation(
+            start, target_yaw, self.swept_heading_step
+        )
+        return np.asarray(
+            [(pose.x, pose.y, pose.yaw) for pose in poses],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _join_route_sections(*sections):
+        joined = []
+        for section in sections:
+            values = np.asarray(section, dtype=np.float64)
+            if values.ndim != 2 or values.shape[1] != 3 or not len(values):
+                raise ValueError(
+                    "parking preview section must be a non-empty Nx3 path"
+                )
+            joined.append(values if not joined else values[1:])
+        return np.vstack(joined)
+
+    def _nominal_exit_approach_route_poses(self):
+        start = (self.aisle_x, self.decision_y, self.outgoing_heading)
+        goal = self._zigzag_turn_start_pose()
+        length = math.hypot(goal[0] - start[0], goal[1] - start[1])
+        tangent = self.zigzag_approach_tangent_ratio * max(0.01, length)
+        sample_count = max(
+            11, int(math.ceil(length / self.path_sample_spacing)) + 1
+        )
+        return quintic_pose_path(
+            start,
+            goal,
+            tangent,
+            tangent,
+            sample_count,
+        )
+
+    def _planned_route_poses(self, selected_space):
+        """Build one complete nominal LEFT or RIGHT route for RViz."""
+        if selected_space not in (LEFT, RIGHT):
+            raise ValueError("parking preview requires LEFT or RIGHT")
+
+        entry_curve = self._entry_curve_route_poses()
+        decision = (self.aisle_x, self.decision_y, self.aisle_heading)
+        aisle = self._straight_route_poses(entry_curve[-1], decision)
+        park_yaw = 0.0 if selected_space == LEFT else math.pi
+        park_x = (
+            self.left_park_x
+            if selected_space == LEFT
+            else self.right_park_x
+        )
+        turn_to_space = self._rotation_route_poses(decision, park_yaw)
+        return_pose = (self.aisle_x, self.decision_y, park_yaw)
+        park_pose = (park_x, self.decision_y, park_yaw)
+        park_in = self._straight_route_poses(return_pose, park_pose)
+        back_out = self._straight_route_poses(park_pose, return_pose)
+        turn_to_exit = self._rotation_route_poses(
+            return_pose, self.outgoing_heading
+        )
+        exit_approach = self._nominal_exit_approach_route_poses()
+        exit_curve = self._zigzag_exit_route_poses()
+        route = self._join_route_sections(
+            entry_curve,
+            aisle,
+            turn_to_space,
+            park_in,
+            back_out,
+            turn_to_exit,
+            exit_approach,
+            exit_curve,
+        )
+        if not np.all(np.isfinite(route)):
+            raise ValueError("parking preview route contains non-finite poses")
+        return route
+
+    def _publish_planned_route(self, publisher, route):
+        """Latch one surveyed parking-local candidate with a zero stamp."""
+        message = Path()
+        message.header.stamp = rospy.Time()
+        message.header.frame_id = self.route_frame
+        for x, y, yaw in np.asarray(route, dtype=np.float64):
+            pose = PoseStamped()
+            pose.header = message.header
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.position.z = 0.05
+            pose.pose.orientation.z = math.sin(0.5 * float(yaw))
+            pose.pose.orientation.w = math.cos(0.5 * float(yaw))
+            message.poses.append(pose)
+        publisher.publish(message)
+
+    def _validate_route_geometry(self):
         if self.entry_y <= self.decision_y:
             raise rospy.ROSInitException(
                 "parking entry_y must be north of decision_y"
             )
-        if self.entry_y - self.entry_curve_offset <= self.decision_y:
+        if self.entry_y - self.turn_curve_offset <= self.decision_y:
             raise rospy.ROSInitException(
                 "parking entry curve must end north of decision_y"
             )
-        if self.entry_curve_tangent >= 0.5 * self.entry_curve_offset:
+        if self.turn_curve_tangent >= 0.5 * self.turn_curve_offset:
             raise rospy.ROSInitException(
-                "parking entry curve tangent must be below half its offset"
+                "parking turn curve tangent must be below half its offset"
             )
         entry_start = (
-            self.aisle_x + self.entry_curve_offset,
+            self.aisle_x + self.turn_curve_offset,
             self.entry_y,
             self.approach_heading,
         )
@@ -1045,11 +1636,6 @@ class ParkingMissionController:
             raise rospy.ROSInitException(
                 "parking zigzag exit must be a 90-degree turn"
             )
-        if self.zigzag_turn_tangent >= 0.5 * self.zigzag_turn_offset:
-            raise rospy.ROSInitException(
-                "parking zigzag turn tangent must be below half its offset"
-            )
-
         aisle_pose = (self.aisle_x, self.decision_y, self.aisle_heading)
         aisle_corners = rectangle_corners(
             aisle_pose, self.front, self.rear, self.half_width
@@ -1167,10 +1753,11 @@ class ParkingMissionController:
             raise rospy.ROSInitException(
                 "parking zigzag alignment tail does not end in the handoff bounds"
             )
+        handoff_epsilon = 1e-9
         if not (
-            min(turn_end[0], exit_goal[0])
+            min(turn_end[0], exit_goal[0]) - handoff_epsilon
             <= self.handoff_max_x
-            <= max(turn_end[0], exit_goal[0])
+            <= max(turn_end[0], exit_goal[0]) + handoff_epsilon
         ):
             raise rospy.ROSInitException(
                 "parking moving handoff does not begin on the alignment tail"
@@ -1201,7 +1788,7 @@ class ParkingMissionController:
         self._publish_state()
         if self.map_pose is not None and self.odom_pose is not None:
             rospy.loginfo(
-                "Parking mission state: %s map=(%.4f,%.4f,%.1fdeg) "
+                "Parking mission state: %s diagnostic_map=(%.4f,%.4f,%.1fdeg) "
                 "odom=(%.4f,%.4f,%.1fdeg)",
                 state,
                 self.map_pose[0],
@@ -1214,11 +1801,97 @@ class ParkingMissionController:
         else:
             rospy.loginfo("Parking mission state: %s", state)
 
+    def _reset_local_registration(self, reason="new arm generation"):
+        self.registration_filter.reset(reason)
+        self.registration_confirmation_count = 0
+        self.registration_rejection_reason = reason
+        self.registration_source_stamp = None
+        self.registration_heading_prior = None
+        self.local_to_odom = None
+        self.registration_covariance = tuple()
+        self.ready_published_seq = None
+        self.ready_source_stamp = None
+        self.entry_curve_map = None
+        self.entry_curve_odom = None
+        self.entry_connector_odom = None
+        self.entry_connector_path = None
+        self.entry_curve_path = None
+        self.active_path = None
+        self.active_path_state = None
+        self.active_path_validation = None
+        self.bounded_lane_command_generation = None
+        self.bounded_lane_command_odom_generation = None
+
+    def arm_callback(self, message):
+        """Arm one ordered generation without touching lane ownership."""
+        with self.lock:
+            sequence = int(message.seq)
+            if sequence == 0 or sequence == self.arm_seq:
+                return
+            if message.frame_id != self.mission_name:
+                rospy.logwarn(
+                    "Ignoring parking arm frame '%s' (expected '%s')",
+                    message.frame_id,
+                    self.mission_name,
+                )
+                return
+            if message.stamp == rospy.Time():
+                rospy.logwarn(
+                    "Ignoring parking arm generation %d with zero stamp",
+                    sequence,
+                )
+                return
+            if self.mission_has_control or self.state not in (
+                self.WAIT_GATE,
+                self.COMPLETE,
+                self.FAILED,
+            ):
+                rospy.logwarn(
+                    "Ignoring parking arm generation %d while %s",
+                    sequence,
+                    self.state,
+                )
+                return
+            self.arm_seq = sequence
+            self.arm_stamp = message.stamp
+            self.zone_gate = False
+            self.start_requested = False
+            self.revoke_requested = False
+            self._reset_local_registration()
+            # Registration needs two independent LiDAR observations before
+            # the fixed entry bundle can be advertised.  Keep lane ownership,
+            # but apply the parking common cruise profile as soon as this
+            # mission is armed so those observations cannot be crossed at the
+            # normal-lane 0.28 m/s rate.  The stricter entry cap is still
+            # applied only after the ordered gate opens.
+            self.speed_limit_pub.publish(
+                Float64(data=self.cruise_velocity)
+            )
+            if self.state != self.WAIT_GATE:
+                self._set_state(self.WAIT_GATE)
+            rospy.loginfo(
+                "Parking registration armed: generation=%d stamp=%.3f; "
+                "lane controller remains owner at %.3fm/s maximum",
+                sequence,
+                message.stamp.to_sec(),
+                self.cruise_velocity,
+            )
+
     def gate_callback(self, message):
         with self.lock:
             self._apply_pending_odom_state()
             was_open = self.zone_gate
-            self.zone_gate = bool(message.data)
+            requested = bool(message.data)
+            prepared = bool(
+                self._ready_matches_current_arm(rospy.Time.now())
+            )
+            self.zone_gate = requested and prepared
+            if requested and not prepared:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Ignoring parking enable before matching local ready",
+                )
+                return
             if self.zone_gate and not was_open:
                 # A command and odometry sample newer than this gate edge are
                 # required before parking can take cmd_vel ownership. This
@@ -1228,6 +1901,8 @@ class ParkingMissionController:
                     self.lane_command_generation
                 )
                 self.gate_odom_generation = self.odom_generation
+                self.bounded_lane_command_generation = None
+                self.bounded_lane_command_odom_generation = None
                 self.start_requested = True
                 self.speed_limit_pub.publish(
                     Float64(data=self.lane_entry_speed_limit)
@@ -1258,7 +1933,7 @@ class ParkingMissionController:
     def _anchored_pose_in_bounds(
         self, minimum_x, maximum_x, minimum_y, maximum_y, heading_tolerance
     ):
-        anchored_pose = self._anchored_map_pose()
+        anchored_pose = self._anchored_local_pose()
         if anchored_pose is None:
             return False
         x, y, yaw = anchored_pose
@@ -1269,13 +1944,13 @@ class ParkingMissionController:
             <= heading_tolerance
         )
 
-    def _anchored_map_pose(self):
-        if self.odom_pose is None or self.route_transform is None:
+    def _anchored_local_pose(self):
+        if self.odom_pose is None or self._frozen_local_to_odom() is None:
             return None
         return self._odom_pose_to_route(self.odom_pose)
 
     def _lane_observation_summary(self):
-        anchored_pose = self._anchored_map_pose()
+        anchored_pose = self._anchored_local_pose()
         if anchored_pose is None:
             pose_text = "unavailable"
         else:
@@ -1463,6 +2138,530 @@ class ParkingMissionController:
             )
         return None
 
+    def _registration_scan_points(self, scan, odom_pose):
+        """Return acquisition-ordered, indexed LiDAR points in odom."""
+        ranges = np.asarray(scan["ranges"], dtype=np.float64)
+        angles = scan["angle_min"] + np.arange(ranges.size) * scan[
+            "angle_increment"
+        ]
+        valid = np.isfinite(ranges)
+        finite_ranges = ranges[valid]
+        valid[valid] = (
+            (finite_ranges >= scan["range_min"])
+            & (finite_ranges <= self.registration_scan_maximum_range)
+        )
+        indices = np.flatnonzero(valid)
+        if indices.size == 0:
+            return indices, np.empty((0, 2), dtype=np.float64)
+        ranges = ranges[indices]
+        angles = angles[indices]
+        base_x = self.lidar_x + ranges * np.cos(angles)
+        base_y = self.lidar_y + ranges * np.sin(angles)
+        cosine = math.cos(odom_pose[2])
+        sine = math.sin(odom_pose[2])
+        points = np.column_stack(
+            (
+                odom_pose[0] + cosine * base_x - sine * base_y,
+                odom_pose[1] + sine * base_x + cosine * base_y,
+            )
+        )
+        return indices, points
+
+    @staticmethod
+    def _fit_registration_line(points):
+        points = np.asarray(points, dtype=np.float64)
+        centre = np.mean(points, axis=0)
+        covariance = (points - centre).T @ (points - centre)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        direction = eigenvectors[:, int(np.argmax(eigenvalues))]
+        projection = (points - centre) @ direction
+        start = centre + float(np.min(projection)) * direction
+        end = centre + float(np.max(projection)) * direction
+        normal = np.asarray((-direction[1], direction[0]))
+        residuals = np.abs((points - centre) @ normal)
+        return start, end, residuals
+
+    def _split_registration_cluster(self, points):
+        """Split a scan polyline at corners and retain straight fixture faces."""
+        minimum = self.registration_minimum_points
+        pending = [np.asarray(points, dtype=np.float64)]
+        segments = []
+        while pending:
+            values = pending.pop()
+            if len(values) < minimum:
+                continue
+            chord = values[-1] - values[0]
+            chord_length = float(np.linalg.norm(chord))
+            if chord_length > 1e-9:
+                chord_normal = np.asarray((-chord[1], chord[0])) / chord_length
+                chord_residuals = np.abs(
+                    (values - values[0]) @ chord_normal
+                )
+                corner_index = int(np.argmax(chord_residuals))
+                if (
+                    float(chord_residuals[corner_index])
+                    > self.registration_line_residual
+                    and corner_index >= minimum - 1
+                    and len(values) - corner_index >= minimum
+                ):
+                    pending.append(values[: corner_index + 1])
+                    pending.append(values[corner_index:])
+                    continue
+            start, end, residuals = self._fit_registration_line(values)
+            maximum_index = int(np.argmax(residuals))
+            maximum_residual = float(residuals[maximum_index])
+            if (
+                maximum_residual > self.registration_line_residual
+                and minimum <= maximum_index <= len(values) - minimum
+            ):
+                pending.append(values[: maximum_index + 1])
+                pending.append(values[maximum_index:])
+                continue
+            length = float(np.linalg.norm(end - start))
+            if (
+                maximum_residual <= self.registration_line_residual
+                and self.registration_minimum_segment_length
+                <= length
+                <= self.registration_maximum_segment_length
+            ):
+                segments.append((tuple(start), tuple(end), length))
+        return segments
+
+    def _extract_registration_segments(self, scan, odom_pose):
+        indices, points = self._registration_scan_points(scan, odom_pose)
+        if len(points) < self.registration_minimum_points:
+            return tuple()
+        breaks = np.flatnonzero(
+            (np.diff(indices) != 1)
+            | (
+                np.linalg.norm(np.diff(points, axis=0), axis=1)
+                > self.registration_cluster_gap
+            )
+        )
+        starts = np.concatenate(([0], breaks + 1))
+        ends = np.concatenate((breaks + 1, [len(points)]))
+        segments = []
+        for start, end in zip(starts, ends):
+            if end - start >= self.registration_minimum_points:
+                segments.extend(
+                    self._split_registration_cluster(points[start:end])
+                )
+        return tuple(segments)
+
+    @staticmethod
+    def _undirected_angle(first, second):
+        difference = abs(normalize_angle(first - second))
+        return min(difference, abs(math.pi - difference))
+
+    def _registration_pose_is_plausible(self, transform, odom_pose):
+        local_pose = transform.inverse().apply_pose(odom_pose)
+        minimum_x, maximum_x, minimum_y, maximum_y = (
+            self.registration_robot_local_bounds
+        )
+        if not (
+            minimum_x <= local_pose.x <= maximum_x
+            and minimum_y <= local_pose.y <= maximum_y
+            and abs(normalize_angle(local_pose.yaw - self.approach_heading))
+            <= self.registration_robot_heading_tolerance
+        ):
+            return False
+        for rectangle, face in zip(
+            self.fixed_obstacle_rectangles, self.registration_visible_faces
+        ):
+            rect_min_x, rect_max_x, rect_min_y, rect_max_y = rectangle
+            if face == "minimum_x" and local_pose.x > rect_min_x:
+                return False
+            if face == "maximum_x" and local_pose.x < rect_max_x:
+                return False
+            if face == "minimum_y" and local_pose.y > rect_min_y:
+                return False
+            if face == "maximum_y" and local_pose.y < rect_max_y:
+                return False
+        return True
+
+    def _refine_fixture_registration(
+        self, result, landmarks, assigned_segments, odom_pose
+    ):
+        """Stabilize sparse quantized faces with a frozen course heading.
+
+        A 360-ray, 20 mm-resolution scan exposes only a cropped handful of
+        returns on each 120 mm fixture face.  AMCL map-to-odom orientation, or
+        the initial approach orientation when AMCL is unavailable, supplies an
+        independent course-heading observation.  The measured face headings
+        retain a configurable share, and the two nonparallel measured line
+        offsets then solve translation without treating cropped midpoints as
+        surveyed endpoints.
+        """
+        fitted = result.transform
+        approach_yaw = (
+            normalize_angle(odom_pose[2] - self.approach_heading)
+            if self.registration_heading_prior is None
+            else self.registration_heading_prior
+        )
+        yaw = normalize_angle(
+            approach_yaw
+            + self.registration_face_heading_weight
+            * normalize_angle(
+                fitted.target_from_source_yaw - approach_yaw
+            )
+        )
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        rotation = np.asarray(((cosine, -sine), (sine, cosine)))
+        normals = []
+        offsets = []
+        for landmark, segment in zip(landmarks, assigned_segments):
+            local_midpoint = np.asarray(landmark.midpoint, dtype=np.float64)
+            observed_midpoint = 0.5 * (
+                np.asarray(segment[0], dtype=np.float64)
+                + np.asarray(segment[1], dtype=np.float64)
+            )
+            local_normal = np.asarray(
+                (-math.sin(landmark.heading), math.cos(landmark.heading)),
+                dtype=np.float64,
+            )
+            target_normal = rotation @ local_normal
+            normals.append(target_normal)
+            offsets.append(
+                float(
+                    target_normal
+                    @ (observed_midpoint - rotation @ local_midpoint)
+                )
+            )
+        try:
+            translation = np.linalg.solve(
+                np.asarray(normals, dtype=np.float64),
+                np.asarray(offsets, dtype=np.float64),
+            )
+        except np.linalg.LinAlgError:
+            return result
+        refined = RigidTransform2D(
+            float(translation[0]),
+            float(translation[1]),
+            yaw,
+            fitted.source_frame,
+            fitted.target_frame,
+        )
+        return replace(result, transform=refined)
+
+    def _estimate_fixture_registration(self, segments, odom_pose, stamp):
+        """Fit deterministically named approach-visible fixture faces.
+
+        Both signs are 120 mm long, so trying every pair, name permutation and
+        direction leaves symmetric hypotheses in a noisy 360-ray scan.  The
+        lane-followed approach supplies only an axis prior: each extracted
+        segment is assigned to the nearer surveyed horizontal/vertical face,
+        directed consistently, and checked against that finite face's
+        longitudinal extent.  The two measured line offsets still determine
+        x/y; no global map translation is used.
+        """
+        if len(segments) < 2:
+            return None
+        landmarks = self.registration_landmarks
+        if len(landmarks) != 2:
+            return None
+        approach_yaw = (
+            normalize_angle(odom_pose[2] - self.approach_heading)
+            if self.registration_heading_prior is None
+            else self.registration_heading_prior
+        )
+        expected_headings = tuple(
+            normalize_angle(approach_yaw + landmark.heading)
+            for landmark in landmarks
+        )
+        classified = [[], []]
+        for segment in segments:
+            heading = math.atan2(
+                segment[1][1] - segment[0][1],
+                segment[1][0] - segment[0][0],
+            )
+            errors = tuple(
+                self._undirected_angle(heading, expected)
+                for expected in expected_headings
+            )
+            index = int(np.argmin(errors))
+            other = 1 - index
+            if (
+                errors[index] > self.registration_heading_class_tolerance
+                or errors[other] - errors[index]
+                < self.registration_heading_class_margin
+            ):
+                continue
+            start, end = segment[0], segment[1]
+            observed_direction = (
+                end[0] - start[0],
+                end[1] - start[1],
+            )
+            expected_direction = (
+                math.cos(expected_headings[index]),
+                math.sin(expected_headings[index]),
+            )
+            if (
+                observed_direction[0] * expected_direction[0]
+                + observed_direction[1] * expected_direction[1]
+                < 0.0
+            ):
+                start, end = end, start
+                heading = normalize_angle(heading + math.pi)
+            classified[index].append(
+                (start, end, segment[2], errors[index], heading)
+            )
+        if not all(classified):
+            return None
+
+        candidates = []
+        for first in classified[0]:
+            for second in classified[1]:
+                assigned = (first, second)
+                observations = tuple(
+                    OrientedSegmentObservation(
+                        landmark=landmark.name,
+                        start=candidate[0],
+                        end=candidate[1],
+                    )
+                    for landmark, candidate in zip(landmarks, assigned)
+                )
+                observation = RegistrationObservation(
+                    stamp=float(stamp.to_sec()),
+                    target_frame="odom",
+                    segments=observations,
+                )
+                result = estimate_local_registration(
+                    self.registration_template,
+                    observation,
+                    self.registration_config,
+                )
+                if not result.accepted:
+                    continue
+                result = self._refine_fixture_registration(
+                    result, landmarks, assigned, odom_pose
+                )
+                if not self._registration_pose_is_plausible(
+                    result.transform, odom_pose
+                ):
+                    continue
+
+                longitudinal_error = 0.0
+                finite_faces_match = True
+                for landmark, candidate in zip(landmarks, assigned):
+                    expected_midpoint = result.transform.apply_point(
+                        landmark.midpoint
+                    )
+                    heading = normalize_angle(
+                        result.transform.target_from_source_yaw
+                        + landmark.heading
+                    )
+                    tangent = (math.cos(heading), math.sin(heading))
+                    endpoint_offsets = tuple(
+                        tangent[0] * (endpoint[0] - expected_midpoint[0])
+                        + tangent[1] * (endpoint[1] - expected_midpoint[1])
+                        for endpoint in candidate[:2]
+                    )
+                    half_length = 0.5 * math.hypot(
+                        landmark.end[0] - landmark.start[0],
+                        landmark.end[1] - landmark.start[1],
+                    )
+                    excess = max(
+                        0.0,
+                        max(abs(value) for value in endpoint_offsets)
+                        - half_length,
+                    )
+                    if excess > self.registration_longitudinal_tolerance:
+                        finite_faces_match = False
+                        break
+                    longitudinal_error += excess
+                if not finite_faces_match:
+                    continue
+
+                local_pose = result.transform.inverse().apply_pose(odom_pose)
+                length_error = sum(
+                    abs(
+                        candidate[2]
+                        - math.hypot(
+                            landmark.end[0] - landmark.start[0],
+                            landmark.end[1] - landmark.start[1],
+                        )
+                    )
+                    for landmark, candidate in zip(landmarks, assigned)
+                )
+                heading_class_error = first[3] + second[3]
+                score = (
+                    result.diagnostics.robust_rms
+                    + 2.0 * length_error
+                    + longitudinal_error
+                    + 0.02 * heading_class_error
+                    + 0.05
+                    * abs(
+                        normalize_angle(
+                            local_pose.yaw - self.approach_heading
+                        )
+                    )
+                )
+                candidates.append((score, result))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda value: value[0])
+        best_score, best = candidates[0]
+        for alternative_score, alternative in candidates[1:]:
+            if alternative_score - best_score > self.registration_ambiguity_score:
+                break
+            first = best.transform
+            second = alternative.transform
+            if (
+                math.hypot(
+                    first.target_from_source_x
+                    - second.target_from_source_x,
+                    first.target_from_source_y
+                    - second.target_from_source_y,
+                )
+                > self.registration_ambiguity_position
+                or abs(
+                    normalize_angle(
+                        first.target_from_source_yaw
+                        - second.target_from_source_yaw
+                    )
+                )
+                > self.registration_ambiguity_heading
+            ):
+                return None
+        return best
+
+    def _process_registration_scan(self, scan, odom_pose):
+        """Consume one synchronized scan while the caller owns ``self.lock``."""
+        if (
+            self.arm_seq is None
+            or self.arm_stamp is None
+            or self.local_to_odom is not None
+            or self.state != self.WAIT_GATE
+        ):
+            return
+        source_stamp = scan["source_stamp"]
+        now = rospy.Time.now()
+        if source_stamp < self.arm_stamp:
+            self.registration_rejection_reason = "scan predates arm"
+            return
+        source_age = (now - source_stamp).to_sec()
+        if not (
+            -self.registration_future_tolerance
+            <= source_age
+            <= self.registration_source_max_age
+        ):
+            self.registration_rejection_reason = "stale registration scan"
+            return
+        if self.registration_heading_prior is None:
+            map_orientation_is_fresh = bool(
+                self.map_pose is not None
+                and self.map_pose_stamp is not None
+                and abs((source_stamp - self.map_pose_stamp).to_sec())
+                <= self.pose_timeout
+            )
+            if map_orientation_is_fresh:
+                self.registration_heading_prior = normalize_angle(
+                    odom_pose[2] - self.map_pose[2]
+                )
+                heading_source = "AMCL map-to-odom"
+            else:
+                self.registration_heading_prior = normalize_angle(
+                    odom_pose[2] - self.approach_heading
+                )
+                heading_source = "initial approach"
+            rospy.loginfo(
+                "Parking registration course heading fixed from %s: %.2fdeg",
+                heading_source,
+                math.degrees(self.registration_heading_prior),
+            )
+        segments = self._extract_registration_segments(scan, odom_pose)
+        result = self._estimate_fixture_registration(
+            segments, odom_pose, source_stamp
+        )
+        if result is None:
+            self.registration_rejection_reason = (
+                "two nonparallel fixture faces were not observable"
+            )
+            rospy.logwarn_throttle(
+                1.0,
+                "Parking registration pending: extracted_segments=%d "
+                "pose=(%.3f, %.3f, %.1fdeg)",
+                len(segments),
+                odom_pose[0],
+                odom_pose[1],
+                math.degrees(odom_pose[2]),
+            )
+            # A sparse 360-ray scan can miss one of the two 120 mm faces for
+            # a frame even though the accepted transforms immediately before
+            # and after it are independent and consistent.  Preserve that
+            # streak only inside the configured source-time gap; the temporal
+            # filter still clears it when the next accepted result is late.
+            temporal = self.registration_filter.state()
+            if (
+                temporal.confirmation_count > 0
+                and float(source_stamp.to_sec()) - temporal.last_stamp
+                > self.registration_filter.config.maximum_gap
+            ):
+                temporal = self.registration_filter.reset(
+                    "confirmation gap"
+                )
+            self.registration_confirmation_count = (
+                temporal.confirmation_count
+            )
+            return
+        temporal = self.registration_filter.update(result)
+        self.registration_confirmation_count = temporal.confirmation_count
+        self.registration_rejection_reason = temporal.reason
+        if not temporal.confirmed:
+            rospy.loginfo(
+                "Parking registration observation %d/%d: "
+                "local->odom=(%.4f, %.4f, %.2fdeg)%s",
+                temporal.confirmation_count,
+                self.registration_filter.config.required_confirmations,
+                result.transform.target_from_source_x,
+                result.transform.target_from_source_y,
+                math.degrees(result.transform.target_from_source_yaw),
+                " reason=" + temporal.reason if temporal.reason else "",
+            )
+            return
+        self.local_to_odom = temporal.transform
+        self.registration_covariance = temporal.covariance
+        self.registration_source_stamp = rospy.Time.from_sec(
+            temporal.last_stamp
+        )
+        rospy.loginfo(
+            "Parking local registration frozen after %d scans: "
+            "local->odom=(%.4f, %.4f, %.2fdeg)",
+            temporal.confirmation_count,
+            self.local_to_odom.target_from_source_x,
+            self.local_to_odom.target_from_source_y,
+            math.degrees(self.local_to_odom.target_from_source_yaw),
+        )
+
+    def _stage_registration_scan(self, scan, odom_pose):
+        """Keep the newest synchronized registration input without blocking."""
+        with self.safety_data_lock:
+            pending = self.pending_registration_scan
+            if (
+                pending is None
+                or scan["source_stamp"] >= pending[0]["source_stamp"]
+            ):
+                self.pending_registration_scan = (scan, odom_pose)
+
+    def _stage_selection_scan(self, scan, odom_pose):
+        """Keep the newest source-synchronized bay-selection input."""
+        with self.safety_data_lock:
+            pending = self.pending_selection_scan
+            if (
+                pending is None
+                or scan["source_stamp"] >= pending[0]["source_stamp"]
+            ):
+                self.pending_selection_scan = (scan, odom_pose)
+
+    def _apply_pending_registration_scan(self):
+        """Drain one newest-only registration slot under ``self.lock``."""
+        with self.safety_data_lock:
+            pending = self.pending_registration_scan
+            self.pending_registration_scan = None
+        if pending is not None:
+            self._process_registration_scan(*pending)
+
     def _pending_scan_expired(self, scan, now):
         return (
             (now - scan["source_stamp"]).to_sec() > self.scan_timeout
@@ -1601,13 +2800,20 @@ class ParkingMissionController:
             ready_safety_scans = self._take_ready_safety_scans(received)
         for scan, scan_pose in ready_safety_scans:
             self._project_safety_scan(scan, scan_pose)
+            self._stage_registration_scan(scan, scan_pose)
+            self._stage_selection_scan(scan, scan_pose)
 
         if not self.lock.acquire(False):
             return
+        occupancy = None
         try:
             self._apply_pending_odom_state()
+            self._apply_pending_registration_scan()
+            occupancy = self._apply_pending_selection_scan()
         finally:
             self.lock.release()
+        if occupancy is not None:
+            self.occupancy_pub.publish(occupancy)
 
     @staticmethod
     def _median_ranges(message, window):
@@ -1661,12 +2867,10 @@ class ParkingMissionController:
             # directions without ever substituting the newest pose.
             self._enqueue_pending_safety_scan(safety_scan, received)
             ready_safety_scans = self._take_ready_safety_scans(received)
-            # Bay selection is secondary to live motion safety. If the main
-            # state lock is busy, retain the newest immutable scan for the
-            # next 20 Hz control tick instead of dropping it permanently.
-            self.pending_selection_scan = safety_scan
         for ready_scan, scan_pose in ready_safety_scans:
             self._project_safety_scan(ready_scan, scan_pose)
+            self._stage_registration_scan(ready_scan, scan_pose)
+            self._stage_selection_scan(ready_scan, scan_pose)
 
         # Bay occupancy is used only while SELECT_SPACE is stopped. Never let
         # this subscriber worker queue on the main lock; a control tick will
@@ -1674,6 +2878,7 @@ class ParkingMissionController:
         if not self.lock.acquire(False):
             return
         try:
+            self._apply_pending_registration_scan()
             occupancy = self._apply_pending_selection_scan()
         finally:
             self.lock.release()
@@ -1683,9 +2888,12 @@ class ParkingMissionController:
     def _apply_pending_selection_scan(self):
         """Consume the newest bay scan; caller must hold ``self.lock``."""
         with self.safety_data_lock:
-            scan = self.pending_selection_scan
+            pending = self.pending_selection_scan
             self.pending_selection_scan = None
-        if scan is None or self.state != self.SELECT_SPACE:
+        if pending is None:
+            return None
+        scan, synchronized_odom_pose = pending
+        if self.state != self.SELECT_SPACE:
             return None
         # A scan acquired or delivered before the stopped selection epoch must
         # never count as one of its independent confirmation samples.
@@ -1695,25 +2903,24 @@ class ParkingMissionController:
         ):
             return None
         received = scan["received"]
-        map_pose_valid = not (
-            self.map_pose is None
-            or self.map_pose_stamp is None
-            or self.map_pose_received is None
-            or (received - self.map_pose_stamp).to_sec() > self.pose_timeout
-            or (received - self.map_pose_received).to_sec() > self.pose_timeout
-        )
-        if not map_pose_valid:
+        local_to_odom = self._frozen_local_to_odom()
+        if synchronized_odom_pose is None or local_to_odom is None:
             return None
-        points = scan_points_in_map(
+        points_odom = scan_points_in_map(
             scan["ranges"],
             scan["angle_min"],
             scan["angle_increment"],
             scan["range_min"],
             scan["maximum_range"],
-            self.map_pose,
+            synchronized_odom_pose,
             self.lidar_x,
             self.lidar_y,
         )
+        odom_to_local = local_to_odom.inverse()
+        points = np.asarray(
+            [odom_to_local.apply_point(point) for point in points_odom],
+            dtype=np.float64,
+        ).reshape((-1, 2))
         left_points = points_in_box(points, self.left_box)
         right_points = points_in_box(points, self.right_box)
         self.left_points = left_points
@@ -1740,6 +2947,7 @@ class ParkingMissionController:
     def command_observer_callback(self, message):
         """Remember the lane command that must continue through handoff."""
         with self.lock:
+            self._apply_pending_odom_state()
             if (
                 not self.mission_has_control
                 and math.isfinite(message.linear.x)
@@ -1749,6 +2957,34 @@ class ParkingMissionController:
                 self.observed_lane_angular = float(message.angular.z)
                 self.observed_lane_command_received = rospy.Time.now()
                 self.lane_command_generation += 1
+                handoff_speed_limit = min(
+                    self.lane_entry_speed_limit, self.approach_speed
+                )
+                command_is_bounded = (
+                    self.observed_lane_linear > 1e-4
+                    and self.observed_lane_linear
+                    <= handoff_speed_limit + 1e-9
+                    and abs(self.observed_lane_angular)
+                    <= self.maximum_angular_velocity + 1e-9
+                )
+                if (
+                    self.zone_gate
+                    and self.lane_command_generation
+                    > self.gate_lane_command_generation
+                    and command_is_bounded
+                ):
+                    if self.bounded_lane_command_generation is None:
+                        # Require a subsequently applied odometry sample before
+                        # projecting the moving base onto the prepared path.
+                        self.bounded_lane_command_generation = (
+                            self.lane_command_generation
+                        )
+                        self.bounded_lane_command_odom_generation = (
+                            self.odom_generation
+                        )
+                elif not command_is_bounded:
+                    self.bounded_lane_command_generation = None
+                    self.bounded_lane_command_odom_generation = None
 
     def _map_pose_is_fresh(self, now):
         if (
@@ -1782,20 +3018,8 @@ class ParkingMissionController:
             <= self.odom_timeout
         )
 
-    def _synchronized_route_odom_pose(self):
-        if self.map_pose_stamp is None:
-            return None
-        with self.safety_data_lock:
-            return self._odom_pose_at_scan_stamp(
-                self.map_pose_stamp, self.odom_pose_history
-            )
-
     def _inputs_fresh(self, now):
-        return (
-            self._map_pose_is_fresh(now)
-            and self._odom_is_fresh(now)
-            and self._synchronized_route_odom_pose() is not None
-        )
+        return self.local_to_odom is not None and self._odom_is_fresh(now)
 
     def _set_lane_controller(self, enabled):
         try:
@@ -1825,53 +3049,28 @@ class ParkingMissionController:
             rospy.logerr("Parking lane emergency stop failed: %s", error)
             return False
 
-    def _latch_route_transform(self):
-        synchronized_odom_pose = self._synchronized_route_odom_pose()
-        if self.map_pose is None or synchronized_odom_pose is None:
-            return False
-        anchor_y = clamp(
-            self.map_pose[1],
-            self.entry_anchor_min_y,
-            self.entry_anchor_max_y,
-        )
-        self.route_anchor_map_pose = (
-            float(self.map_pose[0]),
-            float(anchor_y),
-            float(self.map_pose[2]),
-        )
-        self.route_anchor_lateral_correction = anchor_y - self.map_pose[1]
-        self.route_transform = RigidTransform2D.from_pose_pair(
-            synchronized_odom_pose,
-            self.route_anchor_map_pose,
-            source_frame="odom",
-            target_frame="map",
-        )
-        if abs(self.route_anchor_lateral_correction) > 1e-6:
-            rospy.loginfo(
-                "Parking AMCL lateral anchor corrected by %.4fm "
-                "(measured y=%.4f, anchored y=%.4f)",
-                self.route_anchor_lateral_correction,
-                self.map_pose[1],
-                anchor_y,
-            )
-        return True
+    def _frozen_local_to_odom(self):
+        """Return the sole frozen parking-local registration."""
+        return self.local_to_odom
 
     def _route_pose_to_odom(self, pose):
         """Project surveyed route coordinates into the local control frame."""
-        if self.odom_aligned_route:
-            return tuple(float(value) for value in pose)
-        transformed = self.route_transform.inverse().apply_pose(pose)
+        local_to_odom = self._frozen_local_to_odom()
+        if local_to_odom is None:
+            raise ValueError("parking local->odom registration is unavailable")
+        transformed = local_to_odom.apply_pose(pose)
         return transformed.x, transformed.y, transformed.yaw
 
     def _odom_pose_to_route(self, pose):
         """Project a local measured pose into surveyed route coordinates."""
-        if self.odom_aligned_route:
-            return tuple(float(value) for value in pose)
-        transformed = self.route_transform.apply_pose(pose)
+        local_to_odom = self._frozen_local_to_odom()
+        if local_to_odom is None:
+            raise ValueError("parking local->odom registration is unavailable")
+        transformed = local_to_odom.inverse().apply_pose(pose)
         return transformed.x, transformed.y, transformed.yaw
 
     def _latch_route_goal(self):
-        if self.goal_map is None or self.route_transform is None:
+        if self.goal_map is None or self._frozen_local_to_odom() is None:
             return False
         self.goal_odom = self._route_pose_to_odom(self.goal_map)
         return True
@@ -1886,7 +3085,7 @@ class ParkingMissionController:
     def _route_pose_for_safety(self, pose):
         pose = Pose2D.from_value(pose)
         values = (pose.x, pose.y, pose.yaw)
-        if self.route_transform is None:
+        if self._frozen_local_to_odom() is None:
             return values
         return self._odom_pose_to_route(values)
 
@@ -2080,11 +3279,12 @@ class ParkingMissionController:
             pose, footprint, self.exit_turn_corner_relief
         )
 
-    def _map_boundary_clearance(self, pose, footprint):
+    def _local_boundary_clearance(self, pose, footprint):
+        """Clearance to mission-local bounds through the frozen transform."""
         corners = self._corners_for_footprint(
             self._route_pose_for_safety(pose), footprint
         )
-        minimum_x, maximum_x, minimum_y, maximum_y = self.map_safety_bounds
+        minimum_x, maximum_x, minimum_y, maximum_y = self.local_safety_bounds
         return min(
             min(x for x, _ in corners) - minimum_x,
             maximum_x - max(x for x, _ in corners),
@@ -2097,15 +3297,19 @@ class ParkingMissionController:
         points = self.fixed_obstacle_points_route
         if points.size == 0:
             return points.copy()
-        if self.odom_aligned_route or self.route_transform is None:
+        local_to_odom = self._frozen_local_to_odom()
+        if local_to_odom is None:
             return points.copy()
-        map_to_odom = self.route_transform.inverse()
         return np.asarray(
-            [map_to_odom.apply_point(point) for point in points],
+            [local_to_odom.apply_point(point) for point in points],
             dtype=np.float64,
         )
 
-    def _path_safety(self, boundary_kind, total_line_margin=None):
+    def _path_safety(
+        self,
+        boundary_kind,
+        total_line_margin=None,
+    ):
         callbacks = {
             "entry": self._entry_line_clearance,
             "entry_turn": self._entry_turn_union_clearance,
@@ -2115,18 +3319,25 @@ class ParkingMissionController:
             "final_turn": self._final_turn_union_clearance,
         }
         callback = callbacks.get(boundary_kind)
-        uncertainty = self.localization_margin + self.tracking_margin
+        # The surveyed route, paint callbacks, fixed fixtures and local bounds
+        # all receive the same frozen local->odom transform.  Registration
+        # covariance is common-mode for that fixed sweep and must not be added
+        # again as relative clearance.  Keep it as registration diagnostics;
+        # configured odom/tracking margins and source-stamped live LiDAR own
+        # the independent errors while the robot is moving.
+        localization_margin = self.localization_margin
+        uncertainty = localization_margin + self.tracking_margin
         if total_line_margin is None:
             total_line_margin = self.line_margin + uncertainty
         line_margin = max(0.0, float(total_line_margin) - uncertainty)
         return PathSafety(
             line_boundaries=(CallbackBoundary(callback),) if callback else (),
-            map_boundaries=(CallbackBoundary(self._map_boundary_clearance),),
+            map_boundaries=(CallbackBoundary(self._local_boundary_clearance),),
             fixed_obstacles=self._fixed_obstacle_points_odom(),
             margins=SafetyMargins(
                 line=line_margin,
                 obstacle=self.obstacle_margin,
-                localization=self.localization_margin,
+                localization=localization_margin,
                 tracking=self.tracking_margin,
             ),
         )
@@ -2183,6 +3394,7 @@ class ParkingMissionController:
         exit_velocity=None,
         total_line_margin=None,
         feedforward_scale=1.0,
+        fail_on_error=True,
     ):
         values = np.asarray(poses, dtype=np.float64)
         if (
@@ -2191,7 +3403,8 @@ class ParkingMissionController:
             or values.shape[0] < 2
             or not np.all(np.isfinite(values))
         ):
-            self._fail("%s did not produce a finite pose path" % label)
+            if fail_on_error:
+                self._fail("%s did not produce a finite pose path" % label)
             return None
         feedforward_scale = float(feedforward_scale)
         profile = self._speed_profile(
@@ -2212,12 +3425,14 @@ class ParkingMissionController:
                     ),
                 ),
                 safety=self._path_safety(
-                    boundary_kind, total_line_margin=total_line_margin
+                    boundary_kind,
+                    total_line_margin=total_line_margin,
                 ),
                 label=str(label),
             )
         except ValueError as error:
-            self._fail("cannot build common %s path: %s" % (label, error))
+            if fail_on_error:
+                self._fail("cannot build common %s path: %s" % (label, error))
             return None
 
         validation = self.path_validator.validate_path(path)
@@ -2225,15 +3440,16 @@ class ParkingMissionController:
         path.obstacle_clearance = validation.minimum_obstacle_clearance
         path.map_clearance = validation.minimum_map_clearance
         if not validation.safe:
-            self._fail(
-                "%s common swept path violates a fixed boundary "
-                "(line=%.4fm map=%.4fm)"
-                % (
-                    label,
-                    validation.minimum_line_clearance,
-                    validation.minimum_map_clearance,
+            if fail_on_error:
+                self._fail(
+                    "%s common swept path violates a fixed boundary "
+                    "(line=%.4fm local=%.4fm)"
+                    % (
+                        label,
+                        validation.minimum_line_clearance,
+                        validation.minimum_map_clearance,
+                    )
                 )
-            )
             return None
         return path
 
@@ -2351,10 +3567,10 @@ class ParkingMissionController:
             tracking.path_index,
             tracking.target_speed,
             stopping_linear,
-            (
+            self.path_follower.stopping_angular_velocities(
+                tracking,
+                stopping_linear,
                 self.odom_angular_velocity,
-                self.path_follower.last_angular,
-                tracking.angular_velocity,
             ),
             self.safety_reaction_time,
             self.linear_deceleration,
@@ -2384,7 +3600,7 @@ class ParkingMissionController:
         self._publish_path_diagnostics()
         return Twist()
 
-    def _common_path_command(self, now, tracking=None):
+    def _common_path_command(self, now, tracking=None, safety_decision=None):
         if (
             self.odom_pose is None
             or self.goal_odom is None
@@ -2398,9 +3614,21 @@ class ParkingMissionController:
             elapsed = self.control_period
         else:
             elapsed = clamp((now - self.last_command_time).to_sec(), 0.0, 0.15)
-        speed_limit, emergency_stop = self._common_safety_speed_limit(
-            now, tracking
-        )
+        if safety_decision is None:
+            speed_limit, emergency_stop = self._common_safety_speed_limit(
+                now, tracking
+            )
+        else:
+            if not isinstance(safety_decision, SafetyDecision):
+                raise TypeError("safety_decision must be a SafetyDecision")
+            if safety_decision.requires_stop:
+                return self._hard_path_stop_command(now)
+            self.active_path_validation = safety_decision.validation
+            self.path_follower.update_clearance(
+                safety_decision.validation
+            )
+            speed_limit = safety_decision.speed_limit
+            emergency_stop = False
         if emergency_stop:
             return self._hard_path_stop_command(now)
         command, _tracking = self.path_follower.command(
@@ -2547,7 +3775,6 @@ class ParkingMissionController:
             return None
 
         pose = Pose2D.from_value(self.odom_pose)
-        safety = self._rotation_path_safety()
         sequences = [
             sample_in_place_rotation(
                 pose, self.rotation_target_yaw, self.swept_heading_step
@@ -2587,6 +3814,7 @@ class ParkingMissionController:
                     self.swept_heading_step,
                 )
             )
+        safety = self._rotation_path_safety()
         return combine_validation_results(
             self.path_validator.validate_poses(
                 sequence,
@@ -2760,46 +3988,13 @@ class ParkingMissionController:
 
     def _build_zigzag_exit_curve(self):
         """Build the smooth left turn and its westbound alignment tail."""
-        if self.odom_pose is None or self.route_transform is None:
+        if self.odom_pose is None or self._frozen_local_to_odom() is None:
             return False
-        start_map = self._zigzag_turn_start_pose()
         try:
-            curve_map = quintic_turn_path(
-                start_map,
-                self.zigzag_heading,
-                self.zigzag_turn_offset,
-                self.zigzag_turn_tangent,
-                self.zigzag_turn_samples,
-            )
+            self.zigzag_exit_curve_map = self._zigzag_exit_route_poses()
         except ValueError as error:
             self._fail("cannot form the smooth zigzag exit turn: %s" % error)
             return False
-
-        turn_end = curve_map[-1]
-        tail_count = max(
-            2,
-            int(
-                math.ceil(
-                    self.zigzag_alignment_tail / self.path_sample_spacing
-                )
-            )
-            + 1,
-        )
-        fraction = np.linspace(0.0, 1.0, tail_count)
-        tail = np.column_stack(
-            (
-                turn_end[0]
-                + fraction
-                * self.zigzag_alignment_tail
-                * math.cos(self.zigzag_heading),
-                turn_end[1]
-                + fraction
-                * self.zigzag_alignment_tail
-                * math.sin(self.zigzag_heading),
-                np.full(tail_count, self.zigzag_heading),
-            )
-        )
-        self.zigzag_exit_curve_map = np.vstack((curve_map, tail[1:]))
         self.zigzag_exit_curve_odom = np.asarray(
             [
                 self._route_pose_to_odom(tuple(pose))
@@ -2854,34 +4049,30 @@ class ParkingMissionController:
             return False
         return True
 
-    def _build_adaptive_entry(self):
-        """Join the latest moving pose to the surveyed left-turn path."""
-        if self.odom_pose is None or self.route_transform is None:
+    def _build_adaptive_entry(self, preflight=False):
+        """Atomically prepare the registered connector and fixed turn.
+
+        Candidate geometry is kept local until both CommonPaths pass their
+        complete swept-footprint checks.  A later rejected candidate therefore
+        cannot destroy the immutable route advertised in an earlier ready.
+        """
+        self.entry_preparation_error = ""
+        if self.odom_pose is None or self._frozen_local_to_odom() is None:
+            self.entry_preparation_error = "local registration or odom unavailable"
             return False
 
-        curve_start = (
-            self.aisle_x + self.entry_curve_offset,
-            self.entry_y,
-            self.approach_heading,
-        )
-        self.entry_curve_map = quintic_turn_path(
-            curve_start,
-            self.aisle_heading,
-            self.entry_curve_offset,
-            self.entry_curve_tangent,
-            self.entry_curve_samples,
-        )
-        self.entry_curve_odom = np.asarray(
+        entry_curve_map = self._entry_curve_route_poses()
+        entry_curve_odom = np.asarray(
             [
                 self._route_pose_to_odom(tuple(pose))
-                for pose in self.entry_curve_map
+                for pose in entry_curve_map
             ],
             dtype=np.float64,
         )
 
         connector_start = tuple(float(value) for value in self.odom_pose)
         connector_end = tuple(
-            float(value) for value in self.entry_curve_odom[0]
+            float(value) for value in entry_curve_odom[0]
         )
         delta_x = connector_end[0] - connector_start[0]
         delta_y = connector_end[1] - connector_start[1]
@@ -2890,9 +4081,11 @@ class ParkingMissionController:
             + math.sin(connector_end[2]) * delta_y
         )
         if forward_distance <= 1e-4:
-            self._fail(
+            self.entry_preparation_error = (
                 "adaptive parking entry has no forward distance to its turn"
             )
+            if not preflight:
+                self._fail(self.entry_preparation_error)
             return False
 
         start_tangent = self.entry_connector_tangent_ratio * forward_distance
@@ -2902,11 +4095,15 @@ class ParkingMissionController:
         # still zero, so the following fixed turn remains a continuous G2 join.
         end_tangent = start_tangent
         if end_tangent <= 1e-4:
-            self._fail("adaptive parking entry is too short to form a safe path")
+            self.entry_preparation_error = (
+                "adaptive parking entry is too short to form a safe path"
+            )
+            if not preflight:
+                self._fail(self.entry_preparation_error)
             return False
 
         try:
-            self.entry_connector_odom = quintic_pose_path(
+            entry_connector_odom = quintic_pose_path(
                 connector_start,
                 connector_end,
                 start_tangent,
@@ -2914,7 +4111,11 @@ class ParkingMissionController:
                 self.entry_connector_samples,
             )
         except ValueError as error:
-            self._fail("cannot form adaptive parking entry: %s" % error)
+            self.entry_preparation_error = (
+                "cannot form adaptive parking entry: %s" % error
+            )
+            if not preflight:
+                self._fail(self.entry_preparation_error)
             return False
 
         approach_direction = np.asarray(
@@ -2922,45 +4123,50 @@ class ParkingMissionController:
             dtype=np.float64,
         )
         forward_steps = np.diff(
-            self.entry_connector_odom[:, :2], axis=0
+            entry_connector_odom[:, :2], axis=0
         ) @ approach_direction
         if np.any(forward_steps <= 0.0):
-            self._fail("adaptive parking entry path is not forward-monotonic")
+            self.entry_preparation_error = (
+                "adaptive parking entry path is not forward-monotonic"
+            )
+            if not preflight:
+                self._fail(self.entry_preparation_error)
             return False
 
-        self.entry_connector_speed = self.approach_speed
-
-        self.goal_map = tuple(float(value) for value in self.entry_curve_map[0])
-        self.goal_odom = tuple(float(value) for value in self.entry_curve_odom[0])
-        self.motion_timeout = self.drive_timeout
+        entry_connector_speed = self.approach_speed
         connector_entry_velocity = min(
-            self.entry_connector_speed,
+            entry_connector_speed,
             max(
                 self.minimum_velocity,
                 abs(self.observed_lane_linear),
             ),
         )
-        self.entry_connector_path = self._common_path_from_poses(
-            self.entry_connector_odom,
+        entry_connector_path = self._common_path_from_poses(
+            entry_connector_odom,
             1,
-            self.entry_connector_speed,
+            entry_connector_speed,
             self.APPROACH,
             "entry",
             self.entry_curve_end_position_tolerance,
             self.entry_curve_end_heading_tolerance,
             self.entry_curve_end_crossing_max_distance,
             entry_velocity=connector_entry_velocity,
-            exit_velocity=min(self.entry_connector_speed, self.entry_turn_speed),
+            exit_velocity=min(entry_connector_speed, self.entry_turn_speed),
             # The entry-line callback and common swept validation own both
             # handoff rejection and live stopping; no second corner-only
             # clearance gate is applied outside PathSafety.
             total_line_margin=self.entry_handoff_minimum_clearance,
             feedforward_scale=self.arc_angular_scale,
+            fail_on_error=not preflight,
         )
-        if self.entry_connector_path is None or self.state == self.FAILED:
+        if entry_connector_path is None or self.state == self.FAILED:
+            if not self.entry_preparation_error:
+                self.entry_preparation_error = (
+                    "adaptive parking connector failed full swept validation"
+                )
             return False
-        self.entry_curve_path = self._common_path_from_poses(
-            self.entry_curve_odom,
+        entry_curve_path = self._common_path_from_poses(
+            entry_curve_odom,
             1,
             self.entry_turn_speed,
             self.TURN_IN,
@@ -2971,18 +4177,137 @@ class ParkingMissionController:
             entry_velocity=self.entry_turn_speed,
             exit_velocity=self.entry_turn_speed,
             feedforward_scale=self.arc_angular_scale,
+            fail_on_error=not preflight,
         )
-        if self.entry_curve_path is None or self.state == self.FAILED:
+        if entry_curve_path is None or self.state == self.FAILED:
+            if not self.entry_preparation_error:
+                self.entry_preparation_error = (
+                    "parking entry turn failed full swept validation"
+                )
             return False
+
+        # Commit the whole route as one prepared generation only after both
+        # segments are valid.  Every later handoff starts from a projection on
+        # these exact CommonPath objects; it never synthesizes a short suffix.
+        self.entry_curve_map = entry_curve_map
+        self.entry_curve_odom = entry_curve_odom
+        self.entry_connector_odom = entry_connector_odom
+        self.entry_connector_speed = entry_connector_speed
+        self.entry_connector_path = entry_connector_path
+        self.entry_curve_path = entry_curve_path
+        self.goal_map = tuple(float(value) for value in entry_curve_map[0])
+        self.goal_odom = tuple(float(value) for value in entry_curve_odom[0])
+        self.motion_timeout = self.drive_timeout
         rospy.loginfo(
             "Adaptive parking entry: length=%.3fm lateral=%.3fm "
             "clearance=%.3fm speed=%.3fm/s",
-            self.entry_connector_path.length,
+            entry_connector_path.length,
             connector_end[1] - connector_start[1],
-            self.entry_connector_path.line_clearance,
-            self.entry_connector_speed,
+            entry_connector_path.line_clearance,
+            entry_connector_speed,
         )
         return True
+
+    def _prepared_entry_projection(self):
+        """Project the latest moving pose onto the immutable ready path."""
+        if self.entry_connector_path is None or self.odom_pose is None:
+            return None, "prepared parking entry or odometry is unavailable"
+        pose = Pose2D.from_value(self.odom_pose)
+        projection = project_to_path(
+            self.entry_connector_path,
+            pose.x,
+            pose.y,
+            search_ahead_distance=max(
+                self.path_search_ahead, self.entry_connector_path.length
+            ),
+        )
+        heading_error = abs(normalize_angle(projection.heading - pose.yaw))
+        if projection.distance > self.entry_handoff_maximum_path_error + 1e-9:
+            return (
+                None,
+                "prepared entry projection error %.4fm exceeds %.4fm"
+                % (
+                    projection.distance,
+                    self.entry_handoff_maximum_path_error,
+                ),
+            )
+        if heading_error > self.entry_handoff_maximum_heading_error + 1e-9:
+            return (
+                None,
+                "prepared entry heading error %.2fdeg exceeds %.2fdeg"
+                % (
+                    math.degrees(heading_error),
+                    math.degrees(
+                        self.entry_handoff_maximum_heading_error
+                    ),
+                ),
+            )
+        return projection, ""
+
+    def _prepared_entry_handoff_safety(self, now):
+        """Validate a takeover from the actual capped moving pose.
+
+        Fixed geometry was already swept when the ready path was committed.
+        The common validator is still run here with the newest LiDAR snapshot
+        so both the remaining route and the reaction-plus-complete-stop sweep
+        originate from the measured handoff pose.
+        """
+        if not self._odom_is_fresh(now):
+            return None, None, "parking entry handoff odometry is stale"
+        projection, issue = self._prepared_entry_projection()
+        if projection is None:
+            return None, None, issue
+        scan_is_fresh, live_obstacles = self._live_safety_snapshot(now)
+        if self.require_live_safety_scan and not scan_is_fresh:
+            return None, None, "parking entry handoff safety scan is stale"
+
+        pose = Pose2D.from_value(self.odom_pose)
+        stopping_linear = projection.direction * max(
+            abs(self.observed_lane_linear), self.odom_linear_speed
+        )
+        tracking = calculate_tracking(
+            self.entry_connector_path,
+            pose,
+            projection.path_index,
+            self.common_tracking_config,
+            previous_station=projection.station,
+            linear_velocity=stopping_linear,
+        )
+        angular_velocities = (
+            self.observed_lane_angular,
+        ) + self.path_follower.stopping_angular_velocities(
+            tracking,
+            stopping_linear,
+            self.odom_angular_velocity,
+        )
+        decision = self.path_validator.motion_safety(
+            self.entry_connector_path,
+            pose,
+            tracking.path_index,
+            tracking.target_speed,
+            stopping_linear,
+            angular_velocities,
+            self.safety_reaction_time,
+            self.linear_deceleration,
+            distance_margin=self.safety_distance_margin,
+            lookahead_distance=self.live_validation_distance,
+            live_obstacles=live_obstacles,
+            tracking=tracking,
+        )
+        if decision.requires_stop:
+            validation = decision.validation
+            return (
+                None,
+                decision,
+                "prepared entry requires a stop "
+                "(line=%.4fm obstacle=%.4fm local=%.4fm)"
+                % (
+                    validation.minimum_line_clearance,
+                    validation.minimum_obstacle_clearance,
+                    validation.minimum_map_clearance,
+                ),
+            )
+        return tracking, decision, ""
 
     def _begin_entry_curve(self):
         self.goal_map = tuple(float(value) for value in self.entry_curve_map[-1])
@@ -3013,20 +4338,102 @@ class ParkingMissionController:
             return "PASSED"
         return "TRACK"
 
+    def _try_publish_ready(self, now):
+        """Prepare and validate entry while the lane controller keeps driving."""
+        if (
+            self.arm_seq is None
+            or self.arm_stamp is None
+            or self.local_to_odom is None
+            or self.state != self.WAIT_GATE
+            or not self._odom_is_fresh(now)
+            or self.odom_stamp is None
+            or self.odom_stamp < self.arm_stamp
+        ):
+            return False
+        already_prepared = self.ready_published_seq == self.arm_seq
+        # READY is a physical handoff/braking window, so it must use the newest
+        # odom pose rather than the older pose synchronized to the LiDAR scan.
+        # The arm-time lane speed cap keeps the two-scan registration latency
+        # inside this window without weakening its stopping-distance meaning.
+        progress = entry_plane_progress(
+            self.registration_template.entry_plane,
+            self.odom_pose,
+            self.local_to_odom,
+        )
+        if not (
+            self.entry_lead_minimum
+            <= progress.longitudinal
+            <= self.entry_lead_maximum
+            and abs(progress.lateral) <= self.entry_lead_lateral_tolerance
+            and abs(progress.heading_error)
+            <= self.entry_lead_heading_tolerance
+        ):
+            return False
+        if already_prepared:
+            if (
+                self.ready_source_stamp is not None
+                and (self.odom_stamp - self.ready_source_stamp).to_sec()
+                < self.ready_republish_period
+            ):
+                return False
+            projection, issue = self._prepared_entry_projection()
+            if projection is None:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Parking prepared entry is no longer reachable: %s",
+                    issue,
+                )
+                return False
+        else:
+            if not self._build_adaptive_entry(preflight=True):
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Parking local entry is not ready: %s",
+                    self.entry_preparation_error,
+                )
+                return False
+        ready = Header()
+        ready.seq = self.arm_seq
+        ready.stamp = self.odom_stamp
+        ready.frame_id = self.mission_name
+        self.ready_pub.publish(ready)
+        self.ready_published_seq = self.arm_seq
+        self.ready_source_stamp = self.odom_stamp
+        rospy.loginfo(
+            "Parking ready generation=%d at local lead %.3fm: complete "
+            "entry connector and turn swept validation passed",
+            self.arm_seq,
+            progress.longitudinal,
+        )
+        return True
+
+    def _ready_matches_current_arm(self, now):
+        if (
+            self.arm_seq is None
+            or self.ready_published_seq != self.arm_seq
+            or self.ready_source_stamp is None
+            or self.local_to_odom is None
+            or self.entry_connector_path is None
+            or self.entry_curve_path is None
+        ):
+            return False
+        age = (now - self.ready_source_stamp).to_sec()
+        return -self.registration_future_tolerance <= age <= self.odom_timeout
+
     def _start_run(self, now):
-        if not self._inputs_fresh(now):
+        if not (
+            self._inputs_fresh(now)
+            and self._ready_matches_current_arm(now)
+        ):
             rospy.logwarn_throttle(
                 2.0,
-                "Waiting for fresh AMCL map pose and local odometry for parking",
+                "Waiting for matching parking ready and fresh local odometry",
             )
             return
         self.start_requested = False
         self.revoke_requested = False
         self.selected_space = None
         self.space_pub.publish(String(data="UNKNOWN"))
-        self.route_transform = None
-        self.route_anchor_map_pose = None
-        self.route_anchor_lateral_correction = 0.0
         self.parking_goal_map = None
         self.parking_return_map = None
         self.parking_return_odom = None
@@ -3036,12 +4443,6 @@ class ParkingMissionController:
         self.rotation_target_yaw = None
         self.rotation_initial_error = 0.0
         self.rotation_static_validation = None
-        self.entry_curve_map = None
-        self.entry_curve_odom = None
-        self.entry_connector_odom = None
-        self.entry_connector_speed = self.approach_speed
-        self.entry_connector_path = None
-        self.entry_curve_path = None
         self.zigzag_exit_curve_map = None
         self.zigzag_exit_curve_odom = None
         self.zigzag_exit_curve_path = None
@@ -3472,21 +4873,21 @@ class ParkingMissionController:
 
     def _selection_input_issue(self, now):
         """Explain why a new stopped parking-bay scan cannot be consumed."""
-        if not self._map_pose_is_fresh(now):
-            return "stale AMCL map pose"
         if not self._odom_is_fresh(now):
             return "stale parking odometry"
+        local_to_odom = self._frozen_local_to_odom()
+        if local_to_odom is None:
+            return "parking local registration unavailable"
 
-        # ENTER_AISLE has already confirmed the stopped longitudinal endpoint
-        # from odometry. Requiring the same point from AMCL again made a normal
-        # localization translation correction suppress otherwise unambiguous
-        # [0, occupied] scans. AMCL remains authoritative for projecting scan
-        # returns into the two map ROIs; only its aisle heading must agree here.
+        # ENTER_AISLE already confirmed the stopped endpoint from odometry.
+        # Project that same odometry through the frozen fixture transform;
+        # AMCL is diagnostic only and cannot suppress an unambiguous scan.
+        local_pose = local_to_odom.inverse().apply_pose(self.odom_pose)
         heading_error = abs(
-            normalize_angle(self.map_pose[2] - self.aisle_heading)
+            normalize_angle(local_pose.yaw - self.aisle_heading)
         )
         if heading_error > self.checkpoint_heading_tolerance:
-            return "AMCL aisle heading error %.1fdeg exceeds %.1fdeg" % (
+            return "local aisle heading error %.1fdeg exceeds %.1fdeg" % (
                 math.degrees(heading_error),
                 math.degrees(self.checkpoint_heading_tolerance),
             )
@@ -3581,7 +4982,7 @@ class ParkingMissionController:
             return
         if not self._inputs_fresh(now):
             rospy.logwarn_throttle(
-                1.0, "Parking entry handoff lost fresh localization"
+                1.0, "Parking entry handoff lost fresh registered odometry"
             )
             return
         command_fresh = (
@@ -3608,31 +5009,53 @@ class ParkingMissionController:
             or not command_after_gate
             or not command_fresh
             or not command_is_bounded
+            or self.bounded_lane_command_generation is None
+            or self.bounded_lane_command_odom_generation is None
+            or self.odom_generation
+            <= self.bounded_lane_command_odom_generation
         ):
             rospy.logwarn_throttle(
                 1.0,
-                "Parking waits for post-gate odometry and a fresh capped "
-                "lane command while lane control remains active",
+                "Parking waits for a fresh capped lane command followed by "
+                "post-cap odometry while lane control remains active",
             )
             return
-        if not self._latch_route_transform():
-            self._fail("cannot anchor the fixed parking route to local odometry")
-            return
-        if not self._build_adaptive_entry():
+        handoff_tracking, _decision, handoff_issue = (
+            self._prepared_entry_handoff_safety(now)
+        )
+        if handoff_tracking is None:
+            rospy.logwarn_throttle(
+                1.0,
+                "Parking waits for a safe prepared-path handoff: %s",
+                handoff_issue,
+            )
             return
 
-        # Build and validate from the latest moving pose before disabling lane
-        # control. The first parking command is deliberately identical to the
-        # last observed lane command; with dt=0 the limiter preserves it, then
-        # converges toward the adaptive path on subsequent timer cycles.
+        # The entry was generated and completely swept before ready.  The
+        # shared follower starts at the projected station of the latest
+        # post-cap pose; no mission-specific suffix is regenerated here.
         handoff_linear = self.observed_lane_linear
         handoff_angular = self.observed_lane_angular
         if not self._set_lane_controller(False):
             self._fail("could not acquire cmd_vel control")
             return
+        # Odom and the synchronized safety scan can arrive while the service
+        # call owns the controller lock.  Apply that staged pose and run the
+        # same common handoff check once more before the first mission command.
+        self._apply_pending_odom_state()
+        command_now = rospy.Time.now()
+        handoff_tracking, handoff_decision, handoff_issue = (
+            self._prepared_entry_handoff_safety(command_now)
+        )
+        if handoff_tracking is None:
+            self._fail(
+                "parking entry became unsafe during control handoff: %s"
+                % handoff_issue
+            )
+            return
         self.last_linear = handoff_linear
         self.last_angular = handoff_angular
-        self.last_command_time = now
+        self.last_command_time = command_now
         self._set_state(self.APPROACH)
         if not self._activate_common_path(
             self.entry_connector_path,
@@ -3642,7 +5065,13 @@ class ParkingMissionController:
         ):
             self._fail("cannot activate the common adaptive parking entry")
             return
-        self.cmd_pub.publish(self._common_path_command(now))
+        self.cmd_pub.publish(
+            self._common_path_command(
+                command_now,
+                tracking=handoff_tracking,
+                safety_decision=handoff_decision,
+            )
+        )
 
     def _zigzag_lane_handoff_ready(self, now):
         confirmation_fresh = (
@@ -3725,6 +5154,7 @@ class ParkingMissionController:
             if self.shutting_down:
                 return
             self._apply_pending_odom_state()
+            self._apply_pending_registration_scan()
             occupancy = self._apply_pending_selection_scan()
             if occupancy is not None:
                 self.occupancy_pub.publish(occupancy)
@@ -3739,7 +5169,13 @@ class ParkingMissionController:
             ):
                 self._start_run(now)
 
-            if self.state in (self.WAIT_GATE, self.COMPLETE):
+            if self.state == self.WAIT_GATE:
+                # Registration and full entry validation happen while the
+                # lane controller retains cmd_vel ownership.  The arm callback
+                # has already applied its bounded lane speed cap.
+                self._try_publish_ready(now)
+                return
+            if self.state == self.COMPLETE:
                 return
             if self.manual_stop:
                 if self.mission_has_control:

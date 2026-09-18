@@ -21,7 +21,7 @@ lane_lookahead:
       anchor_tolerance: 0.002
 
   # This fixed benchmark finish is only the lane-approach timing plane. The
-  # mission observation polygon is tuned independently from integrated runs.
+  # single mission polygon is tuned independently from integrated runs.
   # The benchmark path continues 51 mm beyond this plane.
   finish:
     x: 1.55

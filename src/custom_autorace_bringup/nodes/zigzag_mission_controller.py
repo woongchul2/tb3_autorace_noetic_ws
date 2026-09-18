@@ -13,7 +13,7 @@ import rospy
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Float64, Float64MultiArray, String
+from std_msgs.msg import Bool, Float64, Float64MultiArray, Header, String
 from std_srvs.srv import SetBool
 
 from custom_autorace_bringup.path_following import (
@@ -24,14 +24,24 @@ from custom_autorace_bringup.path_following import (
     PathFollower,
     PathSafety,
     Pose2D,
+    RigidTransform2D,
     SafetyMargins,
     SpeedProfile,
     SweptFootprintValidator,
     TrackingConfig,
     clamp,
-    freeze_path_in_odom,
     normalize_angle,
+    project_to_path,
     yaw_from_quaternion,
+)
+from custom_autorace_bringup.local_registration import (
+    CurveRegistrationConfig,
+    LocalCurveTemplate,
+    ObservedCurve,
+    TemporalRegistrationConfig,
+    TemporalRegistrationFilter,
+    registration_radial_uncertainty,
+    register_curve_subset,
 )
 from custom_autorace_bringup.zigzag_path import (
     RasterPaintCorridorChecker,
@@ -64,11 +74,17 @@ class ZigzagMissionController:
         self.scan_topic = str(
             get(p + "topics/scan", "/scan_mid360_raw")
         )
-        self.map_pose_topic = str(
-            get(p + "topics/map_pose", "/mission/map_pose")
-        )
         self.gate_topic = str(
             get(p + "topics/zone_gate", "/mission/enable/zigzag")
+        )
+        self.arm_topic = str(
+            get(p + "topics/mission_arm", "/mission/arm/zigzag")
+        )
+        self.ready_topic = str(
+            get(p + "topics/mission_ready", "/mission/ready/zigzag")
+        )
+        self.lane_path_topic = str(
+            get(p + "topics/lane_path", "/control/lane_path")
         )
         self.boundary_topic = str(
             get(p + "topics/lane_boundaries", "/detect/lane_boundaries")
@@ -111,6 +127,133 @@ class ZigzagMissionController:
         )
         self.maximum_pose_stamp_skew = max(
             0.005, float(get(p + "start/maximum_pose_stamp_skew", 0.04))
+        )
+        self.curve_registration_config = CurveRegistrationConfig(
+            sample_count=max(
+                5, int(get(p + "registration/sample_count", 21))
+            ),
+            station_search_step=max(
+                0.002,
+                float(get(p + "registration/station_search_step", 0.01)),
+            ),
+            minimum_observed_length=max(
+                0.05,
+                float(get(p + "registration/minimum_observed_length", 0.20)),
+            ),
+            minimum_heading_variation=math.radians(
+                max(
+                    1.0,
+                    float(
+                        get(
+                            p + "registration/minimum_heading_variation_deg",
+                            8.0,
+                        )
+                    ),
+                )
+            ),
+            minimum_lateral_excitation=max(
+                0.001,
+                float(
+                    get(
+                        p + "registration/minimum_lateral_excitation", 0.008
+                    )
+                ),
+            ),
+            position_inlier_threshold=max(
+                0.003,
+                float(
+                    get(
+                        p + "registration/position_inlier_threshold", 0.025
+                    )
+                ),
+            ),
+            minimum_inlier_fraction=clamp(
+                float(
+                    get(p + "registration/minimum_inlier_fraction", 0.75)
+                ),
+                0.1,
+                1.0,
+            ),
+            maximum_rms=max(
+                0.002, float(get(p + "registration/maximum_rms", 0.018))
+            ),
+            ambiguity_station_separation=max(
+                0.02,
+                float(
+                    get(
+                        p + "registration/ambiguity_station_separation", 0.08
+                    )
+                ),
+            ),
+            maximum_ambiguity_rms_difference=max(
+                1e-4,
+                float(
+                    get(
+                        p + "registration/maximum_ambiguity_rms_difference",
+                        0.002,
+                    )
+                ),
+            ),
+            maximum_ambiguity_rms_ratio=max(
+                1.0,
+                float(
+                    get(
+                        p + "registration/maximum_ambiguity_rms_ratio", 1.15
+                    )
+                ),
+            ),
+        )
+        self.registration_filter = TemporalRegistrationFilter(
+            TemporalRegistrationConfig(
+                required_confirmations=max(
+                    1,
+                    int(get(p + "registration/confirmation_frames", 3)),
+                ),
+                maximum_gap=max(
+                    0.05,
+                    float(get(p + "registration/confirmation_max_gap", 0.20)),
+                ),
+                maximum_position_delta=max(
+                    0.002,
+                    float(
+                        get(
+                            p + "registration/maximum_position_spread", 0.015
+                        )
+                    ),
+                ),
+                maximum_heading_delta=math.radians(
+                    max(
+                        0.5,
+                        float(
+                            get(
+                                p + "registration/maximum_heading_spread_deg",
+                                2.0,
+                            )
+                        ),
+                    )
+                ),
+            )
+        )
+        self.registration_source_max_age = max(
+            0.05,
+            float(get(p + "registration/source_max_age", 0.35)),
+        )
+        self.registration_future_tolerance = max(
+            0.0,
+            float(get(p + "registration/future_tolerance", 0.05)),
+        )
+        self.ready_republish_period = max(
+            0.05,
+            float(get(p + "registration/ready_republish_period", 0.15)),
+        )
+        self.registration_maximum_start_station_error = max(
+            0.01,
+            float(
+                get(
+                    p + "registration/maximum_start_station_error",
+                    0.10,
+                )
+            ),
         )
         self.scan_frame = str(get(p + "scan/frame_id", "base_scan")).lstrip(
             "/"
@@ -303,6 +446,11 @@ class ZigzagMissionController:
         )
         if not isinstance(self.map_path, CommonPath):
             raise rospy.ROSInitException("zigzag path is not in the common format")
+        self.local_curve_template = LocalCurveTemplate(
+            name="zigzag",
+            frame_id=self.map_path.frame_id,
+            points=tuple(zip(self.map_path.x, self.map_path.y)),
+        )
         maximum_curvature = max(
             0.1, float(get(p + "path/maximum_curvature", 5.10))
         )
@@ -462,9 +610,6 @@ class ZigzagMissionController:
             terminal_crossing=self.exit_position_tolerance,
         )
 
-        self.map_timeout = max(
-            0.05, float(get(p + "timeouts/map_pose", 0.35))
-        )
         self.odom_timeout = max(
             0.05, float(get(p + "timeouts/odometry", 0.35))
         )
@@ -486,6 +631,9 @@ class ZigzagMissionController:
         self.state_started = rospy.Time.now()
         self.mission_started = None
         self.zone_gate = False
+        self.arm_generation = 0
+        self.armed_at = None
+        self.accepted_gate_generation = 0
         self.start_requested = False
         self.revoke_requested = False
         self.mission_has_control = False
@@ -494,9 +642,6 @@ class ZigzagMissionController:
         self.manual_stop = False
         self.pause_started = None
 
-        self.map_ready = False
-        self.map_x = self.map_y = self.map_yaw = 0.0
-        self.map_stamp = None
         self.odom_ready = False
         self.odom_x = self.odom_y = self.odom_yaw = 0.0
         self.odom_speed = 0.0
@@ -512,6 +657,12 @@ class ZigzagMissionController:
 
         self.committed_path = None
         self.route_from_odom = None
+        self.prepared_path = None
+        self.prepared_route_from_odom = None
+        self.prepared_registration_transform = None
+        self.prepared_generation = 0
+        self.prepared_stamp = None
+        self.registration_covariance = tuple()
         self.path_index = 0
         self.maximum_position_error_seen = 0.0
         self.maximum_heading_error_seen = 0.0
@@ -547,6 +698,14 @@ class ZigzagMissionController:
         self.diagnostics_pub = rospy.Publisher(
             "/zigzag/diagnostics", Float64MultiArray, queue_size=1, latch=True
         )
+        self.ready_pub = rospy.Publisher(
+            self.ready_topic, Header, queue_size=1, latch=True
+        )
+        # Keep the surveyed plan visible from bringup.  Acquisition later
+        # replaces this latched message with the immutable odom execution path.
+        # A zero stamp keeps this latched plan timeless for RViz clients that
+        # connect after the controller has finished initializing.
+        self._publish_path(self.map_path, stamp=rospy.Time())
         rospy.Subscriber(
             self.odom_topic,
             Odometry,
@@ -556,10 +715,11 @@ class ZigzagMissionController:
         rospy.Subscriber(
             self.scan_topic, LaserScan, self.scan_callback, queue_size=1
         )
-        rospy.Subscriber(
-            self.map_pose_topic, PoseStamped, self.map_pose_callback, queue_size=1
-        )
         rospy.Subscriber(self.gate_topic, Bool, self.gate_callback, queue_size=1)
+        rospy.Subscriber(self.arm_topic, Header, self.arm_callback, queue_size=1)
+        rospy.Subscriber(
+            self.lane_path_topic, Path, self.lane_path_callback, queue_size=1
+        )
         rospy.Subscriber(
             self.boundary_topic,
             Float64MultiArray,
@@ -602,38 +762,315 @@ class ZigzagMissionController:
         self._publish_state()
         rospy.loginfo("Zigzag mission state: %s", state)
 
+    def arm_callback(self, message):
+        """Reset registration only when the ordered manager arms a new run."""
+
+        if message.frame_id != "zigzag":
+            return
+        with self.lock:
+            generation = int(message.seq)
+            if (
+                generation <= 0
+                or message.stamp == rospy.Time()
+                or generation == self.arm_generation
+            ):
+                return
+            self.arm_generation = generation
+            self.armed_at = message.stamp
+            self.accepted_gate_generation = 0
+            self.start_requested = False
+            self.prepared_path = None
+            self.prepared_route_from_odom = None
+            self.prepared_registration_transform = None
+            self.prepared_generation = 0
+            self.prepared_stamp = None
+            self.registration_covariance = tuple()
+            self.registration_filter.reset("new mission arm")
+
+    @staticmethod
+    def _path_points(message):
+        points = []
+        for stamped_pose in message.poses:
+            x = float(stamped_pose.pose.position.x)
+            y = float(stamped_pose.pose.position.y)
+            if not math.isfinite(x) or not math.isfinite(y):
+                return tuple()
+            if not points or math.hypot(
+                x - points[-1][0], y - points[-1][1]
+            ) > 1e-6:
+                points.append((x, y))
+        return tuple(points)
+
+    @staticmethod
+    def _registration_uncertainty(
+        covariance,
+        footprint,
+        local_points=None,
+        target_from_source_yaw=0.0,
+    ):
+        return registration_radial_uncertainty(
+            covariance,
+            footprint,
+            local_points=local_points,
+            target_from_source_yaw=target_from_source_yaw,
+        )
+
+    def lane_path_callback(self, message):
+        """Recognize and freeze the mission-local spline before handoff."""
+
+        stamp = message.header.stamp
+        received = rospy.Time.now()
+        if stamp == rospy.Time():
+            return
+        source_age = (received - stamp).to_sec()
+        if (
+            source_age > self.registration_source_max_age
+            or source_age < -self.registration_future_tolerance
+        ):
+            return
+        points = self._path_points(message)
+        if len(points) < 3:
+            return
+        with self.lock:
+            generation = self.arm_generation
+            armed_at = self.armed_at
+            if (
+                generation <= 0
+                or armed_at is None
+                or stamp < armed_at
+                or self.zone_gate
+                or self.state not in (self.WAIT_GATE, self.COMPLETE)
+            ):
+                return
+            already_prepared = self.prepared_generation == generation
+            odom_frame = self.odom_frame
+            template = self.local_curve_template
+            config = self.curve_registration_config
+            start_station_bounds = None
+            if self.route_odom_aligned and self.odom_ready:
+                projection = project_to_path(
+                    self.map_path, self.odom_x, self.odom_y
+                )
+                station_error = (
+                    self.registration_maximum_start_station_error
+                )
+                start_station_bounds = (
+                    max(0.0, projection.station - station_error),
+                    min(
+                        self.map_path.length,
+                        projection.station + station_error,
+                    ),
+                )
+        frame_id = str(message.header.frame_id).lstrip("/")
+        expected_frame = str(odom_frame).lstrip("/")
+        if not frame_id or frame_id != expected_frame:
+            rospy.logwarn_throttle(
+                1.0,
+                "Ignoring zigzag lane path in frame '%s'; expected '%s'",
+                frame_id,
+                expected_frame,
+            )
+            return
+        try:
+            result = register_curve_subset(
+                template,
+                ObservedCurve(
+                    stamp=stamp.to_sec(),
+                    target_frame=odom_frame,
+                    points=points,
+                ),
+                config,
+                start_station_bounds=start_station_bounds,
+            )
+        except (TypeError, ValueError, np.linalg.LinAlgError) as error:
+            rospy.logwarn_throttle(
+                1.0, "Rejecting malformed zigzag rolling path: %s", error
+            )
+            return
+
+        with self.lock:
+            if generation != self.arm_generation or self.zone_gate:
+                return
+            if not result.accepted or result.registration is None:
+                if not already_prepared:
+                    self.registration_filter.reset(
+                        result.diagnostics.reason
+                        or "curve registration rejected"
+                    )
+                return
+            if already_prepared:
+                frozen_transform = self.prepared_registration_transform
+                if frozen_transform is None:
+                    return
+                observed_transform = result.registration.transform
+                position_delta = math.hypot(
+                    observed_transform.target_from_source_x
+                    - frozen_transform.target_from_source_x,
+                    observed_transform.target_from_source_y
+                    - frozen_transform.target_from_source_y,
+                )
+                heading_delta = abs(
+                    normalize_angle(
+                        observed_transform.target_from_source_yaw
+                        - frozen_transform.target_from_source_yaw
+                    )
+                )
+                temporal_config = self.registration_filter.config
+                if (
+                    position_delta
+                    > temporal_config.maximum_position_delta
+                    or heading_delta
+                    > temporal_config.maximum_heading_delta
+                    or self.prepared_stamp is None
+                    or stamp <= self.prepared_stamp
+                    or (stamp - self.prepared_stamp).to_sec()
+                    < self.ready_republish_period
+                    or not self.odom_ready
+                ):
+                    return
+                pose = Pose2D(self.odom_x, self.odom_y, self.odom_yaw)
+                follower = PathFollower(self.tracking_config)
+                projection = follower.reset(self.prepared_path, pose)
+                if (
+                    projection.distance > self.start_maximum_path_error
+                    or abs(normalize_angle(projection.heading - pose.yaw))
+                    > self.start_maximum_join_heading_error
+                ):
+                    return
+                self.prepared_stamp = stamp
+                ready = Header(seq=generation, stamp=stamp, frame_id="zigzag")
+                self.ready_pub.publish(ready)
+                return
+            temporal = self.registration_filter.update(result.registration)
+            if not temporal.confirmed:
+                return
+            registration_transform = temporal.transform
+            transform = registration_transform
+            # Gazebo's established path is deliberately world/odom aligned.
+            # Curve matching still determines when this mission is present,
+            # but it must not replace the verified identity route there.
+            if self.route_odom_aligned:
+                transform = RigidTransform2D(
+                    0.0,
+                    0.0,
+                    0.0,
+                    self.map_path.frame_id,
+                    self.odom_frame,
+                )
+            route_from_odom = transform.inverse()
+            covariance = (
+                tuple() if self.route_odom_aligned else temporal.covariance
+            )
+            candidate = transform.apply_path(self.map_path)
+            uncertainty = self._registration_uncertainty(
+                covariance,
+                self.footprint,
+                local_points=np.column_stack(
+                    (self.map_path.x, self.map_path.y)
+                ),
+                target_from_source_yaw=transform.target_from_source_yaw,
+            )
+            candidate.safety = self._path_safety(
+                route_from_odom, registration_margin=uncertainty
+            )
+            current_pose = (
+                Pose2D(self.odom_x, self.odom_y, self.odom_yaw)
+                if self.odom_ready
+                else None
+            )
+            live_obstacles = np.array(
+                self.live_obstacle_points, dtype=np.float64, copy=True
+            )
+            validator = self.path_validator
+            tracking_config = self.tracking_config
+
+        validation = validator.validate_path(
+            candidate, live_obstacles=live_obstacles
+        )
+        if not validation.safe or current_pose is None:
+            return
+        follower = PathFollower(tracking_config)
+        projection = follower.reset(candidate, current_pose)
+        heading_error = abs(
+            normalize_angle(projection.heading - current_pose.yaw)
+        )
+        if (
+            projection.distance > self.start_maximum_path_error
+            or heading_error > self.start_maximum_join_heading_error
+        ):
+            return
+        candidate.line_clearance = validation.minimum_line_clearance
+        candidate.obstacle_clearance = validation.minimum_obstacle_clearance
+        candidate.map_clearance = validation.minimum_map_clearance
+
+        with self.lock:
+            if (
+                generation != self.arm_generation
+                or self.zone_gate
+                or self.prepared_generation == generation
+            ):
+                return
+            self.prepared_path = candidate
+            self.prepared_route_from_odom = route_from_odom
+            self.prepared_registration_transform = registration_transform
+            self.prepared_generation = generation
+            self.prepared_stamp = stamp
+            self.registration_covariance = covariance
+            ready = Header()
+            ready.seq = generation
+            ready.stamp = stamp
+            ready.frame_id = "zigzag"
+            self.ready_pub.publish(ready)
+            rospy.loginfo(
+                "Zigzag local route ready: generation=%d station=%.3f "
+                "rms=%.4fm uncertainty=%.4fm",
+                generation,
+                result.start_station,
+                result.diagnostics.best_rms,
+                uncertainty,
+            )
+
     def gate_callback(self, message):
         with self.lock:
+            if bool(message.data) and not self._prepared_matches_arm():
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Ignoring zigzag gate without a matching prepared route",
+                )
+                return
             was_open = self.zone_gate
             self.zone_gate = bool(message.data)
             if self.zone_gate and not was_open:
+                # The ordered manager already checked the source-stamped READY
+                # token. Bind its one-shot Bool gate to the exact local arm so
+                # callback/timer latency cannot age out an accepted route.
+                self.accepted_gate_generation = self.arm_generation
                 self.start_requested = True
-            elif not self.zone_gate and was_open and self.state != self.COMPLETE:
-                self.revoke_requested = True
+            elif not self.zone_gate:
+                self.accepted_gate_generation = 0
+                if was_open and self.state != self.COMPLETE:
+                    self.revoke_requested = True
 
-    def map_pose_callback(self, message):
-        received = rospy.Time.now()
-        source_stamp = (
-            message.header.stamp
-            if message.header.stamp != rospy.Time()
-            else received
+    def _prepared_matches_arm(self):
+        if (
+            self.arm_generation <= 0
+            or self.prepared_generation != self.arm_generation
+            or self.prepared_path is None
+            or self.prepared_route_from_odom is None
+            or self.prepared_stamp is None
+        ):
+            return False
+        return True
+
+    def _prepared_ready_for_gate(self, now):
+        if not self._prepared_matches_arm():
+            return False
+        age = (now - self.prepared_stamp).to_sec()
+        return (
+            -self.registration_future_tolerance
+            <= age
+            <= self.registration_source_max_age
         )
-        with self.lock:
-            if not all(
-                math.isfinite(value)
-                for value in (
-                    message.pose.position.x,
-                    message.pose.position.y,
-                    yaw_from_quaternion(message.pose.orientation),
-                )
-            ):
-                rospy.logerr_throttle(1.0, "Ignoring non-finite zigzag map pose")
-                return
-            self.map_x = float(message.pose.position.x)
-            self.map_y = float(message.pose.position.y)
-            self.map_yaw = yaw_from_quaternion(message.pose.orientation)
-            self.map_stamp = source_stamp
-            self.map_ready = True
 
     def odom_callback(self, message):
         received = rospy.Time.now()
@@ -1036,6 +1473,21 @@ class ZigzagMissionController:
             return False
 
     def _start_run(self, now):
+        # READY freshness belongs to the ordered manager. Once its gate is
+        # accepted, lane-path callbacks cannot replace the prepared bundle, so
+        # the timer only verifies the captured arm identity. Re-aging the
+        # camera stamp here races the manager's already accepted READY token.
+        if (
+            self.accepted_gate_generation != self.arm_generation
+            or not self._prepared_matches_arm()
+        ):
+            self.start_requested = False
+            self.zone_gate = False
+            self.accepted_gate_generation = 0
+            rospy.logwarn_throttle(
+                1.0, "Ignoring zigzag start without a matching prepared route"
+            )
+            return False
         self.start_requested = False
         self.revoke_requested = False
         self.speed_limit_pub.publish(Float64(data=self.entry_velocity_cap))
@@ -1053,50 +1505,7 @@ class ZigzagMissionController:
         self.maximum_position_error_seen = 0.0
         self.maximum_heading_error_seen = 0.0
         self._set_state(self.ACQUIRING, now)
-
-    def _inputs_problem(self, now):
-        if not self.map_ready or self.map_stamp is None:
-            return "map pose"
-        map_age = (now - self.map_stamp).to_sec()
-        if map_age < -self.maximum_pose_stamp_skew:
-            return "future map pose"
-        if map_age > self.map_timeout:
-            return "stale map pose"
-        if not self.odom_ready or self.odom_stamp is None:
-            return "odometry"
-        odom_age = (now - self.odom_stamp).to_sec()
-        if odom_age < -self.maximum_pose_stamp_skew:
-            return "future odometry"
-        if odom_age > self.odom_timeout:
-            return "stale odometry"
-        if self._synchronized_odom_pose() is None:
-            return "map/odom timestamp synchronization"
-        scan_problem = self._scan_input_problem(now)
-        if scan_problem is not None:
-            return scan_problem
-        return None
-
-    def _synchronized_odom_pose(self, stamp=None, maximum_skew=None):
-        target_stamp = self.map_stamp if stamp is None else stamp
-        if target_stamp is None or not self.odom_history:
-            return None
-        allowed_skew = (
-            self.maximum_pose_stamp_skew
-            if maximum_skew is None
-            else max(0.0, float(maximum_skew))
-        )
-        synchronized = min(
-            self.odom_history,
-            key=lambda sample: abs((sample[0] - target_stamp).to_sec()),
-        )
-        if (
-            abs((synchronized[0] - target_stamp).to_sec())
-            > allowed_skew
-        ):
-            return None
-        if synchronized[4] != self.odom_frame:
-            return None
-        return synchronized
+        return True
 
     def _scan_input_problem(self, now):
         if self.scan_stamp is None or self.scan_received is None:
@@ -1126,36 +1535,10 @@ class ZigzagMissionController:
             return "stale odometry"
         return None
 
-    def _captured_acquisition_input_problem(self, snapshot, now):
-        map_age = (now - snapshot["map_stamp"]).to_sec()
-        if map_age < -self.maximum_pose_stamp_skew:
-            return "future map-pose snapshot"
-        if map_age > self.map_timeout:
-            return "stale map-pose snapshot"
-        if (
-            abs(
-                (
-                    snapshot["synchronized_odom_stamp"]
-                    - snapshot["map_stamp"]
-                ).to_sec()
-            )
-            > self.maximum_pose_stamp_skew
-        ):
-            return "map/odometry snapshot synchronization"
-        source_age = (now - snapshot["scan_stamp"]).to_sec()
-        receipt_age = (now - snapshot["scan_received"]).to_sec()
-        if source_age < -self.scan_pose_stamp_skew or receipt_age < 0.0:
-            return "future LiDAR snapshot"
-        if source_age > self.scan_timeout or receipt_age > self.scan_timeout:
-            return "stale LiDAR snapshot"
-        if snapshot["scan_pose_stamp_delta"] > self.scan_pose_stamp_skew:
-            return "LiDAR/odometry snapshot synchronization"
-        return None
-
     def _acquire(self, now):
-        # Capture coherent localization and LiDAR input while lane following
-        # still owns cmd_vel. The full dynamic-obstacle sweep is pure geometry
-        # and must not starve odom, scan, gate, manual-stop or shutdown callbacks.
+        # Registration and the immutable full-route sweep finished before the
+        # ordered gate opened. Recheck only fresh odometry and LiDAR evidence
+        # before the sole cmd_vel ownership transfer.
         with self.lock:
             if self.state != self.ACQUIRING:
                 return False
@@ -1164,23 +1547,33 @@ class ZigzagMissionController:
                     "timed out before the surveyed zigzag path could be acquired"
                 )
                 return False
-            problem = self._inputs_problem(now)
+            prepared = (
+                self.prepared_path
+                if self.prepared_generation == self.arm_generation
+                and self.prepared_generation > 0
+                else None
+            )
+            if prepared is None:
+                rospy.logwarn_throttle(
+                    1.0, "Waiting for prevalidated zigzag local registration"
+                )
+                return False
+            problem = self._tracking_input_problem(now)
+            if problem is None:
+                problem = self._scan_input_problem(now)
             if problem is not None:
                 rospy.logwarn_throttle(1.0, "Waiting for zigzag %s", problem)
                 return False
-            synchronized = self._synchronized_odom_pose()
             live_obstacles = self._fresh_live_obstacles(now)
-            if synchronized is None or live_obstacles is None:
+            if live_obstacles is None:
                 return False
-            sync_stamp, sync_x, sync_y, sync_yaw, _ = synchronized
             snapshot = {
                 "state_started": self.state_started,
                 "map_path": self.map_path,
-                "map_pose": Pose2D(self.map_x, self.map_y, self.map_yaw),
-                "map_stamp": self.map_stamp,
-                "synchronized_odom_pose": Pose2D(sync_x, sync_y, sync_yaw),
-                "synchronized_odom_stamp": sync_stamp,
                 "odom_frame": self.odom_frame,
+                "prepared_path": prepared,
+                "prepared_route_from_odom": self.prepared_route_from_odom,
+                "prepared_generation": self.prepared_generation,
                 "scan_stamp": self.scan_stamp,
                 "scan_received": self.scan_received,
                 "scan_pose_stamp_delta": self.scan_pose_stamp_delta,
@@ -1192,17 +1585,11 @@ class ZigzagMissionController:
                 "tracking_config": self.tracking_config,
             }
 
-        candidate, route_from_odom = freeze_path_in_odom(
-            snapshot["map_path"],
-            snapshot["map_pose"],
-            snapshot["synchronized_odom_pose"],
-            odom_aligned=self.route_odom_aligned,
-            odom_frame=snapshot["odom_frame"],
-        )
+        candidate = snapshot["prepared_path"]
+        route_from_odom = snapshot["prepared_route_from_odom"]
         # The surveyed line/map sweep was already accepted at initialization.
         # A rigid map-to-odom transform preserves those clearances, so only the
         # newly observed obstacle cloud needs another whole-route sweep here.
-        candidate.safety = self._path_safety(route_from_odom)
         validation = snapshot["validator"].validate_path(
             candidate,
             safety=snapshot["live_route_safety"],
@@ -1236,11 +1623,14 @@ class ZigzagMissionController:
                 return False
 
             completed = rospy.Time.now()
-            problem = self._captured_acquisition_input_problem(
-                snapshot, completed
-            )
+            problem = self._tracking_input_problem(completed)
             if problem is None:
-                problem = self._inputs_problem(completed)
+                problem = self._scan_input_problem(completed)
+            if (
+                snapshot["prepared_generation"] != self.prepared_generation
+                or snapshot["prepared_path"] is not self.prepared_path
+            ):
+                problem = "changed local registration"
             if problem is not None:
                 rospy.logwarn_throttle(1.0, "Waiting for zigzag %s", problem)
                 return False
@@ -1301,7 +1691,14 @@ class ZigzagMissionController:
             self.last_angular = initial_angular
             self.last_command_time = committed_at
             self.mission_started = committed_at
-            self._publish_path()
+            # In Gazebo the raw /odom values are numerically map/world aligned,
+            # while the TF named odom belongs to the spawn-relative EKF. Keep
+            # the identity-frozen control path but display those coordinates in
+            # their surveyed source frame so RViz does not apply the EKF offset.
+            display_frame = (
+                self.map_path.frame_id if self.route_odom_aligned else None
+            )
+            self._publish_path(self.committed_path, frame_id=display_frame)
             self._set_state(self.FOLLOWING, committed_at)
             rospy.loginfo(
                 "Zigzag path fixed in odom: entry_index=%d remaining=%.3fm",
@@ -1323,6 +1720,7 @@ class ZigzagMissionController:
         self.speed_limit_pub.publish(Float64(data=self.lane_resume_max_velocity))
         self.revoke_requested = False
         self.start_requested = False
+        self.accepted_gate_generation = 0
         self.committed_path = None
         self._set_state(self.WAIT_GATE)
 
@@ -1365,14 +1763,16 @@ class ZigzagMissionController:
         self.path_follower.diagnostics.commanded_angular = 0.0
         self.last_command_time = rospy.Time.now()
 
-    def _publish_path(self):
+    def _publish_path(self, path, stamp=None, frame_id=None):
         message = Path()
-        message.header.stamp = rospy.Time.now()
-        message.header.frame_id = self.committed_path.frame_id
+        message.header.stamp = rospy.Time.now() if stamp is None else stamp
+        message.header.frame_id = (
+            path.frame_id if frame_id is None else frame_id
+        )
         for x, y, yaw in zip(
-            self.committed_path.x,
-            self.committed_path.y,
-            self.committed_path.heading,
+            path.x,
+            path.y,
+            path.heading,
         ):
             pose = PoseStamped()
             pose.header = message.header
@@ -1440,7 +1840,7 @@ class ZigzagMissionController:
         ):
             self._set_state(self.VERIFY_EXIT, now)
 
-    def _path_safety(self, route_from_odom=None):
+    def _path_safety(self, route_from_odom=None, registration_margin=0.0):
         # Bind each candidate to its own immutable inverse transform. A sweep
         # running without the mission lock must never observe a later run's
         # mutable self.route_from_odom value.
@@ -1483,10 +1883,19 @@ class ZigzagMissionController:
                 )
 
             line_boundaries.append(CallbackBoundary(paint_clearance))
+        registration_margin = max(0.0, float(registration_margin))
+        margins = SafetyMargins(
+            line=self.safety_margins.line,
+            obstacle=self.safety_margins.obstacle,
+            localization=(
+                self.safety_margins.localization + registration_margin
+            ),
+            tracking=self.safety_margins.tracking,
+        )
         return PathSafety(
             line_boundaries=tuple(line_boundaries),
             map_boundaries=(CallbackBoundary(reference_map_clearance),),
-            margins=self.safety_margins,
+            margins=margins,
         )
 
     def _motion_safety(
@@ -1512,10 +1921,10 @@ class ZigzagMissionController:
             else max(0.0, float(linear_speed))
         )
         if angular_velocities is None:
-            angular_velocities = (
-                self.last_angular,
+            angular_velocities = self.path_follower.stopping_angular_velocities(
+                tracking,
+                speed,
                 self.odom_angular_velocity,
-                tracking.angular_velocity,
             )
         stopping_horizon = (
             desired_speed * self.prediction_reaction_time
@@ -1708,10 +2117,10 @@ class ZigzagMissionController:
                 "pose": pose,
                 "tracking": tracking,
                 "linear_speed": max(abs(self.last_linear), self.odom_speed),
-                "angular_velocities": (
-                    self.last_angular,
+                "angular_velocities": follower.stopping_angular_velocities(
+                    tracking,
+                    max(abs(self.last_linear), self.odom_speed),
                     self.odom_angular_velocity,
-                    tracking.angular_velocity,
                 ),
                 "odom_stamp": self.odom_stamp,
                 "scan_stamp": self.scan_stamp,

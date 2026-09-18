@@ -122,6 +122,142 @@ def quintic_pose_path(
     return np.column_stack((positions, headings))
 
 
+def curvature_matched_quintic(
+    start_pose,
+    end_pose,
+    start_curvature,
+    end_curvature,
+    start_tangent_length,
+    end_tangent_length,
+    sample_spacing,
+):
+    """Sample a quintic with matched endpoint pose and curvature.
+
+    Tangent lengths are distances from each endpoint to its adjacent Bezier
+    control point.  The next control at either end adds only the normal
+    acceleration required by the requested curvature.  The returned points,
+    headings and curvatures are therefore G2-continuous with matching route
+    samples at both ends.
+    """
+
+    try:
+        start = np.asarray(start_pose, dtype=np.float64)
+        end = np.asarray(end_pose, dtype=np.float64)
+        values = (
+            float(start_curvature),
+            float(end_curvature),
+            float(start_tangent_length),
+            float(end_tangent_length),
+            float(sample_spacing),
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "curvature-matched quintic inputs must be finite numbers"
+        ) from error
+    if (
+        start.shape != (3,)
+        or end.shape != (3,)
+        or not np.all(np.isfinite(start))
+        or not np.all(np.isfinite(end))
+        or not all(math.isfinite(value) for value in values)
+        or values[2] <= 0.0
+        or values[3] <= 0.0
+        or values[4] <= 0.0
+    ):
+        raise ValueError(
+            "poses and curvatures must be finite; lengths and spacing must "
+            "be positive"
+        )
+
+    start_direction = np.asarray(
+        (math.cos(start[2]), math.sin(start[2])), dtype=np.float64
+    )
+    end_direction = np.asarray(
+        (math.cos(end[2]), math.sin(end[2])), dtype=np.float64
+    )
+    start_normal = np.asarray(
+        (-start_direction[1], start_direction[0]), dtype=np.float64
+    )
+    end_normal = np.asarray(
+        (-end_direction[1], end_direction[0]), dtype=np.float64
+    )
+    start_tangent = values[2]
+    end_tangent = values[3]
+    controls = np.empty((6, 2), dtype=np.float64)
+    controls[0] = start[:2]
+    controls[1] = controls[0] + start_tangent * start_direction
+    controls[2] = (
+        2.0 * controls[1]
+        - controls[0]
+        + 1.25 * start_tangent ** 2 * values[0] * start_normal
+    )
+    controls[5] = end[:2]
+    controls[4] = controls[5] - end_tangent * end_direction
+    controls[3] = (
+        2.0 * controls[4]
+        - controls[5]
+        + 1.25 * end_tangent ** 2 * values[1] * end_normal
+    )
+    if not np.all(np.isfinite(controls)):
+        raise ValueError("curvature-matched quintic controls are non-finite")
+
+    control_length = float(
+        np.sum(np.linalg.norm(np.diff(controls, axis=0), axis=1))
+    )
+    sample_count = max(
+        11, int(math.ceil(control_length / values[4])) + 1
+    )
+    parameter = np.linspace(0.0, 1.0, sample_count, dtype=np.float64)
+    complement = 1.0 - parameter
+    points = np.zeros((sample_count, 2), dtype=np.float64)
+    first = np.zeros((sample_count, 2), dtype=np.float64)
+    second = np.zeros((sample_count, 2), dtype=np.float64)
+    first_controls = 5.0 * np.diff(controls, axis=0)
+    second_controls = 20.0 * (
+        controls[2:] - 2.0 * controls[1:-1] + controls[:-2]
+    )
+    for index in range(6):
+        weight = (
+            math.comb(5, index)
+            * complement ** (5 - index)
+            * parameter ** index
+        )
+        points += weight[:, None] * controls[index]
+    for index in range(5):
+        weight = (
+            math.comb(4, index)
+            * complement ** (4 - index)
+            * parameter ** index
+        )
+        first += weight[:, None] * first_controls[index]
+    for index in range(4):
+        weight = (
+            math.comb(3, index)
+            * complement ** (3 - index)
+            * parameter ** index
+        )
+        second += weight[:, None] * second_controls[index]
+
+    derivative_norm = np.linalg.norm(first, axis=1)
+    if (
+        not np.all(np.isfinite(derivative_norm))
+        or np.any(derivative_norm <= 1e-9)
+        or np.any(np.linalg.norm(np.diff(points, axis=0), axis=1) <= 1e-9)
+    ):
+        raise ValueError(
+            "curvature-matched quintic contains a cusp or duplicate point"
+        )
+    headings = np.arctan2(first[:, 1], first[:, 0])
+    curvatures = (
+        first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0]
+    ) / derivative_norm ** 3
+    headings[0] = normalize_angle(start[2])
+    headings[-1] = normalize_angle(end[2])
+    curvatures[0] = values[0]
+    curvatures[-1] = values[1]
+    return points, headings, curvatures
+
+
 def quintic_turn_path(
     start_pose,
     target_yaw,

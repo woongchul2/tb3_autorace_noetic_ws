@@ -22,7 +22,7 @@ if str(NODE_DIR) not in sys.path:
 import tunnel_mission_controller as controller_module
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Float64MultiArray
+from std_msgs.msg import Bool, Float64MultiArray, Header
 from tunnel_mission_controller import TunnelMissionController
 
 
@@ -107,6 +107,7 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.state_started = self.now
         controller.mission_started = None
         controller.zone_gate = False
+        controller.gate_requested = False
         controller.start_requested = False
         controller.revoke_requested = False
         controller.manual_stop = False
@@ -133,6 +134,24 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.odom_history = deque(maxlen=100)
         controller.map_from_odom = None
         controller.frozen_odom_frame = ""
+        controller.arm_generation = 1
+        controller.armed_at = controller_module.rospy.Time.from_sec(9.0)
+        controller.registered_map_from_odom = (0.0, 0.0, 0.0)
+        controller.registered_odom_frame = "odom"
+        controller.registration_source_stamp = self.now
+        controller.registration_samples = 3
+        controller.registration_maximum_gap = 0.20
+        controller.registration_maximum_position_delta = 0.04
+        controller.registration_maximum_heading_delta = math.radians(4.0)
+        controller.registration_candidates = deque(maxlen=3)
+        controller.last_registration_stamp = None
+        controller.ready_published_generation = 1
+        controller.ready_minimum_entry_lead = 0.20
+        controller.ready_maximum_entry_lead = 0.50
+        controller.ready_maximum_heading_error = math.radians(30.0)
+        controller.portal_registration_config = (
+            controller_module.PortalRegistrationConfig()
+        )
 
         controller.costmap = None
         controller.costmap_version = 1
@@ -155,6 +174,8 @@ class TunnelMissionControllerTest(unittest.TestCase):
 
         controller.map_path = None
         controller.odom_path = None
+        controller.entry_staging_station = None
+        controller.exit_connector_station = None
         controller.path_index = 0
         controller.map_path_index = 0
         controller.remaining_distance = math.inf
@@ -185,8 +206,6 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.last_lane_path_confirmation_time = None
         controller.exit_confirmation_started = False
         controller.confirmation_started_at = None
-        controller.exit_alignment_started = False
-        controller.exit_alignment_settling = False
         controller.join_start_x = 0.0
         controller.join_start_y = 0.0
         controller.join_start_yaw = 0.0
@@ -197,18 +216,15 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.cruise_velocity = 0.075
         controller.minimum_velocity = 0.035
         controller.entry_velocity = 0.035
-        controller.exit_velocity = 0.040
+        controller.exit_velocity = 0.075
         controller.entry_portal_velocity = 0.035
-        controller.exit_straight_velocity = 0.040
         controller.join_velocity_cap = 0.06
         controller.acquisition_timeout = 2.0
         controller.entry_alignment_timeout = 12.0
         controller.entry_straight_timeout = 15.0
         controller.planning_timeout = 15.0
         controller.mission_timeout = 120.0
-        controller.exit_alignment_timeout = 3.0
         controller.exit_straight_timeout = 12.0
-        controller.exit_confirmation_timeout = 3.0
         controller.join_timeout = 2.0
         controller.handoff_timeout = 0.30
         controller.map_pose_timeout = 0.40
@@ -250,6 +266,9 @@ class TunnelMissionControllerTest(unittest.TestCase):
             -1.7475895, -0.28, -0.5 * math.pi
         )
         controller.entry_portal_plane_y = -0.105857
+        controller.registration_reference_pose = controller_module.Pose2D(
+            -1.757968, -0.041389, math.radians(-89.4336)
+        )
         controller.entry_clearance_margin = 0.010
         controller.front = 0.067645
         controller.rear = 0.118073
@@ -258,14 +277,13 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.exit_portal_plane_x = 0.003697
         controller.exit_clearance_margin = 0.010
         controller.exit_outside_pose = controller_module.Pose2D(1.0, 0.0, 0.0)
-        controller.exit_staging_remaining_tolerance = 0.025
-        controller.exit_staging_position_tolerance = 0.025
-        controller.exit_staging_heading_tolerance = math.radians(10.0)
-        controller.exit_staging_lateral_tolerance = 0.045
-        controller.exit_alignment_tolerance = math.radians(1.0)
-        controller.exit_alignment_gain = 2.0
-        controller.exit_alignment_max_angular_velocity = 0.30
-        controller.exit_alignment_min_angular_velocity = 0.08
+        controller.exit_connector_tangent_ratio = 0.20
+        controller.exit_connector_minimum_tangent_length = 0.008
+        controller.exit_connector_maximum_tangent_length = 0.055
+        controller.exit_connector_sample_step = 0.010
+        controller.handoff_remaining_distance = 0.035
+        controller.exit_position_tolerance = 0.060
+        controller.exit_heading_tolerance = math.radians(10.0)
         controller.goal = controller_module.Pose2D(0.0, 0.0, 0.0)
         controller.map_frame = "map"
         controller.planner = SimpleNamespace(
@@ -273,6 +291,7 @@ class TunnelMissionControllerTest(unittest.TestCase):
             primitive_is_collision_free=(
                 lambda _grid, _pose, _curvature, _distance: True
             ),
+            minimum_turning_radius=0.18,
             collision_check_step=0.01,
             collision_check_angle=math.radians(3.0),
         )
@@ -298,6 +317,7 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.path_pub = RecordingPublisher()
         controller.costmap_pub = RecordingPublisher()
         controller.diagnostics_pub = RecordingPublisher()
+        controller.ready_pub = RecordingPublisher()
         return controller
 
     @staticmethod
@@ -328,6 +348,50 @@ class TunnelMissionControllerTest(unittest.TestCase):
     def invalid_lane_path():
         return TunnelMissionControllerTest.valid_lane_path(
             line_clearance=-0.001
+        )
+
+    def make_rolling_exit_controller(self):
+        controller = self.make_controller()
+        controller.state = controller.EXITING
+        controller.state_started = self.now
+        controller.mission_started = self.now
+        controller.mission_has_control = True
+        controller.map_from_odom = (0.0, 0.0, 0.0)
+        controller.frozen_odom_frame = "odom"
+        controller.odom_x = 0.5
+        controller.odom_linear_velocity = 0.075
+        path = controller_module.CommonPath(
+            x=np.asarray([0.0, 0.5, 1.0]),
+            y=np.zeros(3),
+            heading=np.zeros(3),
+            curvature=np.zeros(3),
+            speed=np.full(3, 0.075),
+            label="tunnel_hybrid_moving_exit",
+        )
+        controller.map_path = path
+        controller.odom_path = path
+        controller.exit_connector_station = 0.5
+        controller.path_index = 1
+        controller.remaining_distance = 0.5
+        controller.last_linear = 0.075
+        controller.last_command_time = controller_module.rospy.Time.from_sec(
+            self.seconds - controller.control_period
+        )
+        controller.exit_confirmation_started = True
+        controller.confirmation_started_at = self.now
+        controller._input_problem = lambda now, require_scan=True: None
+        controller._planner_grid = lambda: object()
+        controller._command_is_safe = mock.Mock(return_value=True)
+        return controller
+
+    @staticmethod
+    def rolling_exit_tracking():
+        return SimpleNamespace(
+            path_index=1,
+            position_error=0.0,
+            heading_error=0.0,
+            target_speed=0.075,
+            angular_velocity=0.0,
         )
 
     def odometry(self, x, y=0.0, yaw=0.0):
@@ -629,11 +693,31 @@ class TunnelMissionControllerTest(unittest.TestCase):
         return False, "replay timeout", maximum_seconds, trace
 
     def replay_ideal_tunnel_tracking(self, config, grid, planner, start, plan):
-        """Replay one Hybrid A* path with production control settings."""
+        """Replay the mandatory Hybrid A* plus rolling-exit path."""
         control = config["control"]
         exit_values = config["exit"]
-        path = controller_module.tracking_path_from_plan(
+        terminal = controller_module.Pose2D(
+            float(plan.x[-1]),
+            float(plan.y[-1]),
+            float(plan.yaw[-1]),
+        )
+        outside = controller_module.pose_from_degrees(
+            exit_values["outside_pose"], "exit/outside_pose"
+        )
+        connector = controller_module.portal_alignment_path(
+            terminal,
+            outside,
+            exit_values["connector_tangent_ratio"],
+            exit_values["minimum_tangent_length"],
+            exit_values["maximum_tangent_length"],
+            exit_values["connector_sample_step"],
+            control["exit_velocity"],
+            "map",
+            label="tunnel_moving_exit_connector",
+        )
+        path, _ = controller_module.tracking_path_with_exit_connector(
             plan,
+            connector,
             control["cruise_velocity"],
             control["minimum_velocity"],
             control["entry_velocity"],
@@ -643,16 +727,20 @@ class TunnelMissionControllerTest(unittest.TestCase):
             control["linear_acceleration"],
             control["linear_deceleration"],
             control["angular_acceleration"],
+            "map",
         )
+        checker = self.make_controller()
+        checker.planner = planner
+        self.assertTrue(checker._path_is_safe(grid, path, 0))
         replayed, reason, _, _ = self.replay_ideal_common_path(
             config,
             grid,
             planner,
             start,
             path,
-            exit_values["staging_remaining_tolerance"],
-            exit_values["staging_position_tolerance"],
-            math.radians(exit_values["staging_heading_tolerance_deg"]),
+            exit_values["handoff_remaining_distance"],
+            exit_values["position_tolerance"],
+            math.radians(exit_values["heading_tolerance_deg"]),
             config["timeouts"]["mission"],
         )
         return replayed, reason
@@ -1159,6 +1247,201 @@ class TunnelMissionControllerTest(unittest.TestCase):
             if event[0:2] == ("publish", "/cmd_vel")
         )
         self.assert_zero(first_command_event[2])
+
+    def test_registration_generation_source_stamp_and_ready_identity(self):
+        controller = self.make_controller()
+        controller.arm_generation = 0
+        controller.armed_at = None
+        controller.ready_published_generation = 0
+        controller.registered_map_from_odom = None
+        controller.registered_odom_frame = ""
+        controller.registration_source_stamp = None
+        controller.registration_candidates.clear()
+
+        arm = Header()
+        arm.seq = 7
+        arm.stamp = controller_module.rospy.Time.from_sec(9.50)
+        arm.frame_id = "tunnel"
+        controller.arm_callback(arm)
+
+        stale = controller_module.rospy.Time.from_sec(9.49)
+        self.assertFalse(
+            controller._submit_registration_candidate(
+                (0.0, 0.0, 0.0), "odom", stale
+            )
+        )
+        for stamp_value in (9.70, 9.80, 9.90):
+            controller._submit_registration_candidate(
+                (0.0, 0.0, 0.0),
+                "odom",
+                controller_module.rospy.Time.from_sec(stamp_value),
+            )
+        self.assertEqual(controller.registered_map_from_odom, (0.0, 0.0, 0.0))
+        self.assertEqual(controller.ready_pub.messages, [])
+
+        ready_stamp = controller_module.rospy.Time.from_sec(10.0)
+        lead = 0.30
+        odom_y = controller.entry_portal_plane_y + lead
+        controller.odom_history.append(
+            (
+                ready_stamp,
+                controller.entry_staging_pose.x,
+                odom_y,
+                controller.entry_staging_pose.yaw,
+                "odom",
+            )
+        )
+        controller.costmap = object()
+        controller._planner_grid = lambda: object()
+        controller._path_is_safe = lambda _grid, _path, _index: True
+
+        self.assertTrue(controller._try_publish_ready(ready_stamp))
+        ready = controller.ready_pub.messages[-1]
+        self.assertEqual(ready.seq, 7)
+        self.assertEqual(ready.stamp, ready_stamp)
+        self.assertEqual(ready.frame_id, "tunnel")
+
+        next_arm = Header()
+        next_arm.seq = 8
+        next_arm.stamp = ready_stamp
+        next_arm.frame_id = "tunnel"
+        controller.costmap = None
+        controller.arm_callback(next_arm)
+        self.assertIsNone(controller.registered_map_from_odom)
+        self.assertFalse(
+            controller._submit_registration_candidate(
+                (0.0, 0.0, 0.0), "odom", ready_stamp
+            )
+        )
+        wrong_identity = Header()
+        wrong_identity.seq = 9
+        wrong_identity.stamp = ready_stamp
+        wrong_identity.frame_id = "level_crossing"
+        controller.arm_callback(wrong_identity)
+        self.assertEqual(controller.arm_generation, 8)
+        empty_identity = Header()
+        empty_identity.seq = 9
+        empty_identity.stamp = ready_stamp
+        controller.arm_callback(empty_identity)
+        self.assertEqual(controller.arm_generation, 8)
+
+        inactive = Header()
+        inactive.seq = 0
+        inactive.stamp = ready_stamp
+        inactive.frame_id = "tunnel"
+        controller.arm_callback(inactive)
+        self.assertEqual(controller.arm_generation, 0)
+        self.assertIsNone(controller.armed_at)
+
+    def test_ready_before_gate_does_not_stop_or_take_lane_control(self):
+        controller = self.make_controller()
+        controller.arm_generation = 3
+        controller.armed_at = controller_module.rospy.Time.from_sec(9.0)
+        controller.ready_published_generation = 0
+        controller.registered_map_from_odom = (0.0, 0.0, 0.0)
+        controller.registered_odom_frame = "odom"
+        controller.registration_source_stamp = (
+            controller_module.rospy.Time.from_sec(9.8)
+        )
+        ready_stamp = self.now
+        lead = 0.30
+        controller.odom_history.append(
+            (
+                ready_stamp,
+                controller.entry_staging_pose.x,
+                controller.entry_portal_plane_y + lead,
+                controller.entry_staging_pose.yaw,
+                "odom",
+            )
+        )
+        controller.costmap = object()
+        controller._planner_grid = lambda: object()
+        controller._path_is_safe = lambda _grid, _path, _index: True
+
+        controller.scan_updates = controller.minimum_initial_scans - 1
+        self.assertFalse(controller._try_publish_ready(ready_stamp))
+        self.assertEqual(controller.ready_pub.messages, [])
+        controller.scan_updates = controller.minimum_initial_scans
+        self.assertTrue(controller._try_publish_ready(ready_stamp))
+
+        self.assertEqual(controller.state, controller.WAIT_GATE)
+        self.assertFalse(controller.zone_gate)
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(controller.lane_service.calls, [])
+        self.assertEqual(controller.cmd_pub.messages, [])
+        self.assertEqual(controller.speed_limit_pub.messages, [])
+
+    def test_ready_lead_is_invariant_to_longitudinal_connector_shift(self):
+        template_portal = (
+            -1.7475895,
+            -0.105857,
+            -0.5 * math.pi,
+        )
+        local_robot = (
+            template_portal[0],
+            template_portal[1] + 0.30,
+            template_portal[2],
+        )
+        ready_positions = []
+        for shift in (0.0, -0.73):
+            controller = self.make_controller()
+            actual_portal = (4.0, 2.0 + shift, -0.5 * math.pi)
+            transform = controller_module.map_from_odom_transform(
+                template_portal, actual_portal
+            )
+            # The robot is the same 0.30 m upstream of the portal after the
+            # preceding straight connector is shortened or lengthened.
+            actual_robot = (
+                actual_portal[0],
+                actual_portal[1] + 0.30,
+                actual_portal[2],
+            )
+            controller.arm_generation = 9
+            controller.ready_published_generation = 0
+            controller.registered_map_from_odom = transform
+            controller.registered_odom_frame = "odom"
+            controller.registration_source_stamp = (
+                controller_module.rospy.Time.from_sec(9.8)
+            )
+            controller.odom_history.append(
+                (self.now,) + actual_robot + ("odom",)
+            )
+            controller.costmap = object()
+            controller._planner_grid = lambda: object()
+            controller._path_is_safe = lambda _grid, _path, _index: True
+
+            self.assertTrue(controller._try_publish_ready(self.now))
+            registered_robot = controller_module.odom_pose_to_map(
+                actual_robot, transform
+            )
+            ready_positions.append(registered_robot)
+            self.assertEqual(controller.ready_pub.messages[-1].seq, 9)
+
+        for actual, expected in zip(ready_positions, (local_robot, local_robot)):
+            for component, target in zip(actual, expected):
+                self.assertAlmostEqual(component, target, places=9)
+
+    def test_gate_preserves_prepared_scans_without_registration_dwell(self):
+        controller = self.make_controller()
+        controller.costmap = object()
+        controller.scan_updates = 6
+        prepared_stamp = controller_module.rospy.Time.from_sec(9.95)
+        controller.scan_stamp = prepared_stamp
+        controller.scan_received = self.now
+        controller.last_processed_scan_stamp = prepared_stamp
+
+        controller.gate_callback(Bool(data=True))
+        controller._start_run(self.now)
+
+        self.assertEqual(controller.state, controller.ACQUIRING)
+        self.assertEqual(controller.scan_updates, 6)
+        self.assertEqual(controller.scan_stamp, prepared_stamp)
+        self.assertEqual(controller.last_processed_scan_stamp, prepared_stamp)
+        self.assertEqual(
+            controller.minimum_planning_scan_updates,
+            controller.minimum_initial_scans,
+        )
+        self.assertEqual(controller.cmd_pub.messages, [])
 
     def test_entry_clear_requires_fresh_interior_scan_threshold(self):
         controller = self.make_controller()
@@ -1800,30 +2083,41 @@ class TunnelMissionControllerTest(unittest.TestCase):
         self.assertAlmostEqual(swept[0][1], 5.0)
         self.assertAlmostEqual(swept[0][2], 0.01)
 
-    def test_following_endpoint_stops_inside_and_enters_exit_alignment(self):
+    def test_moving_exit_seam_preserves_cruise_command_without_zero(self):
         controller = self.make_controller()
         controller.state = controller.FOLLOWING
         controller.state_started = self.now
         controller.mission_started = self.now
         controller.mission_has_control = True
-        controller.map_path = object()
-        controller.odom_path = SimpleNamespace(
-            length=0.0,
-            station=np.asarray([0.0]),
+        controller.map_from_odom = (0.0, 0.0, 0.0)
+        controller.frozen_odom_frame = "odom"
+        controller.odom_x = 0.5
+        controller.odom_linear_velocity = 0.075
+        controller.goal = controller_module.Pose2D(0.5, 0.0, 0.0)
+        path = controller_module.CommonPath(
+            x=np.asarray([0.0, 0.5, 1.0]),
+            y=np.zeros(3),
+            heading=np.zeros(3),
+            curvature=np.zeros(3),
+            speed=np.full(3, 0.075),
+            label="tunnel_hybrid_moving_exit",
+        )
+        controller.map_path = path
+        controller.odom_path = path
+        controller.exit_connector_station = 0.5
+        controller.remaining_distance = 0.5
+        controller.last_linear = 0.075
+        controller.last_command_time = controller_module.rospy.Time.from_sec(
+            self.seconds - controller.control_period
         )
         controller._input_problem = lambda now, require_scan=True: None
         controller._planner_grid = lambda: object()
-        controller._tracking_endpoint_ready = lambda: True
-        controller._exit_clearance_ready = mock.Mock(
-            side_effect=AssertionError(
-                "exit clearance is checked only after the straight exit"
-            )
-        )
+        controller._command_is_safe = mock.Mock(return_value=True)
         tracking = SimpleNamespace(
-            path_index=0,
+            path_index=1,
             position_error=0.0,
             heading_error=0.0,
-            target_speed=0.04,
+            target_speed=0.075,
             angular_velocity=0.0,
         )
 
@@ -1832,11 +2126,111 @@ class TunnelMissionControllerTest(unittest.TestCase):
         ):
             controller.control_callback(None)
 
-        self.assertEqual(controller.state, controller.ALIGNING_EXIT)
-        controller._exit_clearance_ready.assert_not_called()
+            self.assertEqual(controller.state, controller.EXITING)
+            self.assertIs(controller.map_path, path)
+            self.assertIs(controller.odom_path, path)
+            self.assertTrue(controller.exit_confirmation_started)
+            confirmation_started_at = controller.confirmation_started_at
+            self.assertEqual(confirmation_started_at, self.now)
+            self.assertEqual(len(controller.cmd_pub.messages), 1)
+            self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
+            self.assertAlmostEqual(controller.last_linear, 0.075)
+
+            controller._exit_pose_ready = lambda: True
+            controller._exit_clearance_ready = lambda: True
+            self.advance()
+            controller.lane_path_diagnostics_callback(self.valid_lane_path())
+            self.advance()
+            controller.lane_path_diagnostics_callback(self.valid_lane_path())
+            controller.control_callback(None)
+
+        self.assertEqual(controller.state, controller.JOINING_LANE)
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(controller.lane_service.calls, [True])
+        self.assertTrue(
+            all(
+                command.linear.x > 0.0
+                for command in controller.cmd_pub.messages
+            )
+        )
+        self.assertEqual(
+            [message.data for message in controller.state_pub.messages],
+            [controller.EXITING, controller.JOINING_LANE],
+        )
+
+    def test_moving_exit_builder_requires_safe_guarded_connector(self):
+        controller = self.make_controller()
+        controller.goal = controller_module.Pose2D(0.0, 0.0, 0.0)
+        controller.exit_outside_pose = controller_module.Pose2D(
+            1.0, 0.0, 0.0
+        )
+
+        def plan():
+            return SimpleNamespace(
+                x=np.asarray([-0.5, 0.0]),
+                y=np.zeros(2),
+                yaw=np.zeros(2),
+                curvature=np.zeros(2),
+            )
+
+        path, station, reason = controller._build_moving_exit_path(
+            plan(), object()
+        )
+        self.assertEqual(reason, "")
+        self.assertEqual(path.label, "tunnel_hybrid_moving_exit")
+        self.assertAlmostEqual(station, 0.5)
+        self.assertAlmostEqual(path.speed[-1], 0.075)
+
+        controller.planner.primitive_is_collision_free = (
+            lambda _grid, _pose, _curvature, _distance: False
+        )
+        rejected, rejected_station, reason = (
+            controller._build_moving_exit_path(plan(), object())
+        )
+        self.assertIsNone(rejected)
+        self.assertIsNone(rejected_station)
+        self.assertIn("not collision-free", reason)
+
+    def test_rejected_moving_exit_rejects_the_whole_plan(self):
+        controller = self.make_controller()
+        controller.state = controller.PLANNING
+        controller.state_started = self.now
+        controller.mission_started = self.now
+        controller.zone_gate = True
+        controller.mission_has_control = True
+        controller.map_from_odom = (0.0, 0.0, 0.0)
+        controller.frozen_odom_frame = "odom"
+        controller.goal = controller_module.Pose2D(1.0, 0.0, 0.0)
+        controller.exit_outside_pose = controller_module.Pose2D(
+            2.0, 0.0, 0.0
+        )
+        rejected_plan = SimpleNamespace(
+            x=np.asarray([0.0, 1.0]),
+            y=np.zeros(2),
+            yaw=np.zeros(2),
+            curvature=np.zeros(2),
+            expanded_nodes=2,
+        )
+        controller.planner.plan = lambda *_args, **_kwargs: rejected_plan
+        controller.planner.primitive_is_collision_free = (
+            lambda _grid, pose, _curvature, _distance: pose.x < 1.0 - 1e-9
+        )
+        grid = object()
+        controller._planner_grid = lambda: grid
+
+        controller._plan_worker(
+            controller.planning_generation,
+            grid,
+            controller_module.Pose2D(0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            controller.costmap_version,
+            1,
+        )
+
+        self.assertEqual(controller.state, controller.PLANNING)
         self.assertIsNone(controller.map_path)
         self.assertIsNone(controller.odom_path)
-        self.assert_zero(controller.cmd_pub.messages[-1])
+        self.assertIsNone(controller.exit_connector_station)
 
     def test_planner_worker_does_not_block_control_callback(self):
         controller = self.make_controller()
@@ -1929,6 +2323,9 @@ class TunnelMissionControllerTest(unittest.TestCase):
             controller.odom_y = 0.0
             controller.odom_yaw = 0.0
             controller.goal = controller_module.Pose2D(1.0, 0.0, 0.0)
+            controller.exit_outside_pose = controller_module.Pose2D(
+                1.5, 0.0, 0.0
+            )
             controller.costmap_version = 2
             planner = controller_module.HybridAStarPlanner(
                 footprint=controller_module.RectangularFootprint(
@@ -1974,7 +2371,7 @@ class TunnelMissionControllerTest(unittest.TestCase):
             far_soft.soft_replan_lookahead_distance,
         )
 
-    def test_production_one_point_inner_goal_enters_exit_alignment(self):
+    def test_production_one_point_inner_goal_continues_into_moving_exit(self):
         config, _, grid, planner, goal = self.production_grid_and_planner()
 
         for start_x in (goal.x - 0.02, goal.x - 0.03):
@@ -2007,14 +2404,20 @@ class TunnelMissionControllerTest(unittest.TestCase):
                 controller.linear_deceleration = control["linear_deceleration"]
                 controller.angular_acceleration = control["angular_acceleration"]
                 exit_values = config["exit"]
-                controller.exit_staging_remaining_tolerance = exit_values[
-                    "staging_remaining_tolerance"
+                controller.exit_connector_tangent_ratio = exit_values[
+                    "connector_tangent_ratio"
                 ]
-                controller.exit_staging_position_tolerance = exit_values[
-                    "staging_position_tolerance"
+                controller.exit_connector_minimum_tangent_length = exit_values[
+                    "minimum_tangent_length"
                 ]
-                controller.exit_staging_heading_tolerance = math.radians(
-                    exit_values["staging_heading_tolerance_deg"]
+                controller.exit_connector_maximum_tangent_length = exit_values[
+                    "maximum_tangent_length"
+                ]
+                controller.exit_connector_sample_step = exit_values[
+                    "connector_sample_step"
+                ]
+                controller.exit_outside_pose = controller_module.pose_from_degrees(
+                    exit_values["outside_pose"], "exit/outside_pose"
                 )
                 controller._input_problem = lambda now, require_scan=True: None
                 controller._planner_grid = lambda: grid
@@ -2038,14 +2441,26 @@ class TunnelMissionControllerTest(unittest.TestCase):
                     1,
                 )
                 self.assertEqual(controller.state, controller.FOLLOWING)
-                self.assertEqual(controller.map_path.x.size, 1)
+                self.assertGreater(controller.map_path.x.size, 1)
+                self.assertEqual(
+                    controller.map_path.label,
+                    "tunnel_hybrid_moving_exit",
+                )
+                self.assertAlmostEqual(controller.exit_connector_station, 0.0)
 
+                self.advance()
                 controller.control_callback(None)
 
-                self.assertEqual(controller.state, controller.ALIGNING_EXIT)
-                self.assertIsNone(controller.map_path)
-                self.assertIsNone(controller.odom_path)
-                self.assert_zero(controller.cmd_pub.messages[-1])
+                self.assertEqual(controller.state, controller.EXITING)
+                self.assertTrue(controller.exit_confirmation_started)
+                self.assertIsNotNone(controller.map_path)
+                self.assertIsNotNone(controller.odom_path)
+                self.assertTrue(
+                    all(
+                        command.linear.x > 0.0
+                        for command in controller.cmd_pub.messages
+                    )
+                )
 
     def test_production_static_exclusion_rejects_recorded_wall_ghost_only(self):
         config, costmap, _, _, _ = self.production_grid_and_planner()
@@ -2175,84 +2590,56 @@ class TunnelMissionControllerTest(unittest.TestCase):
         )
         self.assertEqual(controller.last_motion_safety_failure, "")
 
-    def test_exit_requires_frozen_clearance_and_safe_lane_path_frames(self):
-        controller = self.make_controller()
-        controller.state = controller.VERIFY_EXIT
-        controller.state_started = self.now
-        controller.mission_started = self.now
-        controller.mission_has_control = True
-        controller.exit_confirmation_started = True
-        controller.confirmation_started_at = self.now
-        controller._input_problem = lambda now, require_scan=True: None
-        controller._exit_pose_ready = lambda: True
-        frozen_clearance = {"ready": False}
-        controller._exit_clearance_ready = lambda: frozen_clearance["ready"]
+    def test_exit_keeps_moving_until_clearance_and_lane_frames_are_ready(self):
+        controller = self.make_rolling_exit_controller()
+        exit_pose_ready = {"ready": False}
+        exit_clearance_ready = {"ready": False}
+        controller._exit_pose_ready = lambda: exit_pose_ready["ready"]
+        controller._exit_clearance_ready = lambda: exit_clearance_ready["ready"]
+        tracking = self.rolling_exit_tracking()
 
-        self.advance()
-        controller.lane_path_diagnostics_callback(self.valid_lane_path())
-        self.advance()
-        controller.lane_path_diagnostics_callback(self.valid_lane_path())
-        controller.control_callback(None)
+        with mock.patch.object(
+            controller_module, "calculate_tracking", return_value=tracking
+        ):
+            self.advance()
+            controller.lane_path_diagnostics_callback(self.valid_lane_path())
+            self.advance()
+            controller.lane_path_diagnostics_callback(self.valid_lane_path())
+            controller.control_callback(None)
 
-        self.assertEqual(controller.state, controller.VERIFY_EXIT)
-        self.assertEqual(controller.lane_service.calls, [])
+            self.assertEqual(controller.state, controller.EXITING)
+            self.assertEqual(controller.lane_service.calls, [])
+            self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
 
-        frozen_clearance["ready"] = True
-        self.advance()
-        controller.lane_path_diagnostics_callback(self.invalid_lane_path())
-        self.advance()
-        controller.lane_path_diagnostics_callback(self.valid_lane_path())
-        controller.control_callback(None)
+            exit_clearance_ready["ready"] = True
+            self.advance()
+            controller.lane_path_diagnostics_callback(self.invalid_lane_path())
+            self.advance()
+            controller.lane_path_diagnostics_callback(self.valid_lane_path())
+            controller.control_callback(None)
 
-        self.assertEqual(controller.state, controller.VERIFY_EXIT)
-        self.assertEqual(controller.lane_service.calls, [])
+            self.assertEqual(controller.state, controller.EXITING)
+            self.assertEqual(controller.lane_service.calls, [])
+            self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
 
-        self.advance()
-        controller.lane_path_diagnostics_callback(self.valid_lane_path())
-        controller.control_callback(None)
+            self.advance()
+            controller.lane_path_diagnostics_callback(self.valid_lane_path())
+            exit_pose_ready["ready"] = True
+            controller.control_callback(None)
 
         self.assertEqual(controller.state, controller.JOINING_LANE)
         self.assertEqual(controller.lane_service.calls, [True])
         self.assertFalse(controller.mission_has_control)
+        self.assertTrue(
+            all(
+                command.linear.x > 0.0
+                for command in controller.cmd_pub.messages
+            )
+        )
 
-    def test_exit_waits_for_safe_rolling_lane_path_before_handoff(self):
-        controller = self.make_controller()
-        controller.state = controller.VERIFY_EXIT
-        controller.state_started = self.now
-        controller.mission_started = self.now
-        controller.mission_has_control = True
-        controller.exit_confirmation_started = True
-        controller.confirmation_started_at = self.now
-        controller._input_problem = lambda now, require_scan=True: None
-        controller._exit_pose_ready = lambda: True
-        controller._exit_clearance_ready = lambda: True
-        controller.lane_path_stamp = None
-        controller.lane_path_valid = False
-
-        self.advance()
-        controller.lane_path_diagnostics_callback(self.invalid_lane_path())
-        self.advance()
-        controller.lane_path_diagnostics_callback(self.invalid_lane_path())
-        controller.control_callback(None)
-        self.assertEqual(controller.state, controller.VERIFY_EXIT)
-
-        self.advance()
-        controller.lane_path_diagnostics_callback(self.valid_lane_path())
-        self.advance()
-        controller.lane_path_diagnostics_callback(self.valid_lane_path())
-        controller.control_callback(None)
-        self.assertEqual(controller.state, controller.JOINING_LANE)
-
-    def test_exit_rejects_stale_rolling_lane_path(self):
-        controller = self.make_controller()
-        controller.state = controller.VERIFY_EXIT
-        controller.state_started = self.now
-        controller.mission_started = self.now
-        controller.mission_has_control = True
-        controller.exit_confirmation_started = True
-        controller.confirmation_started_at = self.now
-        controller._input_problem = lambda now, require_scan=True: None
-        controller._exit_pose_ready = lambda: True
+    def test_exit_rejects_stale_lane_path_without_a_planned_stop(self):
+        controller = self.make_rolling_exit_controller()
+        controller._exit_pose_ready = lambda: False
         controller._exit_clearance_ready = lambda: True
 
         self.advance()
@@ -2260,39 +2647,36 @@ class TunnelMissionControllerTest(unittest.TestCase):
         self.advance()
         controller.lane_path_diagnostics_callback(self.valid_lane_path())
         self.advance(controller.lane_path_timeout + 0.01)
-        controller.control_callback(None)
+        with mock.patch.object(
+            controller_module,
+            "calculate_tracking",
+            return_value=self.rolling_exit_tracking(),
+        ):
+            controller.control_callback(None)
 
-        self.assertEqual(controller.state, controller.VERIFY_EXIT)
+        self.assertEqual(controller.state, controller.EXITING)
         self.assertEqual(controller.lane_service.calls, [])
+        self.assertEqual(len(controller.cmd_pub.messages), 1)
+        self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
 
-    def test_exit_handoff_uses_safe_lane_path_after_portal_is_clear(self):
-        controller = self.make_controller()
-        controller.state = controller.VERIFY_EXIT
-        controller.state_started = self.now
-        controller.mission_started = self.now
-        controller.mission_has_control = True
-        controller.exit_confirmation_started = True
-        controller.confirmation_started_at = self.now
-        controller.odom_yaw = math.radians(1.24)
-        self.assertGreater(
-            abs(controller.odom_yaw), controller.exit_alignment_tolerance
-        )
-        controller._input_problem = lambda now, require_scan=True: None
+    def test_exit_endpoint_without_safe_handoff_fails_closed(self):
+        controller = self.make_rolling_exit_controller()
         controller._exit_pose_ready = lambda: True
         controller._exit_clearance_ready = lambda: True
+        controller.lane_path_valid = False
 
-        self.advance()
-        controller.lane_path_diagnostics_callback(
-            self.valid_lane_path(line_clearance=0.020)
-        )
-        self.advance()
-        controller.lane_path_diagnostics_callback(
-            self.valid_lane_path(line_clearance=0.020)
-        )
-        controller.control_callback(None)
+        with mock.patch.object(
+            controller_module,
+            "calculate_tracking",
+            return_value=self.rolling_exit_tracking(),
+        ):
+            controller.control_callback(None)
 
-        self.assertEqual(controller.state, controller.JOINING_LANE)
-        self.assertEqual(controller.lane_service.calls, [True])
+        self.assertEqual(controller.state, controller.FAILED)
+        self.assertTrue(controller.mission_has_control)
+        self.assertEqual(controller.lane_service.calls, [])
+        self.assertEqual(len(controller.cmd_pub.messages), 1)
+        self.assert_zero(controller.cmd_pub.messages[-1])
 
     def test_production_exit_uses_only_shared_lane_path_diagnostics(self):
         with (PACKAGE_DIR / "config" / "tunnel_mission_gazebo.yaml").open(
@@ -2310,160 +2694,34 @@ class TunnelMissionControllerTest(unittest.TestCase):
         self.assertNotIn("boundary_timeout", config["exit"])
         self.assertNotIn("lane_center_timeout", config["exit"])
 
-    def test_exit_aligns_inside_then_builds_a_straight_exit_path(self):
-        controller = self.make_controller()
-        controller.state = controller.ALIGNING_EXIT
-        controller.state_started = self.now
-        controller.mission_started = self.now
-        controller.mission_has_control = True
-        controller.map_from_odom = (0.0, 0.0, 0.0)
-        controller.frozen_odom_frame = "odom"
-        controller.odom_yaw = math.radians(7.5)
-        controller._input_problem = lambda now, require_scan=True: None
-        controller._planner_grid = lambda: object()
-        checked_commands = []
-        controller._command_is_safe = (
-            lambda _grid, linear, angular: checked_commands.append(
-                (linear, angular)
-            )
-            or True
+    def test_production_moving_exit_retains_cruise_speed(self):
+        with (PACKAGE_DIR / "config" / "tunnel_mission_gazebo.yaml").open(
+            encoding="utf-8"
+        ) as stream:
+            config = yaml.safe_load(stream)["tunnel"]
+
+        self.assertAlmostEqual(
+            config["control"]["exit_velocity"],
+            config["control"]["cruise_velocity"],
         )
-
-        controller.control_callback(None)
-
-        self.assertEqual(controller.state, controller.ALIGNING_EXIT)
-        self.assertEqual(controller.lane_service.calls, [])
-        self.assertEqual(len(checked_commands), 1)
-        self.assertEqual(checked_commands[0][0], 0.0)
-        self.assertLess(checked_commands[0][1], 0.0)
-        self.assertEqual(controller.cmd_pub.messages[-1].linear.x, 0.0)
-        self.assertLess(controller.cmd_pub.messages[-1].angular.z, 0.0)
-
-        controller.odom_yaw = math.radians(0.5)
-        self.advance()
-        controller.control_callback(None)
-
-        self.assertEqual(controller.state, controller.EXITING)
-        self.assertEqual(controller.map_path.label, "tunnel_straight_exit")
-        self.assertAlmostEqual(controller.map_path.x[0], 0.0)
-        self.assertAlmostEqual(controller.map_path.x[-1], 1.0)
-        self.assertTrue(np.allclose(controller.map_path.y, 0.0))
-        self.assertTrue(np.allclose(controller.map_path.heading, 0.0))
-        self.assertEqual(controller.lane_service.calls, [])
-
-    def test_exit_alignment_waits_for_measured_stop_before_rotating(self):
-        controller = self.make_controller()
-        controller.state = controller.ALIGNING_EXIT
-        controller.state_started = self.now
-        controller.mission_started = self.now
-        controller.mission_has_control = True
-        controller.map_from_odom = (0.0, 0.0, 0.0)
-        controller.frozen_odom_frame = "odom"
-        controller.odom_yaw = math.radians(7.5)
-        controller.odom_linear_velocity = 0.04
-        controller._input_problem = lambda now, require_scan=True: None
-        controller._planner_grid = lambda: object()
-        controller._command_is_safe = mock.Mock(return_value=True)
-
-        controller.control_callback(None)
-
-        self.assertEqual(controller.state, controller.ALIGNING_EXIT)
-        self.assertFalse(controller.exit_alignment_started)
-        controller._command_is_safe.assert_not_called()
-        self.assert_zero(controller.cmd_pub.messages[-1])
-
-        controller.odom_linear_velocity = 0.0
-        self.advance()
-        controller.control_callback(None)
-
-        self.assertTrue(controller.exit_alignment_started)
-        controller._command_is_safe.assert_called_once()
-        self.assertLess(controller.cmd_pub.messages[-1].angular.z, 0.0)
-
-    def test_exit_alignment_holds_zero_through_heading_overshoot(self):
-        controller = self.make_controller()
-        controller.state = controller.ALIGNING_EXIT
-        controller.state_started = self.now
-        controller.mission_started = self.now
-        controller.mission_has_control = True
-        controller.map_from_odom = (0.0, 0.0, 0.0)
-        controller.frozen_odom_frame = "odom"
-        controller.exit_alignment_started = True
-        controller.odom_yaw = math.radians(0.5)
-        controller.odom_angular_velocity = 0.08
-        controller._input_problem = lambda now, require_scan=True: None
-        controller._planner_grid = lambda: object()
-        controller._command_is_safe = mock.Mock(return_value=True)
-
-        controller.control_callback(None)
-
-        self.assertTrue(controller.exit_alignment_settling)
-        controller._command_is_safe.assert_not_called()
-        self.assert_zero(controller.cmd_pub.messages[-1])
-
-        controller.odom_yaw = math.radians(-1.2)
-        controller.odom_angular_velocity = 0.06
-        self.advance()
-        controller.control_callback(None)
-
-        self.assertTrue(controller.exit_alignment_settling)
-        controller._command_is_safe.assert_not_called()
-        self.assert_zero(controller.cmd_pub.messages[-1])
-
-        controller.odom_angular_velocity = 0.0
-        self.advance()
-        controller.control_callback(None)
-
-        self.assertFalse(controller.exit_alignment_settling)
-        controller._command_is_safe.assert_called_once()
-        self.assertGreater(controller.cmd_pub.messages[-1].angular.z, 0.0)
-
-    def test_unsafe_exit_heading_alignment_fails_closed(self):
-        controller = self.make_controller()
-        controller.state = controller.ALIGNING_EXIT
-        controller.state_started = self.now
-        controller.mission_started = self.now
-        controller.mission_has_control = True
-        controller.map_from_odom = (0.0, 0.0, 0.0)
-        controller.frozen_odom_frame = "odom"
-        controller.odom_yaw = math.radians(7.5)
-        controller._input_problem = lambda now, require_scan=True: None
-        controller._planner_grid = lambda: object()
-        controller._command_is_safe = (
-            lambda _grid, _linear, _angular: False
+        legacy_stop_keys = (
+            "straight_velocity",
+            "fallback_velocity",
+            "moving_transition_enabled",
+            "moving_heading_tolerance_deg",
+            "moving_lateral_tolerance",
+            "moving_longitudinal_tolerance",
+            "staging_remaining_tolerance",
+            "staging_position_tolerance",
+            "staging_heading_tolerance_deg",
+            "staging_lateral_tolerance",
+            "alignment_tolerance_deg",
+            "alignment_gain",
+            "alignment_max_angular_velocity",
+            "alignment_min_angular_velocity",
         )
-
-        controller.control_callback(None)
-
-        self.assertEqual(controller.state, controller.FAILED)
-        self.assertTrue(controller.mission_has_control)
-        self.assert_zero(controller.cmd_pub.messages[-1])
-
-    def test_unsafe_surveyed_exit_straight_fails_closed(self):
-        controller = self.make_controller()
-        controller.state = controller.ALIGNING_EXIT
-        controller.state_started = self.now
-        controller.mission_started = self.now
-        controller.mission_has_control = True
-        controller.map_from_odom = (0.0, 0.0, 0.0)
-        controller.frozen_odom_frame = "odom"
-        controller.goal = controller_module.Pose2D(0.0, 0.0, 0.0)
-        controller.exit_outside_pose = controller_module.Pose2D(
-            1.0, 0.0, 0.0
-        )
-        controller._input_problem = lambda now, require_scan=True: None
-        controller._planner_grid = lambda: object()
-        controller.planner.primitive_is_collision_free = (
-            lambda _grid, _pose, _curvature, _distance: False
-        )
-
-        controller.control_callback(None)
-
-        self.assertEqual(controller.state, controller.FAILED)
-        self.assertTrue(controller.mission_has_control)
-        self.assertIsNone(controller.map_path)
-        self.assertIsNone(controller.odom_path)
-        self.assert_zero(controller.cmd_pub.messages[-1])
+        for key in legacy_stop_keys:
+            self.assertNotIn(key, config["exit"])
 
     def test_release_completes_only_after_fresh_odom_progress_and_lane(self):
         controller = self.make_controller()

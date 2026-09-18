@@ -24,6 +24,7 @@ from custom_autorace_bringup.path_following import (
     StraightCorridorBoundary,
     SweptFootprintValidator,
     TrackingConfig,
+    TrackingResult,
     build_speed_profile,
     freeze_path_in_odom,
     goal_status,
@@ -314,6 +315,7 @@ class CommonPathTest(unittest.TestCase):
             target_speed=0.1,
             initial_line_overlap_allowance=0.03,
             line_egress_distance=0.15,
+            localization_uncertainty=(0.002, 0.004, 0.006),
         )
         self.assertAlmostEqual(path.line_overlap_allowance[0], 0.03)
         self.assertAlmostEqual(path.line_overlap_allowance[1], 0.01)
@@ -327,6 +329,11 @@ class CommonPathTest(unittest.TestCase):
         np.testing.assert_allclose(
             aligned.line_overlap_allowance,
             path.line_overlap_allowance,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            aligned.localization_uncertainty,
+            path.localization_uncertainty,
             atol=0.0,
         )
 
@@ -824,6 +831,36 @@ class CommonPathTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "entry velocity"):
             SpeedProfile(**arguments)
 
+    def test_angular_acceleration_keeps_a_feasible_moving_floor(self):
+        station = np.linspace(0.0, 0.36, 100)
+        curvature = np.linspace(0.0, 4.0, 100)
+        profile = SpeedProfile(
+            cruise_velocity=0.12,
+            minimum_velocity=0.04,
+            entry_velocity=0.04,
+            exit_velocity=0.04,
+            maximum_angular_velocity=0.90,
+            maximum_lateral_acceleration=0.08,
+            linear_acceleration=0.25,
+            linear_deceleration=0.50,
+            angular_acceleration=1.50,
+        )
+
+        speed = build_speed_profile(station, curvature, profile)
+        segment = np.diff(station)
+        duration = 2.0 * segment / (speed[:-1] + speed[1:])
+        angular_acceleration = np.abs(
+            np.diff(speed * curvature)
+        ) / duration
+
+        self.assertGreaterEqual(
+            float(np.min(speed)), profile.minimum_velocity - 1e-12
+        )
+        self.assertLessEqual(
+            float(np.max(angular_acceleration)),
+            profile.angular_acceleration * (1.0 + 1e-9),
+        )
+
     def test_one_point_profile_still_obeys_curvature_safety_cap(self):
         profile = SpeedProfile(
             cruise_velocity=0.4,
@@ -903,6 +940,42 @@ class CommonPathTest(unittest.TestCase):
             command.linear_velocity,
             places=12,
         )
+
+    def test_stopping_yaw_rate_uses_current_linear_speed(self):
+        follower = PathFollower(self.tracking_config())
+        follower.reset(self.straight_path(), Pose2D(0.0, 0.0, 0.0))
+        tracking = follower.calculate_tracking(Pose2D(0.0, 0.0, 0.0))
+        tracking = TrackingResult(
+            tracking.path_index,
+            tracking.target_index,
+            tracking.position_error,
+            tracking.heading_error,
+            tracking.cross_track_error,
+            0.20,
+            tracking.direction,
+            tracking.feedforward_curvature,
+            tracking.feedback_curvature,
+            tracking.curvature_command,
+            tracking.feedforward_angular_velocity,
+            tracking.heading_feedback,
+            tracking.lateral_feedback,
+            0.60,
+            tracking.station,
+            tracking.progress,
+            tracking.steering_lookahead_distance,
+            tracking.speed_preview_distance,
+        )
+        follower.last_angular = -0.10
+
+        stopped = follower.stopping_angular_velocities(
+            tracking, 0.0, measured_angular_velocity=0.02
+        )
+        moving = follower.stopping_angular_velocities(
+            tracking, 0.10, measured_angular_velocity=0.02
+        )
+
+        self.assertEqual(stopped, (0.02, -0.10, 0.0))
+        self.assertAlmostEqual(moving[2], 0.30, places=12)
 
     def test_feedforward_calibration_does_not_change_path_curvature(self):
         path = CommonPath(
@@ -1125,6 +1198,65 @@ class SweptFootprintTest(unittest.TestCase):
         self.assertEqual(result.samples, 3)
         self.assertAlmostEqual(result.minimum_line_clearance, 0.30, places=12)
 
+    def test_pointwise_localization_uncertainty_is_interpolated_in_sweep(self):
+        evaluated_half_widths = []
+
+        def clearance(_pose, footprint):
+            evaluated_half_widths.append(footprint.half_width)
+            return 0.105 - footprint.half_width
+
+        validator = SweptFootprintValidator(
+            self.footprint,
+            translation_step=0.5,
+            heading_step=math.pi,
+        )
+        path = path_from_xy(
+            ((0.0, 0.0), (1.0, 0.0)),
+            "odom",
+            target_speed=0.1,
+            localization_uncertainty=(0.0, 0.02),
+            safety=PathSafety(
+                line_boundaries=(SimpleNamespace(clearance=clearance),)
+            ),
+        )
+
+        result = validator.validate_path(path)
+
+        np.testing.assert_allclose(
+            evaluated_half_widths,
+            (0.10, 0.11, 0.12),
+            rtol=0.0,
+            atol=1e-12,
+        )
+        self.assertFalse(result.safe)
+        self.assertAlmostEqual(result.minimum_line_clearance, -0.015, places=12)
+        self.assertAlmostEqual(result.first_unsafe_distance, 0.5, places=12)
+
+    def test_runtime_sweep_projects_pointwise_localization_profile(self):
+        path = path_from_xy(
+            ((0.0, 0.0), (0.5, 0.0), (1.0, 0.0)),
+            "odom",
+            target_speed=0.1,
+            localization_uncertainty=(0.001, 0.004, 0.009),
+        )
+        poses = (
+            Pose2D(0.0, 0.0, 0.0),
+            Pose2D(0.25, 0.0, 0.0),
+            Pose2D(0.75, 0.0, 0.0),
+        )
+
+        allowances, localization = self.validator._safety_profiles_for_poses(
+            path, poses, path_index=0
+        )
+
+        np.testing.assert_allclose(allowances, (0.0, 0.0, 0.0), atol=0.0)
+        np.testing.assert_allclose(
+            localization,
+            (0.001, 0.0025, 0.0065),
+            rtol=0.0,
+            atol=1e-12,
+        )
+
     def test_single_subdivision_normalizes_unwrapped_endpoint_yaw(self):
         evaluated_yaw = []
 
@@ -1320,6 +1452,82 @@ class SweptFootprintTest(unittest.TestCase):
         expanded_result = self.validator.validate_path(path, safety=uncertain)
         self.assertFalse(expanded_result.safe)
         self.assertLessEqual(expanded_result.minimum_line_clearance, 0.0)
+
+    def test_runtime_sweep_does_not_count_realized_tracking_error_twice(self):
+        corridor = StraightCorridorBoundary(-0.15, 0.15)
+        safety = PathSafety(
+            line_boundaries=(corridor,),
+            margins=SafetyMargins(localization=0.01, tracking=0.02),
+        )
+        path = path_from_xy(
+            [[0.0, 0.0], [0.5, 0.0]],
+            "odom",
+            target_speed=0.10,
+            safety=safety,
+        )
+
+        # The nominal route is certified with the complete tracking tube.
+        self.assertTrue(self.validator.validate_path(path).safe)
+
+        # This measured pose already contains 25 mm of realized lateral error.
+        # Its physical footprint plus localization uncertainty is clear, while
+        # charging the 20 mm tracking tube a second time would falsely overlap.
+        clear = self.validator.motion_safety(
+            path,
+            Pose2D(0.0, 0.025, 0.0),
+            path_index=0,
+            desired_speed=0.10,
+            linear_velocity=0.0,
+            angular_velocities=(0.0,),
+            reaction_time=0.0,
+            linear_deceleration=0.50,
+            distance_margin=0.005,
+        )
+        self.assertTrue(clear.stopping.safe)
+        self.assertGreater(clear.stopping.minimum_line_clearance, 0.0)
+        self.assertGreater(clear.speed_limit, 0.0)
+
+        # Localization uncertainty is still authoritative at the actual pose.
+        contact = self.validator.motion_safety(
+            path,
+            Pose2D(0.0, 0.045, 0.0),
+            path_index=0,
+            desired_speed=0.10,
+            linear_velocity=0.0,
+            angular_velocities=(0.0,),
+            reaction_time=0.0,
+            linear_deceleration=0.50,
+            distance_margin=0.005,
+        )
+        self.assertFalse(contact.stopping.safe)
+        self.assertLessEqual(contact.stopping.minimum_line_clearance, 0.0)
+        self.assertEqual(contact.speed_limit, 0.0)
+
+    def test_stationary_stop_margin_does_not_create_virtual_translation(self):
+        path = path_from_xy(
+            [[0.0, 0.0], [0.5, 0.0]],
+            "odom",
+            target_speed=0.10,
+            safety=PathSafety(
+                fixed_obstacles=np.asarray([[0.24, 0.0]], dtype=np.float64)
+            ),
+        )
+
+        result = self.validator.stopping_sweep(
+            path,
+            Pose2D(0.0, 0.0, 0.0),
+            path_index=0,
+            linear_velocity=0.0,
+            angular_velocities=(0.0,),
+            reaction_time=0.0,
+            linear_deceleration=0.50,
+            distance_margin=0.05,
+        )
+
+        self.assertTrue(result.safe)
+        self.assertAlmostEqual(
+            result.minimum_obstacle_clearance, 0.04, places=12
+        )
 
     def test_initial_line_overlap_can_egress_through_common_path_envelope(self):
         start_cell = RasterCellBoundary(
@@ -1549,6 +1757,67 @@ class SweptFootprintTest(unittest.TestCase):
         self.assertFalse(decision.stopping.safe)
         self.assertLessEqual(decision.stopping.minimum_obstacle_clearance, 0.0)
         self.assertEqual(decision.speed_limit, 0.0)
+
+    def test_prevalidated_route_is_shifted_to_latest_tracking_station(self):
+        path = self.straight_path_with_obstacle(0.55)
+        route_start = 0.0
+        route = self.validator.validate_path(
+            path,
+            start_station=route_start,
+        )
+        current_pose = Pose2D(0.10, 0.0, 0.0)
+        follower = PathFollower(
+            TrackingConfig(
+                lookahead_distance=0.10,
+                maximum_linear_velocity=0.60,
+                maximum_angular_velocity=1.0,
+                maximum_lateral_acceleration=1.0,
+                linear_acceleration=1.0,
+                linear_deceleration=1.0,
+                angular_acceleration=1.0,
+                heading_gain=0.0,
+            )
+        )
+        follower.reset(path, current_pose)
+        tracking = follower.calculate_tracking(current_pose)
+        expected = self.validator.motion_safety(
+            path,
+            current_pose,
+            path_index=0,
+            desired_speed=0.60,
+            linear_velocity=0.10,
+            angular_velocities=(0.0,),
+            reaction_time=0.10,
+            linear_deceleration=0.50,
+            tracking=tracking,
+        )
+
+        with mock.patch.object(
+            self.validator,
+            "validate_path",
+            side_effect=AssertionError("route sweep was repeated"),
+        ):
+            actual = self.validator.motion_safety(
+                path,
+                current_pose,
+                path_index=0,
+                desired_speed=0.60,
+                linear_velocity=0.10,
+                angular_velocities=(0.0,),
+                reaction_time=0.10,
+                linear_deceleration=0.50,
+                tracking=tracking,
+                route_validation=route,
+                route_start_station=route_start,
+            )
+
+        self.assertAlmostEqual(
+            actual.route.first_unsafe_distance,
+            expected.route.first_unsafe_distance,
+            places=12,
+        )
+        self.assertAlmostEqual(actual.speed_limit, expected.speed_limit, places=12)
+        self.assertEqual(actual.stopping.safe, expected.stopping.safe)
 
     def test_runtime_route_split_keeps_future_actual_line_sweep(self):
         def future_actual_line(pose, _footprint):

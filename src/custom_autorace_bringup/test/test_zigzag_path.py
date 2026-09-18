@@ -29,6 +29,12 @@ from custom_autorace_bringup.path_following import (
     ValidationResult,
     sample_path,
 )
+from custom_autorace_bringup.local_registration import (
+    CurveRegistrationConfig,
+    LocalCurveTemplate,
+    TemporalRegistrationConfig,
+    TemporalRegistrationFilter,
+)
 from custom_autorace_bringup.zigzag_path import (
     RasterPaintCorridorChecker,
     SurveyedCorridorChecker,
@@ -203,6 +209,526 @@ class ZigzagPathTest(unittest.TestCase):
             )
         )
         self.assertGreaterEqual(float(self.path.speed[index]), entry_cap)
+
+    def test_constructor_latches_the_surveyed_path_before_the_gate(self):
+        publishers = {}
+        publisher_options = {}
+
+        def get_param(name, default=None):
+            prefix = "~zigzag/"
+            key = name[len(prefix) :] if name.startswith(prefix) else name
+            if key == "texture/enabled":
+                return False
+            value = self.config
+            try:
+                for part in key.split("/"):
+                    value = value[part]
+            except (KeyError, TypeError):
+                return default
+            return value
+
+        def publisher(topic, _message_type, **options):
+            recording = RecordingPublisher()
+            publishers[topic] = recording
+            publisher_options[topic] = options
+            return recording
+
+        validator = mock.Mock()
+        validator.validate_path.return_value = ValidationResult(
+            True,
+            minimum_line_clearance=0.02,
+            minimum_obstacle_clearance=math.inf,
+            minimum_map_clearance=math.inf,
+        )
+        fixed_now = controller_module.rospy.Time.from_sec(42.0)
+        with mock.patch.object(
+            controller_module.rospy, "get_param", side_effect=get_param
+        ), mock.patch.object(
+            controller_module, "SweptFootprintValidator", return_value=validator
+        ), mock.patch.object(
+            controller_module.rospy, "Publisher", side_effect=publisher
+        ), mock.patch.object(
+            controller_module.rospy, "Subscriber", return_value=mock.Mock()
+        ), mock.patch.object(
+            controller_module.rospy, "ServiceProxy", return_value=mock.Mock()
+        ), mock.patch.object(
+            controller_module.rospy, "Timer", return_value=mock.Mock()
+        ), mock.patch.object(
+            controller_module.rospy, "on_shutdown"
+        ), mock.patch.object(
+            controller_module.rospy, "loginfo"
+        ), mock.patch.object(
+            controller_module.rospy.Time, "now", return_value=fixed_now
+        ):
+            controller = ZigzagMissionController()
+
+        self.assertIsNone(controller.committed_path)
+        self.assertTrue(publisher_options["/zigzag/path"]["latch"])
+        self.assertEqual(len(publishers["/zigzag/path"].messages), 1)
+        message = publishers["/zigzag/path"].messages[0]
+        self.assertEqual(message.header.stamp, controller_module.rospy.Time())
+        self.assertEqual(controller.map_path.frame_id, "map")
+        self.assertEqual(message.header.frame_id, "map")
+        self.assertEqual(message.header.frame_id, controller.map_path.frame_id)
+        self.assertEqual(len(message.poses), controller.map_path.size)
+        for index in (0, controller.map_path.size // 2, -1):
+            pose = message.poses[index].pose
+            yaw = float(controller.map_path.heading[index])
+            self.assertAlmostEqual(
+                pose.position.x, float(controller.map_path.x[index]), places=12
+            )
+            self.assertAlmostEqual(
+                pose.position.y, float(controller.map_path.y[index]), places=12
+            )
+            self.assertAlmostEqual(pose.position.z, 0.06, places=12)
+            self.assertAlmostEqual(
+                pose.orientation.z, math.sin(0.5 * yaw), places=12
+            )
+            self.assertAlmostEqual(
+                pose.orientation.w, math.cos(0.5 * yaw), places=12
+            )
+
+    def _local_registration_controller(self):
+        controller = ZigzagMissionController.__new__(ZigzagMissionController)
+        registration = self.config["registration"]
+        controller.lock = threading.RLock()
+        controller.state = controller.WAIT_GATE
+        controller.zone_gate = False
+        controller.arm_generation = 0
+        controller.armed_at = None
+        controller.accepted_gate_generation = 0
+        controller.prepared_path = None
+        controller.prepared_route_from_odom = None
+        controller.prepared_registration_transform = None
+        controller.prepared_generation = 0
+        controller.prepared_stamp = None
+        controller.registration_covariance = tuple()
+        controller.map_path = self.path
+        controller.local_curve_template = LocalCurveTemplate(
+            "zigzag", self.path.frame_id, tuple(zip(self.path.x, self.path.y))
+        )
+        controller.curve_registration_config = CurveRegistrationConfig(
+            sample_count=registration["sample_count"],
+            station_search_step=registration["station_search_step"],
+            minimum_observed_length=registration["minimum_observed_length"],
+            minimum_heading_variation=math.radians(
+                registration["minimum_heading_variation_deg"]
+            ),
+            minimum_lateral_excitation=registration[
+                "minimum_lateral_excitation"
+            ],
+            position_inlier_threshold=registration[
+                "position_inlier_threshold"
+            ],
+            minimum_inlier_fraction=registration["minimum_inlier_fraction"],
+            maximum_rms=registration["maximum_rms"],
+            ambiguity_station_separation=registration[
+                "ambiguity_station_separation"
+            ],
+            maximum_ambiguity_rms_difference=registration[
+                "maximum_ambiguity_rms_difference"
+            ],
+            maximum_ambiguity_rms_ratio=registration[
+                "maximum_ambiguity_rms_ratio"
+            ],
+        )
+        controller.registration_filter = TemporalRegistrationFilter(
+            TemporalRegistrationConfig(
+                required_confirmations=registration["confirmation_frames"],
+                maximum_gap=registration["confirmation_max_gap"],
+                maximum_position_delta=registration[
+                    "maximum_position_spread"
+                ],
+                maximum_heading_delta=math.radians(
+                    registration["maximum_heading_spread_deg"]
+                ),
+            )
+        )
+        controller.registration_source_max_age = registration[
+            "source_max_age"
+        ]
+        controller.registration_future_tolerance = registration[
+            "future_tolerance"
+        ]
+        controller.ready_republish_period = registration[
+            "ready_republish_period"
+        ]
+        controller.registration_maximum_start_station_error = registration[
+            "maximum_start_station_error"
+        ]
+        controller.route_odom_aligned = False
+        controller.odom_frame = "odom"
+        controller.odom_ready = True
+        controller.live_obstacle_points = np.empty((0, 2), dtype=np.float64)
+        controller.footprint = AsymmetricFootprint(0.067645, 0.118073, 0.0903)
+        controller.start_maximum_path_error = self.config["start"][
+            "maximum_path_error"
+        ]
+        controller.start_maximum_join_heading_error = math.radians(
+            self.config["start"]["maximum_join_heading_error_deg"]
+        )
+        controller.tracking_config = TrackingConfig(
+            lookahead_distance=0.065,
+            maximum_linear_velocity=0.14,
+            maximum_angular_velocity=0.8,
+            maximum_lateral_acceleration=0.035,
+            linear_acceleration=0.04,
+            linear_deceleration=0.12,
+            angular_acceleration=0.8,
+            heading_gain=0.35,
+        )
+        controller._path_safety = mock.Mock(return_value=PathSafety())
+        controller.path_validator = mock.Mock()
+        controller.path_validator.validate_path.return_value = ValidationResult(
+            True,
+            minimum_line_clearance=0.02,
+            minimum_obstacle_clearance=0.10,
+            minimum_map_clearance=0.20,
+        )
+        controller.ready_pub = RecordingPublisher()
+        return controller
+
+    @staticmethod
+    def _rolling_path_message(points, stamp):
+        message = controller_module.Path()
+        message.header.frame_id = "odom"
+        message.header.stamp = controller_module.rospy.Time.from_sec(stamp)
+        for x, y in points:
+            pose = controller_module.PoseStamped()
+            pose.header = message.header
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.orientation.w = 1.0
+            message.poses.append(pose)
+        return message
+
+    def test_curved_lane_path_registers_shifted_local_route_before_gate(self):
+        controller = self._local_registration_controller()
+        empty_arm = controller_module.Header()
+        empty_arm.seq = 16
+        empty_arm.stamp = controller_module.rospy.Time.from_sec(19.9)
+        controller.arm_callback(empty_arm)
+        self.assertEqual(controller.arm_generation, 0)
+
+        zero_stamp = controller_module.Header(
+            seq=17,
+            stamp=controller_module.rospy.Time(),
+            frame_id="zigzag",
+        )
+        controller.arm_callback(zero_stamp)
+        self.assertEqual(controller.arm_generation, 0)
+
+        arm = controller_module.Header()
+        arm.seq = 17
+        arm.stamp = controller_module.rospy.Time.from_sec(20.0)
+        arm.frame_id = "zigzag"
+        controller.arm_callback(arm)
+
+        start, end = 0.55, 1.05
+        selected = (self.path.station >= start) & (self.path.station <= end)
+        transform = RigidTransform2D(
+            0.37, -0.22, math.radians(6.0), "map", "odom"
+        )
+        observed = [
+            transform.apply_point(point)
+            for point in zip(self.path.x[selected], self.path.y[selected])
+        ]
+        first_index = int(np.flatnonzero(selected)[0])
+        robot_pose = transform.apply_pose(
+            Pose2D(
+                self.path.x[first_index],
+                self.path.y[first_index],
+                self.path.heading[first_index],
+            )
+        )
+        controller.odom_x = robot_pose.x
+        controller.odom_y = robot_pose.y
+        controller.odom_yaw = robot_pose.yaw
+
+        for stamp in (20.03, 20.06, 20.09):
+            with mock.patch.object(
+                controller_module.rospy.Time,
+                "now",
+                return_value=controller_module.rospy.Time.from_sec(
+                    stamp + 0.01
+                ),
+            ):
+                controller.lane_path_callback(
+                    self._rolling_path_message(observed, stamp)
+                )
+
+        self.assertEqual(controller.prepared_generation, 17)
+        self.assertEqual(len(controller.ready_pub.messages), 1)
+        ready = controller.ready_pub.messages[0]
+        self.assertEqual(ready.seq, 17)
+        self.assertEqual(ready.frame_id, "zigzag")
+        self.assertAlmostEqual(ready.stamp.to_sec(), 20.09, places=8)
+        self.assertAlmostEqual(
+            controller.prepared_path.x[first_index], robot_pose.x, delta=0.003
+        )
+        self.assertAlmostEqual(
+            controller.prepared_path.y[first_index], robot_pose.y, delta=0.003
+        )
+        self.assertFalse(controller.zone_gate)
+
+    def test_odom_aligned_run14_entry_uses_pose_bounded_station_search(self):
+        controller = self._local_registration_controller()
+        controller.route_odom_aligned = True
+        arm = controller_module.Header(
+            seq=18,
+            stamp=controller_module.rospy.Time.from_sec(20.0),
+            frame_id="zigzag",
+        )
+        controller.arm_callback(arm)
+
+        # Run14's first rolling path matched the surveyed suffix near station
+        # 0.23 while the raw-odom robot projection was near station 0.273.
+        selected = (
+            (self.path.station >= 0.23)
+            & (self.path.station <= 0.915)
+        )
+        transform = RigidTransform2D(
+            -0.821,
+            1.732,
+            math.radians(0.82),
+            "map",
+            "odom",
+        )
+        observed = [
+            transform.apply_point(point)
+            for point in zip(self.path.x[selected], self.path.y[selected])
+        ]
+        pose_index = int(np.argmin(np.abs(self.path.station - 0.273)))
+        controller.odom_x = float(self.path.x[pose_index])
+        controller.odom_y = float(self.path.y[pose_index])
+        controller.odom_yaw = float(self.path.heading[pose_index])
+
+        with mock.patch.object(
+            controller_module,
+            "register_curve_subset",
+            wraps=controller_module.register_curve_subset,
+        ) as matcher:
+            for stamp in (20.03, 20.06, 20.09):
+                with mock.patch.object(
+                    controller_module.rospy.Time,
+                    "now",
+                    return_value=controller_module.rospy.Time.from_sec(
+                        stamp + 0.01
+                    ),
+                ):
+                    controller.lane_path_callback(
+                        self._rolling_path_message(observed, stamp)
+                    )
+
+        self.assertEqual(controller.prepared_generation, 18)
+        self.assertEqual(len(controller.ready_pub.messages), 1)
+        self.assertEqual(matcher.call_count, 3)
+        for call in matcher.call_args_list:
+            lower, upper = call.kwargs["start_station_bounds"]
+            self.assertLessEqual(lower, 0.23)
+            self.assertGreaterEqual(upper, 0.23)
+            self.assertAlmostEqual(
+                upper - lower,
+                2.0
+                * self.config["registration"][
+                    "maximum_start_station_error"
+                ],
+                delta=0.004,
+            )
+
+    def test_straight_lane_path_never_opens_zigzag_ready_gate(self):
+        controller = self._local_registration_controller()
+        arm = controller_module.Header()
+        arm.seq = 9
+        arm.stamp = controller_module.rospy.Time.from_sec(30.0)
+        arm.frame_id = "zigzag"
+        controller.arm_callback(arm)
+        controller.odom_x = 0.0
+        controller.odom_y = 0.0
+        controller.odom_yaw = 0.0
+        straight = [(value, 0.0) for value in np.linspace(0.0, 0.45, 40)]
+
+        for stamp in (30.03, 30.06, 30.09, 30.12):
+            with mock.patch.object(
+                controller_module.rospy.Time,
+                "now",
+                return_value=controller_module.rospy.Time.from_sec(
+                    stamp + 0.01
+                ),
+            ):
+                controller.lane_path_callback(
+                    self._rolling_path_message(straight, stamp)
+                )
+
+        self.assertEqual(controller.ready_pub.messages, [])
+        self.assertIsNone(controller.prepared_path)
+
+    def test_prepared_zigzag_refreshes_ready_without_replanning(self):
+        controller = self._local_registration_controller()
+        controller.route_odom_aligned = True
+        arm = controller_module.Header(
+            seq=17,
+            stamp=controller_module.rospy.Time.from_sec(20.0),
+            frame_id="zigzag",
+        )
+        controller.arm_callback(arm)
+        selected = (self.path.station >= 0.55) & (self.path.station <= 1.05)
+        transform = RigidTransform2D(
+            0.37, -0.22, math.radians(6.0), "map", "odom"
+        )
+        observed = [
+            transform.apply_point(point)
+            for point in zip(self.path.x[selected], self.path.y[selected])
+        ]
+        first_index = int(np.flatnonzero(selected)[0])
+        pose = Pose2D(
+            self.path.x[first_index],
+            self.path.y[first_index],
+            self.path.heading[first_index],
+        )
+        controller.odom_x = pose.x
+        controller.odom_y = pose.y
+        controller.odom_yaw = pose.yaw
+
+        for stamp in (20.03, 20.06, 20.09):
+            with mock.patch.object(
+                controller_module.rospy.Time,
+                "now",
+                return_value=controller_module.rospy.Time.from_sec(
+                    stamp + 0.01
+                ),
+            ):
+                controller.lane_path_callback(
+                    self._rolling_path_message(observed, stamp)
+                )
+        frozen_path = controller.prepared_path
+        frozen_transform = controller.prepared_route_from_odom
+        self.assertAlmostEqual(
+            controller.prepared_registration_transform.target_from_source_x,
+            transform.target_from_source_x,
+            delta=0.003,
+        )
+        self.assertAlmostEqual(
+            frozen_transform.target_from_source_x, 0.0, places=12
+        )
+        self.assertEqual(controller.registration_covariance, tuple())
+        self.assertEqual(
+            controller._path_safety.call_args.kwargs["registration_margin"],
+            0.0,
+        )
+
+        refresh_stamp = 20.25
+        with mock.patch.object(
+            controller_module.rospy.Time,
+            "now",
+            return_value=controller_module.rospy.Time.from_sec(
+                refresh_stamp + 0.01
+            ),
+        ):
+            controller.lane_path_callback(
+                self._rolling_path_message(observed, refresh_stamp)
+            )
+
+        self.assertEqual(len(controller.ready_pub.messages), 2)
+        self.assertAlmostEqual(
+            controller.ready_pub.messages[-1].stamp.to_sec(),
+            refresh_stamp,
+            places=8,
+        )
+        self.assertIs(controller.prepared_path, frozen_path)
+        self.assertEqual(controller.prepared_route_from_odom, frozen_transform)
+
+    def test_premature_zigzag_gate_has_no_control_side_effect(self):
+        controller = self._local_registration_controller()
+        controller.speed_limit_pub = RecordingPublisher()
+        controller.start_requested = False
+        controller.revoke_requested = False
+        controller.entry_velocity_cap = 0.10
+        arm = controller_module.Header(
+            seq=5,
+            stamp=controller_module.rospy.Time.from_sec(10.0),
+            frame_id="zigzag",
+        )
+        controller.arm_callback(arm)
+        now = controller_module.rospy.Time.from_sec(10.1)
+        with mock.patch.object(
+            controller_module.rospy.Time, "now", return_value=now
+        ), mock.patch.object(controller_module.rospy, "logwarn_throttle"):
+            controller.gate_callback(controller_module.Bool(data=True))
+            self.assertFalse(controller._start_run(now))
+
+        self.assertFalse(controller.zone_gate)
+        self.assertFalse(controller.start_requested)
+        self.assertEqual(controller.speed_limit_pub.messages, [])
+
+    def test_manager_accepted_gate_survives_local_age_and_timer_boundary(self):
+        controller = self._local_registration_controller()
+        controller.arm_generation = 5
+        controller.armed_at = controller_module.rospy.Time.from_sec(9.9)
+        controller.prepared_generation = 5
+        controller.prepared_path = self.path
+        controller.prepared_route_from_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "odom", self.path.frame_id
+        )
+        controller.prepared_stamp = controller_module.rospy.Time.from_sec(10.0)
+        controller.speed_limit_pub = RecordingPublisher()
+        controller.state_pub = RecordingPublisher()
+        controller.entry_velocity_cap = self.config["control"][
+            "entry_velocity_cap"
+        ]
+        controller.start_requested = False
+        controller.revoke_requested = False
+        controller.mission_has_control = False
+
+        gate_time = controller_module.rospy.Time.from_sec(10.379)
+        self.assertFalse(controller._prepared_ready_for_gate(gate_time))
+        with mock.patch.object(
+            controller_module.rospy.Time, "now", return_value=gate_time
+        ):
+            controller.gate_callback(controller_module.Bool(data=True))
+
+        self.assertTrue(controller.zone_gate)
+        self.assertTrue(controller.start_requested)
+        self.assertEqual(controller.accepted_gate_generation, 5)
+        delayed_timer = controller_module.rospy.Time.from_sec(10.40)
+        self.assertFalse(controller._prepared_ready_for_gate(delayed_timer))
+        self.assertTrue(controller._start_run(delayed_timer))
+        self.assertEqual(controller.state, controller.ACQUIRING)
+        self.assertTrue(controller.zone_gate)
+        self.assertFalse(controller.start_requested)
+        self.assertAlmostEqual(
+            controller.speed_limit_pub.messages[-1].data,
+            controller.entry_velocity_cap,
+            places=12,
+        )
+
+    def test_new_arm_invalidates_accepted_zigzag_gate_generation(self):
+        controller = self._local_registration_controller()
+        controller.arm_generation = 5
+        controller.armed_at = controller_module.rospy.Time.from_sec(9.9)
+        controller.prepared_generation = 5
+        controller.prepared_path = self.path
+        controller.prepared_route_from_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "odom", self.path.frame_id
+        )
+        controller.prepared_stamp = controller_module.rospy.Time.from_sec(10.0)
+        controller.start_requested = False
+        controller.revoke_requested = False
+        controller.gate_callback(controller_module.Bool(data=True))
+        self.assertEqual(controller.accepted_gate_generation, 5)
+
+        controller.arm_callback(
+            controller_module.Header(
+                seq=6,
+                stamp=controller_module.rospy.Time.from_sec(10.1),
+                frame_id="zigzag",
+            )
+        )
+
+        self.assertEqual(controller.arm_generation, 6)
+        self.assertEqual(controller.accepted_gate_generation, 0)
+        self.assertFalse(controller.start_requested)
+        self.assertIsNone(controller.prepared_path)
 
     def _configure_production_safety(self, controller):
         footprint_config = self.config["footprint"]
@@ -1163,12 +1689,14 @@ class ZigzagPathTest(unittest.TestCase):
         )
         fixed_stamp = controller_module.rospy.Time.from_sec(stamp)
         controller.map_path = self.path
-        controller.map_ready = True
-        controller.map_x = pose[0]
-        controller.map_y = pose[1]
-        controller.map_yaw = pose[2]
-        controller.map_stamp = fixed_stamp
-        controller.map_timeout = self.config["timeouts"]["map_pose"]
+        controller.arm_generation = 1
+        controller.prepared_generation = 1
+        controller.prepared_path = RigidTransform2D(
+            0.0, 0.0, 0.0, self.path.frame_id, "odom"
+        ).apply_path(self.path)
+        controller.prepared_route_from_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "odom", self.path.frame_id
+        )
         controller.odom_timeout = self.config["timeouts"]["odometry"]
         controller.route_odom_aligned = self.config["route"]["odom_aligned"]
         controller.acquisition_timeout = self.config["timeouts"]["acquisition"]
@@ -1308,6 +1836,8 @@ class ZigzagPathTest(unittest.TestCase):
         self.assertEqual(handoff_calls, [False])
         self.assertEqual(controller.state, controller.FOLLOWING)
         self.assertEqual(len(controller.path_pub.messages), 1)
+        self.assertEqual(controller.committed_path.frame_id, "odom")
+        self.assertEqual(controller.path_pub.messages[0].header.frame_id, "map")
         self.assertEqual(len(follow_calls), 1)
         self.assertAlmostEqual(follow_calls[0][0].to_sec(), 10.10, places=8)
         self.assertIsNone(follow_calls[0][1])
@@ -1322,7 +1852,7 @@ class ZigzagPathTest(unittest.TestCase):
             places=12,
         )
 
-    def test_controller_freezes_map_route_into_odom_for_hardware_mode(self):
+    def test_acquire_commits_prevalidated_rotated_local_route(self):
         entry_index = int(np.argmin(np.abs(self.path.x - 0.33)))
         map_pose = (
             float(self.path.x[entry_index]),
@@ -1343,6 +1873,18 @@ class ZigzagPathTest(unittest.TestCase):
             self.path.frame_id,
             "map",
         ).apply_path(self.path)
+        controller._publish_path(
+            controller.map_path, stamp=controller_module.rospy.Time()
+        )
+        surveyed_message = controller.path_pub.messages[0]
+        local_to_odom = RigidTransform2D.from_pose_pair(
+            Pose2D(*map_pose),
+            Pose2D(*odom_pose),
+            source_frame="map",
+            target_frame="odom",
+        )
+        controller.prepared_path = local_to_odom.apply_path(controller.map_path)
+        controller.prepared_route_from_odom = local_to_odom.inverse()
         controller.odom_x, controller.odom_y, controller.odom_yaw = odom_pose
         fixed_stamp = controller_module.rospy.Time.from_sec(10.0)
         controller.odom_history = deque(
@@ -1363,7 +1905,28 @@ class ZigzagPathTest(unittest.TestCase):
 
         self.assertEqual(controller.state, controller.FOLLOWING)
         self.assertEqual(handoffs, [False])
+        self.assertEqual(len(controller.path_pub.messages), 2)
+        committed_message = controller.path_pub.messages[1]
+        self.assertEqual(surveyed_message.header.frame_id, "map")
+        self.assertEqual(committed_message.header.frame_id, "odom")
         self.assertEqual(controller.committed_path.frame_id, "odom")
+        for index in (0, controller.committed_path.size // 2, -1):
+            pose = committed_message.poses[index].pose
+            self.assertAlmostEqual(
+                pose.position.x,
+                float(controller.committed_path.x[index]),
+                places=12,
+            )
+            self.assertAlmostEqual(
+                pose.position.y,
+                float(controller.committed_path.y[index]),
+                places=12,
+            )
+        self.assertNotAlmostEqual(
+            surveyed_message.poses[0].pose.position.x,
+            committed_message.poses[0].pose.position.x,
+            places=6,
+        )
         recovered_map_pose = controller.route_from_odom.apply_pose(
             Pose2D(*odom_pose)
         )
@@ -1378,6 +1941,40 @@ class ZigzagPathTest(unittest.TestCase):
             controller.path_follower.diagnostics.position_error,
             1e-9,
         )
+
+    def test_acquire_uses_prevalidated_local_route_without_map_pose(self):
+        entry_index = int(np.argmin(np.abs(self.path.station - 0.55)))
+        entry_pose = (
+            float(self.path.x[entry_index]),
+            float(self.path.y[entry_index]),
+            float(self.path.heading[entry_index]),
+        )
+        controller = self._acquiring_controller(entry_pose)
+        controller.arm_generation = 31
+        controller.prepared_generation = 31
+        controller.prepared_path = self.path
+        controller.prepared_route_from_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "odom", "map"
+        )
+        handoffs = []
+
+        def handoff(enabled):
+            handoffs.append(enabled)
+            controller.mission_has_control = not enabled
+            return True
+
+        controller._set_lane_controller = handoff
+        now = controller_module.rospy.Time.from_sec(10.0)
+        with mock.patch.object(
+            controller_module.rospy.Time, "now", return_value=now
+        ):
+            self.assertTrue(controller._acquire(now))
+
+        self.assertEqual(handoffs, [False])
+        self.assertEqual(controller.state, controller.FOLLOWING)
+        self.assertIs(controller.committed_path, self.path)
+        self.assertEqual(controller.route_from_odom.source_frame, "odom")
+        self.assertEqual(controller.route_from_odom.target_frame, "map")
 
     def test_lane_join_success_returns_control_and_completes(self):
         controller = ZigzagMissionController.__new__(ZigzagMissionController)
@@ -1568,7 +2165,7 @@ class ZigzagPathTest(unittest.TestCase):
                 try:
                     controller.odom_callback(self._odom_message(10.40, pose))
                     with controller.lock:
-                        controller.map_stamp = fresh_stamp
+                        controller.prepared_generation += 1
                         controller.scan_stamp = fresh_stamp
                         controller.scan_received = fresh_stamp
                         controller.scan_pose_stamp_delta = 0.0
@@ -1967,9 +2564,14 @@ class ZigzagPathTest(unittest.TestCase):
                 pose=Pose2D(0.0, 0.0, math.radians(10.0)),
                 tracking=steering_tracking,
             )
-        self.assertIn(
-            steering_tracking.angular_velocity,
+        expected_stopping_rates = follower.stopping_angular_velocities(
+            steering_tracking,
+            max(abs(controller.last_linear), controller.odom_speed),
+            controller.odom_angular_velocity,
+        )
+        self.assertEqual(
             motion_safety.call_args.kwargs["angular_velocities"],
+            expected_stopping_rates,
         )
         self.assertIs(
             motion_safety.call_args.kwargs["safety"],

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Select and align intersection paths around camera-path lane segments."""
+"""Select a camera-sign route and align it to source-stamped local evidence."""
 
 import math
 import os
 import threading
+from collections import deque
 
 import cv2
 import numpy as np
@@ -13,10 +14,17 @@ import tf2_ros
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import CameraInfo
-from std_msgs.msg import Bool, Float64, Float64MultiArray, String, UInt8
+from std_msgs.msg import Bool, Float64, Float64MultiArray, Header, String, UInt8
 from std_srvs.srv import SetBool
 
 from custom_autorace_bringup.msg import TrafficSign
+from custom_autorace_bringup.local_registration import (
+    TemporalRegistrationConfig,
+    TemporalRegistrationFilter,
+    register_point_with_heading,
+    registration_covariance_with_floor,
+    registration_radial_uncertainties,
+)
 from custom_autorace_bringup.path_following import (
     AsymmetricFootprint,
     AxisAlignedBoundsBoundary,
@@ -34,7 +42,6 @@ from custom_autorace_bringup.path_following import (
     normalize_angle,
     path_from_xy,
     project_to_path,
-    yaw_from_quaternion,
 )
 
 
@@ -74,16 +81,13 @@ class IntersectionMissionController:
         self.zone_gate_topic = str(
             get(p + "zone_gate_topic", "/mission/enable/intersection")
         )
-        self.direction_observation_topic = str(
-            get(
-                p + "direction_observation_topic",
-                "/mission/inside/intersection_direction_observation",
-            )
+        self.arm_topic = str(
+            get(p + "arm_topic", "/mission/arm/intersection")
         )
-        self.mission_map_pose_topic = str(
-            get(p + "mission_map_pose_topic", "/mission/map_pose")
+        self.ready_topic = str(
+            get(p + "ready_topic", "/mission/ready/intersection")
         )
-
+        self.mission_name = str(get(p + "mission_name", "intersection"))
         self.direction_confirm_frames = max(
             1, int(get(p + "direction_confirm_frames", 9))
         )
@@ -119,14 +123,11 @@ class IntersectionMissionController:
         self.direction_search_timeout = max(
             1.0, float(get(p + "direction_search_timeout", 35.0))
         )
-        self.entry_handoff_timeout = max(
-            1.0, float(get(p + "entry_handoff_timeout", 5.0))
+        self.ready_gate_timeout = max(
+            1.0, float(get(p + "ready_gate_timeout", 5.0))
         )
         self.entry_takeover_pose_timeout = max(
             0.10, float(get(p + "entry_takeover_pose_timeout", 0.75))
-        )
-        self.entry_handoff_lead_distance = max(
-            0.0, float(get(p + "entry_handoff_lead_distance", 0.0))
         )
         self.path_follow_timeout = float(get(p + "path_follow_timeout", 10.0))
         self.path_lookahead = float(get(p + "path_lookahead", 0.08))
@@ -251,66 +252,196 @@ class IntersectionMissionController:
             ),
         )
 
-        # Routes are stored in the surveyed AMCL map. At path generation the
-        # current map -> odom TF is snapshotted, and the controller then tracks
-        # that frozen path only from /odometry/filtered. Ground Truth is never
-        # part of the control loop.
-        self.map_frame = str(get(p + "map_frame", "map"))
-        self.map_transform_lookup_timeout = max(
-            0.01, float(get(p + "map_transform_lookup_timeout", 0.20))
+        # The surveyed mission geometry keeps its map heading, while the
+        # direction sign fixes translation relative to the live vehicle.  The
+        # map translation is deliberately ignored, so changing the length of
+        # the straight before this mission cannot move the local route.
+        self.diagnostic_map_frame = str(
+            get(p + "diagnostic_map_frame", "map")
         )
-        self.map_transform_max_age = max(
-            0.05, float(get(p + "map_transform_max_age", 0.50))
+        self.local_frame = str(
+            get(p + "registration/local_frame", "intersection_local")
         )
-        self.map_world_size = float(get(p + "map_world_size", 4.0))
-        self.map_resolution = float(get(p + "map_resolution", 0.01))
-        self.map_boundary_inflation = max(
-            0.0, float(get(p + "map_boundary_inflation", 0.03))
+        self.sign_landmarks_local = {
+            self.LEFT: self._point_parameter(
+                get(p + "registration/left_sign_landmark_in_local", [0.315, 0.088]),
+                "registration/left_sign_landmark_in_local",
+            ),
+            self.RIGHT: self._point_parameter(
+                get(p + "registration/right_sign_landmark_in_local", [0.315, -0.022]),
+                "registration/right_sign_landmark_in_local",
+            ),
+        }
+        self.sign_physical_height = max(
+            0.001, float(get(p + "registration/sign_physical_height", 0.120))
         )
-        self.map_snap_max_distance = float(get(p + "map_snap_max_distance", 0.45))
-        self.exit_map_snap_max_distance = max(
-            0.01, float(get(p + "exit_map_snap_max_distance", 0.12))
+        self.sign_range_scale = {
+            self.LEFT: max(
+                0.01,
+                float(get(p + "registration/left_sign_range_scale", 1.235)),
+            ),
+            self.RIGHT: max(
+                0.01,
+                float(get(p + "registration/right_sign_range_scale", 1.175)),
+            ),
+        }
+        self.sign_center_bias_pixels = {
+            self.LEFT: float(
+                get(p + "registration/left_sign_center_bias_pixels", 24.0)
+            ),
+            self.RIGHT: float(
+                get(p + "registration/right_sign_center_bias_pixels", 13.0)
+            ),
+        }
+        camera_offset = self._point_parameter(
+            get(p + "registration/camera_offset_in_base", [0.0580, 0.0090]),
+            "registration/camera_offset_in_base",
         )
-        self.map_texture_package = str(
-            get(p + "map_texture_package", "turtlebot3_gazebo")
+        self.camera_offset_in_base = camera_offset
+        self.camera_fx = max(
+            1.0, float(get(p + "registration/camera_fx_fallback", 337.0))
         )
-        self.map_texture_relative_path = str(
+        self.camera_fy = max(
+            1.0, float(get(p + "registration/camera_fy_fallback", 337.0))
+        )
+        self.camera_cx = float(
+            get(p + "registration/camera_cx_fallback", 320.0)
+        )
+        self.local_yaw_in_map = math.radians(
+            float(get(p + "registration/local_yaw_in_map_deg", 180.52))
+        )
+        self.registration_tf_timeout = max(
+            0.0, float(get(p + "registration/map_tf_timeout", 0.020))
+        )
+        self.registration_roi_edge_margin = max(
+            0,
+            int(get(p + "registration/roi_edge_margin_pixels", 2)),
+        )
+        self.registration_entry_lead_min = float(
+            get(p + "registration/entry_lead_min", -0.15)
+        )
+        self.registration_entry_lead_max = float(
+            get(p + "registration/entry_lead_max", 0.03)
+        )
+        self.registration_entry_lateral_max = max(
+            0.01, float(get(p + "registration/entry_lateral_max", 0.03))
+        )
+        self.registration_entry_heading_max = math.radians(
+            max(1.0, float(get(p + "registration/entry_heading_max_deg", 12.0)))
+        )
+        if self.registration_entry_lead_min >= self.registration_entry_lead_max:
+            raise rospy.ROSInitException(
+                "registration entry lead limits are inconsistent"
+            )
+        self.registration_observation_position_sigma = max(
+            0.001,
+            float(get(p + "registration/observation_position_stddev", 0.005)),
+        )
+        self.registration_observation_heading_sigma = math.radians(
+            max(
+                0.1,
+                float(get(p + "registration/observation_heading_stddev_deg", 0.12)),
+            )
+        )
+        self.registration_systematic_position_sigma = max(
+            0.0,
+            float(get(p + "registration/systematic_position_error", 0.0015)),
+        )
+        self.registration_systematic_heading_sigma = math.radians(
+            max(
+                0.0,
+                float(get(p + "registration/systematic_heading_error_deg", 0.16)),
+            )
+        )
+        registration_required_confirmations = max(
+            1, int(get(p + "registration/required_confirmations", 3))
+        )
+        self.registration_temporal_config = TemporalRegistrationConfig(
+            required_confirmations=registration_required_confirmations,
+            maximum_gap=max(
+                0.05, float(get(p + "registration/maximum_confirmation_gap", 0.25))
+            ),
+            maximum_position_delta=max(
+                0.005, float(get(p + "registration/maximum_position_delta", 0.040))
+            ),
+            maximum_heading_delta=math.radians(
+                max(
+                    0.5,
+                    float(get(p + "registration/maximum_heading_delta_deg", 4.0)),
+                )
+            ),
+            history_size=max(
+                registration_required_confirmations,
+                int(get(p + "registration/history_size", 12)),
+            ),
+        )
+        self.odom_history_duration = max(
+            0.25, float(get(p + "registration/odom_history_duration", 2.0))
+        )
+        self.registration_pose_stamp_tolerance = max(
+            0.0,
+            float(get(p + "registration/pose_stamp_tolerance", 0.060)),
+        )
+        self.registration_source_max_age = max(
+            0.05, float(get(p + "registration/source_max_age", 0.45))
+        )
+        self.registration_future_tolerance = max(
+            0.0, float(get(p + "registration/future_tolerance", 0.05))
+        )
+        self.course_world_size = float(get(p + "course_world_size", 4.0))
+        self.course_resolution = float(get(p + "course_resolution", 0.01))
+        self.course_boundary_inflation = max(
+            0.0, float(get(p + "course_boundary_inflation", 0.03))
+        )
+        self.exit_local_snap_max_distance = max(
+            0.01, float(get(p + "exit_local_snap_max_distance", 0.12))
+        )
+        self.course_texture_package = str(
+            get(p + "course_texture_package", "turtlebot3_gazebo")
+        )
+        self.course_texture_relative_path = str(
             get(
-                p + "map_texture_relative_path",
+                p + "course_texture_relative_path",
                 "models/turtlebot3_autorace_2020/course/materials/textures/course.png",
             )
         )
-        self.map_entry_start = self._map_point_parameter(
-            get(p + "map_entry_start", [1.395, -0.750]),
-            "map_entry_start",
+        texture_to_local = get(
+            p + "course_texture_to_local", [1.395, -0.750, 180.0]
         )
-        self.map_entry_start_yaw = math.radians(
-            float(get(p + "map_entry_start_yaw_deg", 180.0))
+        if not isinstance(texture_to_local, (list, tuple)) or len(texture_to_local) != 3:
+            raise rospy.ROSInitException(
+                "course_texture_to_local must be [x, y, yaw_deg]"
+            )
+        self.local_from_texture = RigidTransform2D(
+            float(texture_to_local[0]),
+            float(texture_to_local[1]),
+            math.radians(float(texture_to_local[2])),
+            source_frame="course_texture",
+            target_frame=self.local_frame,
         )
-        self.map_left_entry_goal = self._map_point_parameter(
-            get(p + "map_left_entry_goal", [1.2522, -0.9257]),
-            "map_left_entry_goal",
+        self.local_entry_start = self._point_parameter(
+            get(p + "local_entry_start", [0.0, 0.0]),
+            "local_entry_start",
         )
-        self.map_right_entry_goal = self._map_point_parameter(
-            get(p + "map_right_entry_goal", [1.2513, -0.5886]),
-            "map_right_entry_goal",
+        self.local_entry_start_yaw = math.radians(
+            float(get(p + "local_entry_start_yaw_deg", 0.0))
         )
-        self.map_left_arc_entry_yaw = math.radians(
-            float(get(p + "map_left_arc_entry_yaw_deg", -90.0))
+        self.local_left_entry_goal = self._point_parameter(
+            get(p + "local_left_entry_goal", [0.1428, 0.1757]),
+            "local_left_entry_goal",
         )
-        self.map_right_arc_entry_yaw = math.radians(
-            float(get(p + "map_right_arc_entry_yaw_deg", 90.0))
+        self.local_right_entry_goal = self._point_parameter(
+            get(p + "local_right_entry_goal", [0.1437, -0.1614]),
+            "local_right_entry_goal",
         )
-        self.map_entry_samples = max(
-            20, int(get(p + "map_entry_samples", 100))
+        self.local_left_arc_entry_yaw = math.radians(
+            float(get(p + "local_left_arc_entry_yaw_deg", 90.0))
         )
-        self.entry_alignment_samples = max(
-            20, int(get(p + "entry_alignment_samples", 61))
+        self.local_right_arc_entry_yaw = math.radians(
+            float(get(p + "local_right_arc_entry_yaw_deg", -90.0))
         )
-        self.entry_alignment_tangent_ratio = clamp(
-            float(get(p + "entry_alignment_tangent_ratio", 0.25)),
-            0.05,
-            1.50,
+        self.entry_samples = max(
+            20, int(get(p + "entry_samples", 100))
         )
         self.entry_start_tangent_ratio = clamp(
             float(get(p + "entry_start_tangent_ratio", 0.50)),
@@ -329,43 +460,43 @@ class IntersectionMissionController:
             max(1.0, float(get(p + "entry_max_total_turn_deg", 120.0)))
         )
 
-        self.map_left_exit_control_points = tuple(
-            self._map_point_parameter(value, "map_left_exit_control_points")
+        self.local_left_exit_control_points = tuple(
+            self._point_parameter(value, "local_left_exit_control_points")
             for value in get(
-                p + "map_left_exit_control_points",
+                p + "local_left_exit_control_points",
                 [
-                    [0.762200, -1.035300],
-                    [0.737117, -0.924915],
-                    [0.742982, -0.941341],
-                    [0.721843, -0.847479],
-                    [0.757456, -0.750000],
-                    [0.600000, -0.750000],
+                    [0.632800, 0.285300],
+                    [0.657883, 0.174915],
+                    [0.652018, 0.191341],
+                    [0.673157, 0.097479],
+                    [0.637544, 0.000000],
+                    [0.795000, 0.000000],
                 ],
             )
         )
-        self.map_right_exit_control_points = tuple(
-            self._map_point_parameter(value, "map_right_exit_control_points")
+        self.local_right_exit_control_points = tuple(
+            self._point_parameter(value, "local_right_exit_control_points")
             for value in get(
-                p + "map_right_exit_control_points",
+                p + "local_right_exit_control_points",
                 [
-                    [0.762200, -0.464700],
-                    [0.737117, -0.575085],
-                    [0.742982, -0.558659],
-                    [0.721843, -0.652521],
-                    [0.757456, -0.750000],
-                    [0.600000, -0.750000],
+                    [0.632800, -0.285300],
+                    [0.657883, -0.174915],
+                    [0.652018, -0.191341],
+                    [0.673157, -0.097479],
+                    [0.637544, 0.000000],
+                    [0.795000, 0.000000],
                 ],
             )
         )
         if (
-            len(self.map_left_exit_control_points) < 2
-            or len(self.map_right_exit_control_points) < 2
+            len(self.local_left_exit_control_points) < 2
+            or len(self.local_right_exit_control_points) < 2
         ):
             raise rospy.ROSInitException(
                 "each selected exit branch requires at least two control points"
             )
-        self.map_exit_branch_samples = max(
-            20, int(get(p + "map_exit_branch_samples", 100))
+        self.exit_branch_samples = max(
+            20, int(get(p + "exit_branch_samples", 100))
         )
         self.exit_adaptive_join_ratio = clamp(
             float(get(p + "exit_adaptive_join_ratio", 0.40)),
@@ -412,29 +543,29 @@ class IntersectionMissionController:
             0.01, float(get(p + "exit_takeover_max_distance", 0.06))
         )
 
-        self.map_exit_control_points = tuple(
-            self._map_point_parameter(value, "map_exit_control_points")
+        self.local_exit_control_points = tuple(
+            self._point_parameter(value, "local_exit_control_points")
             for value in get(
-                p + "map_exit_control_points",
+                p + "local_exit_control_points",
                 [
-                    [0.600000, -0.750000],
-                    [0.341036, -0.750000],
-                    [0.295513, -0.678066],
-                    [0.256661, -0.509532],
-                    [0.250000, -0.615049],
-                    [0.250000, -0.300000],
+                    [0.795000, 0.000000],
+                    [1.053964, 0.000000],
+                    [1.099487, -0.071934],
+                    [1.138339, -0.240468],
+                    [1.145000, -0.134951],
+                    [1.145000, -0.450000],
                 ],
             )
         )
-        if len(self.map_exit_control_points) < 2:
+        if len(self.local_exit_control_points) < 2:
             raise rospy.ROSInitException(
-                "map_exit_control_points requires at least two points"
+                "local_exit_control_points requires at least two points"
             )
-        self.map_exit_samples = max(
-            20, int(get(p + "map_exit_samples", 180))
+        self.exit_samples = max(
+            20, int(get(p + "exit_samples", 180))
         )
-        self.exit_goal_yaw = math.radians(
-            float(get(p + "exit_goal_yaw_deg", 90.0))
+        self.local_exit_goal_yaw = math.radians(
+            float(get(p + "local_exit_goal_yaw_deg", -90.0))
         )
         self.exit_path_lookahead = max(
             0.005, float(get(p + "exit_path_lookahead", 0.035))
@@ -473,9 +604,6 @@ class IntersectionMissionController:
         # construction and all lane steering remain in safe_lane_controller.
         self.image_center = float(get(p + "boundary_center_x", 500.0))
         self.boundary_timeout = float(get(p + "boundary_timeout", 0.35))
-        self.zone_signal_timeout = max(
-            0.05, float(get(p + "zone_signal_timeout", 0.50))
-        )
         self.final_lane_confirm_frames = max(
             1, int(get(p + "final_lane_confirm_frames", 9))
         )
@@ -516,12 +644,18 @@ class IntersectionMissionController:
         self.odom_angular_velocity = 0.0
         self.last_x = self.last_y = self.last_wrapped_yaw = None
         self.odom_sequence = 0
+        self.odom_history = deque()
         self.total_distance = 0.0
         self.direction_candidate = self.direction = self.NONE
         self.direction_count = 0
         self.last_direction_confirmation_time = None
+        self.pending_direction_confirmation = None
         self.camera_width = max(1, int(get(p + "camera_width_fallback", 640)))
         self.camera_height = max(1, int(get(p + "camera_height_fallback", 480)))
+        self.registration_filter = TemporalRegistrationFilter(
+            self.registration_temporal_config
+        )
+        self.registration_covariance = tuple()
         self.yellow_x = self.white_x = math.nan
         self.yellow_valid = self.white_valid = False
         self.last_boundary_time = None
@@ -535,7 +669,9 @@ class IntersectionMissionController:
         self.path = None
         self.path_index = 0
         self.path_follower = None
-        self.active_tracking_from_map = None
+        self.local_to_odom = None
+        self.registration_source_stamp = None
+        self.active_tracking_from_local = None
         self.active_path_stage = ""
         self.path_goal_yaw = 0.0
         self.path_exit_yaw = 0.0
@@ -567,16 +703,17 @@ class IntersectionMissionController:
         self.entry_takeover_odom_sequence = -1
         self.exit_takeover_odom_sequence = -1
         self.final_lane_verify_start_distance = None
-        self.localized_map_pose_ready = False
-        self.localized_map_x = self.localized_map_y = self.localized_map_yaw = 0.0
-        self.last_localized_map_pose_time = None
         self.course_occupied = None
         self.course_raw_occupied = None
         self.course_boundary_points = np.empty((0, 2), dtype=np.float64)
         self.course_boundary_cell_size = None
+        self.course_boundary_local = None
+        self.course_bounds_local = None
         self.zone_gate_open = False
-        self.direction_observation_inside = False
-        self.last_direction_observation_time = None
+        self.arm_seq = None
+        self.arm_stamp = None
+        self.ready_published_seq = None
+        self.last_ready_stamp = None
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
@@ -601,13 +738,10 @@ class IntersectionMissionController:
         )
         self.state_pub = rospy.Publisher("/intersection/state", String, queue_size=1, latch=True)
         self.direction_pub = rospy.Publisher("/intersection/direction", UInt8, queue_size=1, latch=True)
-        rospy.Subscriber(self.odom_topic, Odometry, self.odom_callback, queue_size=1)
-        rospy.Subscriber(
-            self.mission_map_pose_topic,
-            PoseStamped,
-            self.mission_map_pose_callback,
-            queue_size=1,
+        self.ready_pub = rospy.Publisher(
+            self.ready_topic, Header, queue_size=1, latch=True
         )
+        rospy.Subscriber(self.odom_topic, Odometry, self.odom_callback, queue_size=1)
         rospy.Subscriber(self.sign_topic, TrafficSign, self.sign_callback, queue_size=1)
         rospy.Subscriber(
             self.camera_info_topic,
@@ -621,10 +755,7 @@ class IntersectionMissionController:
             self.zone_gate_topic, Bool, self.zone_gate_callback, queue_size=1
         )
         rospy.Subscriber(
-            self.direction_observation_topic,
-            Bool,
-            self.direction_observation_callback,
-            queue_size=1,
+            self.arm_topic, Header, self.arm_callback, queue_size=1
         )
         self.lane_service = rospy.ServiceProxy(self.lane_service_name, SetBool)
         self.lane_stop_service = rospy.ServiceProxy(
@@ -635,8 +766,10 @@ class IntersectionMissionController:
         self._publish_state()
         self._publish_course_map()
         rospy.loginfo(
-            "Intersection route waiting for the independent AMCL direction "
-            "window and ordered mission gate"
+            "Intersection route waiting for arm=%s; gate=%s opens only after "
+            "source-stamped local registration readiness",
+            self.arm_topic,
+            self.zone_gate_topic,
         )
 
     def _publish_state(self):
@@ -653,6 +786,9 @@ class IntersectionMissionController:
 
     def odom_callback(self, message):
         with self.lock:
+            stamp = message.header.stamp
+            if stamp == rospy.Time():
+                stamp = rospy.Time.now()
             x, y = message.pose.pose.position.x, message.pose.pose.position.y
             q = message.pose.pose.orientation
             wrapped = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -668,69 +804,151 @@ class IntersectionMissionController:
             self.pose_ready = True
             self.last_odom_time = rospy.Time.now()
             self.odom_sequence += 1
-
-    def mission_map_pose_callback(self, message):
-        """Store the AMCL/odom-propagated pose used for physical region gates."""
-        stamp = message.header.stamp
-        if stamp == rospy.Time():
-            stamp = rospy.Time.now()
-        pose = message.pose
-        with self.lock:
-            self.localized_map_x = float(pose.position.x)
-            self.localized_map_y = float(pose.position.y)
-            self.localized_map_yaw = yaw_from_quaternion(pose.orientation)
-            self.last_localized_map_pose_time = stamp
-            self.localized_map_pose_ready = True
+            frame = message.header.frame_id or "odom"
+            if self.odom_history and frame != self.odom_history[-1][4]:
+                self.odom_history.clear()
+            if not self.odom_history or stamp > self.odom_history[-1][0]:
+                self.odom_history.append((stamp, x, y, self.yaw, frame))
+                while (
+                    len(self.odom_history) > 1
+                    and (stamp - self.odom_history[0][0]).to_sec()
+                    > self.odom_history_duration
+                ):
+                    self.odom_history.popleft()
 
     def zone_gate_callback(self, message):
         with self.lock:
             was_open = self.zone_gate_open
-            self.zone_gate_open = bool(message.data)
+            requested = bool(message.data)
+            prepared = (
+                self.arm_seq is not None
+                and self.ready_published_seq == self.arm_seq
+                and self.last_ready_stamp is not None
+                and -self.registration_future_tolerance
+                <= (rospy.Time.now() - self.last_ready_stamp).to_sec()
+                <= self.registration_source_max_age
+                and self.local_to_odom is not None
+                and self.path is not None
+                and self.active_path_stage == "entry"
+            )
+            self.zone_gate_open = requested and prepared
+            if requested and not prepared:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Ignoring intersection enable before matching local "
+                    "registration readiness",
+                )
         if self.zone_gate_open and not was_open:
             rospy.loginfo(
                 "Ordered intersection mission gate enabled"
             )
 
-    def direction_observation_callback(self, message):
+    def _reset_registration(self):
+        self.direction_candidate = self.NONE
+        self.direction = self.NONE
+        self.direction_count = 0
+        self.last_direction_confirmation_time = None
+        self.pending_direction_confirmation = None
+        if hasattr(self, "registration_filter"):
+            self.registration_filter.reset("new intersection arm")
+        self.local_to_odom = None
+        self.registration_source_stamp = None
+        self.registration_covariance = tuple()
+        self.active_tracking_from_local = None
+        self.ready_published_seq = None
+        self.last_ready_stamp = None
+        self.path = None
+        self.path_follower = None
+        self.active_path_stage = ""
+        self._exit_branch_path_cache = {}
+
+    def arm_callback(self, message):
+        """Arm exactly one ordered generation while lane control continues."""
         with self.lock:
-            self.direction_observation_inside = bool(message.data)
-            self.last_direction_observation_time = rospy.Time.now()
+            sequence = int(message.seq)
+            if sequence == 0 or sequence == self.arm_seq:
+                return
+            if message.frame_id != self.mission_name:
+                rospy.logwarn(
+                    "Ignoring intersection arm frame '%s' (expected '%s')",
+                    message.frame_id,
+                    self.mission_name,
+                )
+                return
+            if self.mission_has_control or self.state not in (
+                self.WAIT_INTERSECTION,
+                self.SEARCH_DIRECTION,
+                self.WAIT_ENTRY_HANDOFF,
+                self.COMPLETE,
+                self.FAILED,
+            ):
+                rospy.logwarn(
+                    "Ignoring intersection arm generation %d while %s",
+                    sequence,
+                    self.state,
+                )
+                return
+            stamp = message.stamp
+            if stamp == rospy.Time():
+                rospy.logwarn(
+                    "Ignoring intersection arm generation %d with zero stamp",
+                    sequence,
+                )
+                return
+            self.arm_seq = sequence
+            self.arm_stamp = stamp
+            self.zone_gate_open = False
+            self._reset_registration()
+            self._set_state(self.SEARCH_DIRECTION)
+            rospy.loginfo(
+                "Intersection registration armed: generation=%d stamp=%.3f; "
+                "lane controller remains active",
+                sequence,
+                stamp.to_sec(),
+            )
 
-    def _zone_signal_is_fresh(self, timestamp, require_after_state=False):
-        if timestamp is None:
+    def _synchronized_odom_pose(self, stamp):
+        """Interpolate the encoder/IMU odometry pose at a camera source stamp."""
+        if stamp is None or stamp == rospy.Time() or not self.odom_history:
+            return None
+        samples = tuple(self.odom_history)
+        if stamp <= samples[0][0]:
+            skew = abs((samples[0][0] - stamp).to_sec())
+            if skew <= self.registration_pose_stamp_tolerance:
+                return Pose2D(*samples[0][1:4])
+            return None
+        if stamp >= samples[-1][0]:
+            skew = abs((stamp - samples[-1][0]).to_sec())
+            if skew <= self.registration_pose_stamp_tolerance:
+                return Pose2D(*samples[-1][1:4])
+            return None
+        for earlier, later in zip(samples[:-1], samples[1:]):
+            if earlier[0] <= stamp <= later[0]:
+                duration = (later[0] - earlier[0]).to_sec()
+                if duration <= 0.0:
+                    return None
+                ratio = (stamp - earlier[0]).to_sec() / duration
+                return Pose2D(
+                    earlier[1] + ratio * (later[1] - earlier[1]),
+                    earlier[2] + ratio * (later[2] - earlier[2]),
+                    earlier[3]
+                    + ratio * normalize_angle(later[3] - earlier[3]),
+                )
+        return None
+
+    def _direction_source_stamp_eligible(self, stamp):
+        if (
+            self.arm_seq is None
+            or self.arm_stamp is None
+            or stamp is None
+            or stamp == rospy.Time()
+            or stamp < self.arm_stamp
+        ):
             return False
-        if require_after_state and timestamp < self.state_started:
-            return False
+        age = (rospy.Time.now() - stamp).to_sec()
         return (
-            rospy.Time.now() - timestamp
-        ).to_sec() <= self.zone_signal_timeout
-
-    def _direction_observation_region_ready(self):
-        return (
-            self.direction_observation_inside
-            and self._zone_signal_is_fresh(self.last_direction_observation_time)
-        )
-
-    def _localized_map_pose_is_fresh(self):
-        return (
-            self.localized_map_pose_ready
-            and self._zone_signal_is_fresh(self.last_localized_map_pose_time)
-        )
-
-    def _entry_handoff_progress(self):
-        """Signed progress through the map-entry start normal plane."""
-        delta_x = self.localized_map_x - self.map_entry_start[0]
-        delta_y = self.localized_map_y - self.map_entry_start[1]
-        return (
-            delta_x * math.cos(self.map_entry_start_yaw)
-            + delta_y * math.sin(self.map_entry_start_yaw)
-        )
-
-    def _entry_handoff_pose_ready(self):
-        return (
-            self._localized_map_pose_is_fresh()
-            and self._entry_handoff_progress()
-            >= -self.entry_handoff_lead_distance
+            age <= self.registration_source_max_age
+            and age >= -self.registration_future_tolerance
         )
 
     def camera_info_callback(self, message):
@@ -739,15 +957,155 @@ class IntersectionMissionController:
         with self.lock:
             self.camera_width = int(message.width)
             self.camera_height = int(message.height)
+            if len(message.K) >= 3:
+                fx = float(message.K[0])
+                cx = float(message.K[2])
+                fy = float(message.K[4]) if len(message.K) >= 5 else math.nan
+                if math.isfinite(fx) and fx > 1.0:
+                    self.camera_fx = fx
+                if math.isfinite(fy) and fy > 1.0:
+                    self.camera_fy = fy
+                if math.isfinite(cx):
+                    self.camera_cx = cx
 
-    def _begin_direction_search(self):
-        # Preserve valid observations collected in the upstream direction
-        # window.  A stale candidate is reset by the normal maximum-gap check
-        # when the next sign message arrives.
-        self._set_state(self.SEARCH_DIRECTION)
-        rospy.loginfo(
-            "Ordered intersection gate opened without a preconfirmed "
-            "direction; timed search started while lane following continues"
+    def _map_aligned_local_yaw(self, source_stamp):
+        """Return intersection-local heading in odom at the camera stamp."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.odom_frame,
+                self.diagnostic_map_frame,
+                source_stamp,
+                rospy.Duration(self.registration_tf_timeout),
+            )
+        except (
+            tf2_ros.LookupException,
+            tf2_ros.ConnectivityException,
+            tf2_ros.ExtrapolationException,
+        ) as error:
+            rospy.logwarn_throttle(
+                1.0,
+                "Waiting for source-stamped intersection map heading: %s",
+                error,
+            )
+            return None
+        quaternion = transform.transform.rotation
+        map_to_odom_yaw = math.atan2(
+            2.0 * (quaternion.w * quaternion.z + quaternion.x * quaternion.y),
+            1.0 - 2.0 * (quaternion.y ** 2 + quaternion.z ** 2),
+        )
+        if not math.isfinite(map_to_odom_yaw):
+            return None
+        return normalize_angle(map_to_odom_yaw + self.local_yaw_in_map)
+
+    def _registration_roi_unclipped(self, roi):
+        margin = self.registration_roi_edge_margin
+        return (
+            int(roi.x_offset) >= margin
+            and int(roi.y_offset) >= margin
+            and int(roi.x_offset) + int(roi.width)
+            <= self.camera_width - margin
+            and int(roi.y_offset) + int(roi.height)
+            <= self.camera_height - margin
+        )
+
+    def _direction_registration_result(
+        self, selected, source_stamp, center_ratio, roi
+    ):
+        odom_pose = self._synchronized_odom_pose(source_stamp)
+        if odom_pose is None or not self._registration_roi_unclipped(roi):
+            return None, odom_pose
+        local_yaw = self._map_aligned_local_yaw(source_stamp)
+        if local_yaw is None:
+            return None, odom_pose
+        if (
+            not math.isfinite(self.camera_fx)
+            or self.camera_fx <= 1.0
+            or not math.isfinite(self.camera_fy)
+            or self.camera_fy <= 1.0
+        ):
+            return None, odom_pose
+        apparent_height = float(roi.height)
+        if apparent_height <= 0.0:
+            return None, odom_pose
+
+        # The upright sign's vertical diameter remains metric under an oblique
+        # horizontal view.  Width does not, and can also be truncated at the
+        # image edge.  Horizontal bearing still comes from the ROI centre.
+        forward = (
+            self.sign_range_scale[selected]
+            * self.camera_fy
+            * self.sign_physical_height
+            / apparent_height
+        )
+        centre_pixels = (
+            float(center_ratio) * float(self.camera_width)
+            + self.sign_center_bias_pixels[selected]
+        )
+        lateral = -(centre_pixels - self.camera_cx) * forward / self.camera_fx
+        base_forward = self.camera_offset_in_base[0] + forward
+        base_lateral = self.camera_offset_in_base[1] + lateral
+        cosine = math.cos(odom_pose.yaw)
+        sine = math.sin(odom_pose.yaw)
+        observed_sign = (
+            odom_pose.x + cosine * base_forward - sine * base_lateral,
+            odom_pose.y + sine * base_forward + cosine * base_lateral,
+        )
+        sign_local = self.sign_landmarks_local[selected]
+        result = register_point_with_heading(
+            source_stamp.to_sec(),
+            self.local_frame,
+            self.odom_frame,
+            sign_local,
+            observed_sign,
+            local_yaw,
+            self.registration_observation_position_sigma,
+            self.registration_observation_heading_sigma,
+        )
+        return result, odom_pose
+
+    def _entry_pose_eligible(self, transform, odom_pose, log_rejection=True):
+        local_pose = transform.inverse().apply_pose(odom_pose)
+        delta_x = local_pose.x - self.local_entry_start[0]
+        delta_y = local_pose.y - self.local_entry_start[1]
+        cosine = math.cos(self.local_entry_start_yaw)
+        sine = math.sin(self.local_entry_start_yaw)
+        entry_longitudinal = cosine * delta_x + sine * delta_y
+        entry_lateral = -sine * delta_x + cosine * delta_y
+        entry_heading = normalize_angle(
+            local_pose.yaw - self.local_entry_start_yaw
+        )
+        eligible = (
+            self.registration_entry_lead_min
+            <= entry_longitudinal
+            <= self.registration_entry_lead_max
+            and abs(entry_lateral) <= self.registration_entry_lateral_max
+            and abs(entry_heading)
+            <= self.registration_entry_heading_max
+        )
+        if not eligible and log_rejection:
+            rospy.logwarn_throttle(
+                1.0,
+                "Intersection aligned; waiting for local entry envelope: "
+                "x=%.3f y=%.3f yaw=%.1fdeg",
+                entry_longitudinal,
+                entry_lateral,
+                math.degrees(entry_heading),
+            )
+        return eligible
+
+    def _registration_uncertainties(self, tracking_points=None):
+        local_points = None
+        transform = getattr(self, "active_tracking_from_local", None)
+        if tracking_points is not None and transform is not None:
+            inverse = transform.inverse()
+            local_points = [inverse.apply_point(point) for point in tracking_points]
+        return registration_radial_uncertainties(
+            getattr(self, "registration_covariance", tuple()),
+            getattr(self, "footprint", None),
+            local_points=local_points,
+            target_from_source_yaw=(
+                0.0 if transform is None else transform.target_from_source_yaw
+            ),
         )
 
     def _direction_observation(self, message):
@@ -780,22 +1138,30 @@ class IntersectionMissionController:
         )
         if message.confidence < minimum_confidence or area_ratio < minimum_area_ratio:
             return None
-        return detected, center_ratio, area_ratio, message.confidence
+        return (
+            detected,
+            center_ratio,
+            area_ratio,
+            message.confidence,
+            roi,
+        )
 
     def sign_callback(self, message):
         with self.lock:
-            if self.state not in (self.WAIT_INTERSECTION, self.SEARCH_DIRECTION):
+            if self.arm_seq is None:
                 return
-            # The independent AMCL direction window opens before the ordered
-            # mission gate.  Only the direction is cached here; lane control
-            # remains authoritative until the separately surveyed entry plane.
-            if not self._direction_observation_region_ready():
+            if self.state == self.WAIT_ENTRY_HANDOFF:
+                self._refresh_prepared_readiness(message)
+                return
+            if self.state != self.SEARCH_DIRECTION:
+                return
+            source_stamp = message.header.stamp
+            if not self._direction_source_stamp_eligible(source_stamp):
                 return
             observation = self._direction_observation(message)
             if observation is None:
                 return
-            detected, center_ratio, area_ratio, confidence = observation
-            now = rospy.Time.now()
+            detected, center_ratio, area_ratio, confidence, roi = observation
             if self.direction in (self.LEFT, self.RIGHT):
                 return
             if (
@@ -805,6 +1171,8 @@ class IntersectionMissionController:
                 self.direction_candidate = self.NONE
                 self.direction_count = 0
                 self.last_direction_confirmation_time = None
+                self.pending_direction_confirmation = None
+                self.registration_filter.reset("unusable direction sign")
                 return
 
             selected = (
@@ -814,11 +1182,14 @@ class IntersectionMissionController:
             )
             separated = (
                 self.last_direction_confirmation_time is None
-                or (now - self.last_direction_confirmation_time).to_sec()
+                or (source_stamp - self.last_direction_confirmation_time).to_sec()
                 > self.direction_confirmation_max_gap
+                or source_stamp <= self.last_direction_confirmation_time
             )
             if separated or selected != self.direction_candidate:
                 self.direction_candidate, self.direction_count = selected, 1
+                self.pending_direction_confirmation = None
+                self.registration_filter.reset("new direction-sign streak")
                 rospy.loginfo(
                     "Direction sign usable: confidence=%.2f area=%.1f%% "
                     "center=%.1f%%",
@@ -828,29 +1199,184 @@ class IntersectionMissionController:
                 )
             else:
                 self.direction_count += 1
-            self.last_direction_confirmation_time = now
-            if self.direction_count >= self.direction_confirm_frames:
-                self.direction = self.direction_candidate
-                self.direction_pub.publish(UInt8(data=self.direction))
-                rospy.loginfo(
-                    "Direction confirmed %d/%d without pre-path steering "
-                    "(image center %.1f%%)",
-                    self.direction_count,
-                    self.direction_confirm_frames,
-                    100.0 * center_ratio,
+            self.last_direction_confirmation_time = source_stamp
+            registration, odom_pose = self._direction_registration_result(
+                detected,
+                source_stamp,
+                center_ratio,
+                roi,
+            )
+            if registration is None:
+                # Selection and alignment are separate stages. A clipped ROI,
+                # unavailable source-stamped TF, or late odometry may skip one
+                # metric update without erasing a valid LEFT/RIGHT streak.
+                return
+            temporal = self.registration_filter.update(registration)
+            if not registration.accepted:
+                return
+            if (
+                self.direction_count >= self.direction_confirm_frames
+                and temporal.confirmed
+                and odom_pose is not None
+                and self._entry_pose_eligible(temporal.transform, odom_pose)
+            ):
+                self.pending_direction_confirmation = (
+                    selected,
+                    source_stamp,
+                    center_ratio,
+                    temporal.transform,
+                    temporal.covariance,
                 )
-                if self.state == self.SEARCH_DIRECTION:
-                    self._set_state(self.WAIT_ENTRY_HANDOFF)
-                    rospy.loginfo(
-                        "Direction latched after the ordered gate; lane "
-                        "following continues to the surveyed AMCL entry plane"
-                    )
-                else:
-                    rospy.loginfo(
-                        "Direction preconfirmed in the upstream AMCL window; "
-                        "waiting for the ordered gate while lane following "
-                        "continues"
-                    )
+                self._try_finalize_direction_registration()
+
+    def _publish_ready(self, source_stamp):
+        ready = Header()
+        ready.seq = int(self.arm_seq)
+        ready.stamp = source_stamp
+        ready.frame_id = self.mission_name
+        self.ready_pub.publish(ready)
+        self.ready_published_seq = self.arm_seq
+        self.last_ready_stamp = source_stamp
+
+    def _refresh_prepared_readiness(self, message):
+        """Refresh a validated route with new source evidence, without replanning."""
+        if (
+            self.zone_gate_open
+            or self.local_to_odom is None
+            or self.path is None
+            or self.active_path_stage != "entry"
+            or self.ready_published_seq != self.arm_seq
+        ):
+            return False
+        source_stamp = message.header.stamp
+        if (
+            not self._direction_source_stamp_eligible(source_stamp)
+            or (
+                self.last_ready_stamp is not None
+                and source_stamp <= self.last_ready_stamp
+            )
+        ):
+            return False
+        observation = self._direction_observation(message)
+        if observation is None:
+            return False
+        detected = observation[0]
+        selected = (
+            self.forced_direction
+            if self.forced_direction in (self.LEFT, self.RIGHT)
+            else detected
+        )
+        if selected != self.direction:
+            return False
+        registration, odom_pose = self._direction_registration_result(
+            detected,
+            source_stamp,
+            observation[1],
+            observation[4],
+        )
+        if (
+            registration is None
+            or not registration.accepted
+            or registration.transform is None
+            or odom_pose is None
+        ):
+            return False
+        position_delta = math.hypot(
+            registration.transform.target_from_source_x
+            - self.local_to_odom.target_from_source_x,
+            registration.transform.target_from_source_y
+            - self.local_to_odom.target_from_source_y,
+        )
+        heading_delta = abs(
+            normalize_angle(
+                registration.transform.target_from_source_yaw
+                - self.local_to_odom.target_from_source_yaw
+            )
+        )
+        temporal_config = self.registration_filter.config
+        if (
+            position_delta > temporal_config.maximum_position_delta
+            or heading_delta > temporal_config.maximum_heading_delta
+        ):
+            return False
+        self._publish_ready(source_stamp)
+        return True
+
+    def _try_finalize_direction_registration(self):
+        if self.pending_direction_confirmation is None:
+            return False
+        (
+            selected,
+            source_stamp,
+            center_ratio,
+            local_to_odom,
+            covariance,
+        ) = self.pending_direction_confirmation
+        if not self._direction_source_stamp_eligible(source_stamp):
+            self.direction_candidate = self.NONE
+            self.direction_count = 0
+            self.last_direction_confirmation_time = None
+            self.pending_direction_confirmation = None
+            rospy.logwarn(
+                "Discarded stale intersection direction confirmation before "
+                "source-synchronized odometry became available"
+            )
+            return False
+        odom_pose = self._synchronized_odom_pose(source_stamp)
+        if odom_pose is None:
+            return False
+
+        self.direction = selected
+        self.local_to_odom = local_to_odom
+        self.registration_covariance = registration_covariance_with_floor(
+            covariance,
+            self.registration_systematic_position_sigma,
+            self.registration_systematic_heading_sigma,
+        )
+        self.registration_source_stamp = source_stamp
+        self.active_tracking_from_local = self.local_to_odom
+        try:
+            generated = self._generate_entry_path(odom_pose)
+        except (ArithmeticError, TypeError, ValueError) as error:
+            rospy.logerr("Local arc-entry path generation raised: %s", error)
+            generated = False
+        if not generated:
+            rospy.logwarn(
+                "Rejected source-stamped local arc-entry path before control "
+                "handoff; keeping selector/alignment evidence while camera "
+                "lane control advances into the entry envelope"
+            )
+            self.direction = self.NONE
+            self.local_to_odom = None
+            self.registration_covariance = tuple()
+            self.registration_source_stamp = None
+            self.active_tracking_from_local = None
+            self.ready_published_seq = None
+            self.last_ready_stamp = None
+            self.path = None
+            self.path_follower = None
+            self.active_path_stage = ""
+            self.pending_direction_confirmation = None
+            self._exit_branch_path_cache = {}
+            self._set_state(self.SEARCH_DIRECTION)
+            return False
+
+        self.direction_pub.publish(UInt8(data=self.direction))
+        self._publish_ready(source_stamp)
+        self.pending_direction_confirmation = None
+        self._set_state(self.WAIT_ENTRY_HANDOFF)
+        rospy.loginfo(
+            "Direction confirmed %d/%d and intersection-local route validated: "
+            "generation=%d source=%.3f direction=%s image_center=%.1f%%; "
+            "lane control remains active until enable",
+            self.direction_count,
+            self.direction_confirm_frames,
+            self.arm_seq,
+            source_stamp.to_sec(),
+            "LEFT" if self.direction == self.LEFT else "RIGHT",
+            100.0 * center_ratio,
+        )
+        return True
 
     def boundary_callback(self, message):
         if len(message.data) < 4:
@@ -1041,23 +1567,22 @@ class IntersectionMissionController:
                 return
 
             if self.state == self.WAIT_INTERSECTION:
-                if self.zone_gate_open:
-                    if self.direction in (self.LEFT, self.RIGHT):
-                        self._set_state(self.WAIT_ENTRY_HANDOFF)
-                        rospy.loginfo(
-                            "Ordered intersection gate accepted the "
-                            "preconfirmed direction; lane following continues "
-                            "to the surveyed AMCL entry plane"
-                        )
-                    elif self._direction_observation_region_ready():
-                        self._begin_direction_search()
+                # Only a non-zero Header arm generation may start camera
+                # evidence collection. A Bool enable never arms this state.
+                pass
 
             elif self.state == self.SEARCH_DIRECTION:
+                self._try_finalize_direction_registration()
                 if self._state_age() > self.direction_search_timeout:
-                    self._fail("direction sign search timed out inside polygon")
+                    rospy.logwarn(
+                        "Intersection direction/registration window expired; "
+                        "restarting evidence while lane control continues"
+                    )
+                    self._reset_registration()
+                    self._set_state(self.SEARCH_DIRECTION)
 
             elif self.state == self.WAIT_ENTRY_HANDOFF:
-                if self._entry_handoff_pose_ready():
+                if self.zone_gate_open:
                     if not self._set_lane_controller(False):
                         self._fail("could not acquire cmd_vel control")
                         return
@@ -1068,20 +1593,18 @@ class IntersectionMissionController:
                     self.cmd_pub.publish(Twist())
                     self.entry_takeover_odom_sequence = self.odom_sequence
                     rospy.loginfo(
-                        "Intersection acquired cmd_vel at the AMCL entry "
-                        "plane; waiting for a post-handoff EKF pose"
+                        "Intersection acquired cmd_vel after matching ready "
+                        "generation; waiting for a post-handoff EKF pose"
                     )
                     self._set_state(self.PREPARE_ENTRY_PATH)
                     return
-                elif self._state_age() > self.entry_handoff_timeout:
-                    self._fail(
-                        "AMCL entry handoff plane timed out "
-                        "(progress=%.3fm map_pose_fresh=%s)"
-                        % (
-                            self._entry_handoff_progress(),
-                            self._localized_map_pose_is_fresh(),
-                        )
+                elif self._state_age() > self.ready_gate_timeout:
+                    rospy.logwarn(
+                        "Intersection enable did not match fresh readiness; "
+                        "reacquiring source-stamped geometry while lane control continues"
                     )
+                    self._reset_registration()
+                    self._set_state(self.SEARCH_DIRECTION)
 
             elif self.state == self.PREPARE_ENTRY_PATH:
                 # A short zero barrier establishes one command owner and lets
@@ -1089,15 +1612,8 @@ class IntersectionMissionController:
                 # call before the aligned entry path is frozen.
                 self.cmd_pub.publish(Twist())
                 if self.odom_sequence > self.entry_takeover_odom_sequence:
-                    try:
-                        generated = self._generate_map_entry_path()
-                    except (ArithmeticError, TypeError, ValueError) as error:
-                        rospy.logerr(
-                            "Arc-entry path generation raised: %s", error
-                        )
-                        generated = False
-                    if not generated:
-                        self._fail("arc-entry path planning failed")
+                    if not self._start_prepared_entry_path():
+                        self._fail("prepared arc-entry path could not start")
                         return
                     self.mission_started = rospy.Time.now()
                     self._set_state(self.FOLLOW_ENTRY_PATH)
@@ -1152,16 +1668,14 @@ class IntersectionMissionController:
                     if self.arc_lane_start_distance is None
                     else self.total_distance - self.arc_lane_start_distance
                 )
-                map_pose_fresh = self._localized_map_pose_is_fresh()
-                exit_projection = self._selected_exit_map_projection()
+                exit_projection = self._selected_exit_local_projection()
                 exit_path_distance = exit_projection.distance
-                # mission_map_pose is the same AMCL sample used by the map to
-                # odom aligner. Projecting onto the whole selected branch is
-                # important: a delayed camera frame can put the robot past the
-                # first stored point while it is still correctly on the path.
+                # Project odometry onto the whole branch transformed by the
+                # same source-stamped local registration as the entry path.
+                # Passing the first stored point therefore cannot miss the
+                # camera-to-common-follower ownership handoff.
                 arc_end_ready = bool(
-                    map_pose_fresh
-                    and exit_path_distance <= self.exit_takeover_max_distance
+                    exit_path_distance <= self.exit_takeover_max_distance
                 )
                 if arc_end_ready:
                     if not self._set_lane_controller(False):
@@ -1173,7 +1687,7 @@ class IntersectionMissionController:
                     self.cmd_pub.publish(Twist())
                     self.exit_takeover_odom_sequence = self.odom_sequence
                     rospy.loginfo(
-                        "AMCL confirmed the %s semicircle end; intersection "
+                        "Local route confirmed the %s semicircle end; intersection "
                         "controller reacquired cmd_vel after %.3fm; waiting "
                         "for a post-handoff EKF pose",
                         "LEFT" if self.direction == self.LEFT else "RIGHT",
@@ -1187,12 +1701,11 @@ class IntersectionMissionController:
                 ):
                     self._fail(
                         "semicircle-end detection failed: age=%.2fs "
-                        "distance=%.3fm map_pose_fresh=%s "
-                        "exit_path_distance=%.3fm station=%.3fm (limit %.3fm)"
+                        "distance=%.3fm exit_path_distance=%.3fm "
+                        "station=%.3fm (limit %.3fm)"
                         % (
                             self._state_age(),
                             arc_distance,
-                            map_pose_fresh,
                             exit_path_distance,
                             exit_projection.station,
                             self.exit_takeover_max_distance,
@@ -1219,8 +1732,7 @@ class IntersectionMissionController:
                         return
                 if self._state_age() > self.exit_takeover_pose_timeout:
                     self._fail(
-                        "no usable post-handoff EKF/map transform for the "
-                        "shared exit path: "
+                        "no usable post-handoff EKF pose for the shared exit path: "
                         "odom_sequence=%d takeover_sequence=%d"
                         % (
                             self.odom_sequence,
@@ -1312,68 +1824,49 @@ class IntersectionMissionController:
         """Return the sole local control pose: encoder/IMU EKF odometry."""
         return self.x, self.y, self.yaw
 
-    def _lookup_tracking_from_map(self):
-        """Snapshot T_odom_map for one generated path.
-
-        AMCL remains the only map -> odom authority. Freezing this transform
-        for each short path avoids steering jumps if AMCL corrects while the
-        path is being tracked.
-        """
-        if self.odom_frame == self.map_frame:
-            return 0.0, 0.0, 0.0
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.odom_frame,
-                self.map_frame,
-                rospy.Time(0),
-                rospy.Duration(self.map_transform_lookup_timeout),
+    @staticmethod
+    def _local_to_tracking_point(point, tracking_from_local):
+        if not isinstance(tracking_from_local, RigidTransform2D):
+            tracking_from_local = RigidTransform2D(
+                *tracking_from_local,
+                source_frame="intersection_local",
+                target_frame="odom",
             )
-        except (
-            tf2_ros.LookupException,
-            tf2_ros.ConnectivityException,
-            tf2_ros.ExtrapolationException,
-        ) as error:
-            rospy.logerr(
-                "No %s <- %s transform for map path: %s",
-                self.odom_frame,
-                self.map_frame,
-                error,
-            )
-            return None
-
-        stamp = transform.header.stamp
-        if stamp != rospy.Time():
-            age = (rospy.Time.now() - stamp).to_sec()
-            if age > self.map_transform_max_age:
-                rospy.logerr(
-                    "%s <- %s transform is %.3fs old (limit %.3fs)",
-                    self.odom_frame,
-                    self.map_frame,
-                    age,
-                    self.map_transform_max_age,
-                )
-                return None
-        translation = transform.transform.translation
-        rotation = transform.transform.rotation
-        return (
-            float(translation.x),
-            float(translation.y),
-            yaw_from_quaternion(rotation),
-        )
+        return tracking_from_local.apply_point(point)
 
     @staticmethod
-    def _map_to_tracking_point(point, tracking_from_map):
-        transform = RigidTransform2D(
-            *tracking_from_map, source_frame="map", target_frame="odom"
-        )
-        return transform.apply_point(point)
+    def _local_to_tracking_yaw(local_yaw, tracking_from_local):
+        if not isinstance(tracking_from_local, RigidTransform2D):
+            tracking_from_local = RigidTransform2D(
+                *tracking_from_local,
+                source_frame="intersection_local",
+                target_frame="odom",
+            )
+        return tracking_from_local.apply_pose((0.0, 0.0, local_yaw)).yaw
 
-    @staticmethod
-    def _map_to_tracking_yaw(map_yaw, tracking_from_map):
-        transform = RigidTransform2D(
-            *tracking_from_map, source_frame="map", target_frame="odom"
+    def _start_prepared_entry_path(self):
+        """Reset the prevalidated entry follower at the post-handoff pose."""
+        if (
+            self.path is None
+            or self.path_follower is None
+            or self.active_path_stage != "entry"
+            or self.ready_published_seq != self.arm_seq
+        ):
+            return False
+        pose = Pose2D(*self._tracking_pose())
+        self.path_follower.reset(
+            self.path,
+            pose,
+            initial_linear=0.0,
+            initial_angular=0.0,
         )
-        return transform.apply_pose((0.0, 0.0, map_yaw)).yaw
+        self.path_index = self.path_follower.path_index
+        self.path_started = rospy.Time.now()
+        self.last_path_command_time = None
+        self.path_tick_pose = None
+        self.path_tick_tracking = None
+        self._publish_path_diagnostics()
+        return True
 
     def _prepare_active_entry_parameters(self):
         self.active_path_velocity = (
@@ -1424,7 +1917,7 @@ class IntersectionMissionController:
         self.active_path_follow_timeout = self.exit_path_follow_timeout
 
     @staticmethod
-    def _map_point_parameter(value, name):
+    def _point_parameter(value, name):
         if not isinstance(value, (list, tuple)) or len(value) != 2:
             raise rospy.ROSInitException("%s must contain exactly [x, y]" % name)
         point = (float(value[0]), float(value[1]))
@@ -1482,7 +1975,15 @@ class IntersectionMissionController:
             result.append((float(point[0]), float(point[1])))
         return result
 
-    def _activate_path(self, path, goal_yaw, exit_yaw, stage):
+    def _activate_path(
+        self,
+        path,
+        goal_yaw,
+        exit_yaw,
+        stage,
+        validation_start_pose=None,
+        begin_tracking=True,
+    ):
         points = list(path)
         if len(points) < 2:
             rospy.logerr("Intersection %s path has fewer than two points", stage)
@@ -1493,20 +1994,21 @@ class IntersectionMissionController:
                 stage,
             )
             return False
-        map_boundary = AxisAlignedBoundsBoundary(
-            -0.5 * self.map_world_size,
-            0.5 * self.map_world_size,
-            -0.5 * self.map_world_size,
-            0.5 * self.map_world_size,
-        )
-        if self.active_tracking_from_map is not None:
-            map_boundary = map_boundary.transformed(
-                RigidTransform2D(
-                    *self.active_tracking_from_map,
-                    source_frame=self.map_frame,
-                    target_frame=self.odom_frame,
-                )
+        if self.active_tracking_from_local is None:
+            rospy.logerr(
+                "Intersection %s path has no frozen local->odom registration",
+                stage,
             )
+            return False
+        if self.course_bounds_local is None:
+            rospy.logerr(
+                "Intersection %s path has no mission-local course bounds",
+                stage,
+            )
+            return False
+        map_boundary = self.course_bounds_local.transformed(
+            self.active_tracking_from_local
+        )
         if self.course_boundary_cell_size is None:
             rospy.logerr(
                 "Intersection %s path has no course raster-cell geometry",
@@ -1516,22 +2018,25 @@ class IntersectionMissionController:
         # Preserve each native texture pixel as its exact rectangular cell.
         # A circumscribed point radius incorrectly grows the middle of every
         # cell edge and can close a physically usable narrow corridor.
-        boundary = RasterCellBoundary(
-            self.course_boundary_points,
-            cell_size=self.course_boundary_cell_size,
-        )
-        if self.active_tracking_from_map is not None:
-            boundary = boundary.transformed(
-                RigidTransform2D(
-                    *self.active_tracking_from_map,
-                    source_frame=self.map_frame,
-                    target_frame=self.odom_frame,
-                )
+        if self.course_boundary_local is None:
+            rospy.logerr(
+                "Intersection %s path has no mission-local paint boundary",
+                stage,
             )
+            return False
+        boundary = self.course_boundary_local.transformed(
+            self.active_tracking_from_local
+        )
+        registration_uncertainty = self._registration_uncertainties(points)
         safety = PathSafety(
             line_boundaries=(boundary,),
             map_boundaries=(map_boundary,),
-            margins=self.path_safety_margins,
+            margins=SafetyMargins(
+                line=self.path_safety_margins.line,
+                obstacle=self.path_safety_margins.obstacle,
+                localization=self.path_safety_margins.localization,
+                tracking=self.path_safety_margins.tracking,
+            ),
         )
         minimum_velocity = min(
             max(0.005, self.active_path_min_velocity),
@@ -1585,6 +2090,7 @@ class IntersectionMissionController:
             direction=1,
             initial_line_overlap_allowance=initial_line_overlap_allowance,
             line_egress_distance=line_egress_distance,
+            localization_uncertainty=registration_uncertainty,
             final_heading=goal_yaw,
             goal_tolerance=GoalTolerance(
                 self.active_path_goal_tolerance,
@@ -1638,11 +2144,19 @@ class IntersectionMissionController:
                 validation.minimum_map_clearance,
             )
             return False
+        validation_pose = (
+            Pose2D(*self._tracking_pose())
+            if validation_start_pose is None
+            else Pose2D.from_value(validation_start_pose)
+        )
         start_validation = self.path_validator.validate_poses(
-            [Pose2D(*self._tracking_pose())],
+            [validation_pose],
             safety,
             line_overlap_allowances=[
                 float(executable.line_overlap_allowance[0])
+            ],
+            localization_uncertainties=[
+                float(executable.localization_uncertainty[0])
             ],
         )
         if not start_validation.safe:
@@ -1692,7 +2206,7 @@ class IntersectionMissionController:
         )
         self.path = executable
         self.path_follower = PathFollower(follower_config)
-        tracking_pose = Pose2D(*self._tracking_pose())
+        tracking_pose = validation_pose
         now = rospy.Time.now()
         if stage == "entry":
             # PREPARE_ENTRY_PATH has already established a mission-owned zero
@@ -1724,7 +2238,7 @@ class IntersectionMissionController:
         self.path_goal_yaw = goal_yaw
         self.path_exit_yaw = exit_yaw
         self.active_path_stage = stage
-        self.path_started = now
+        self.path_started = now if begin_tracking else None
         self.path_max_commanded_angular = 0.0
         self.last_path_command_time = None
         self.path_tick_pose = None
@@ -1733,114 +2247,75 @@ class IntersectionMissionController:
         self._publish_path_diagnostics()
         return True
 
-    def _generate_map_entry_path(self):
-        """Select one surveyed map entry and freeze it in the tracking frame."""
+    def _generate_entry_path(self, synchronized_start_pose):
+        """Build and fully validate the selected entrance from one local pose."""
         if self.direction not in (self.LEFT, self.RIGHT):
             rospy.logerr("Intersection entry has no valid selected direction")
             return False
-        if not self._localized_map_pose_is_fresh():
-            rospy.logerr(
-                "No fresh AMCL pose has arrived on %s",
-                self.mission_map_pose_topic,
-            )
-            return False
-        tracking_from_map = self._lookup_tracking_from_map()
-        if tracking_from_map is None:
-            return False
-        snap_distance = math.hypot(
-            self.map_entry_start[0] - self.localized_map_x,
-            self.map_entry_start[1] - self.localized_map_y,
-        )
-        if snap_distance > self.map_snap_max_distance:
-            rospy.logerr(
-                "Localized pose is %.3f m from the map entry (limit %.3f m)",
-                snap_distance,
-                self.map_snap_max_distance,
-            )
+        if self.local_to_odom is None:
+            rospy.logerr("Intersection entry has no local->odom registration")
             return False
 
         if self.direction == self.LEFT:
-            goal = self.map_left_entry_goal
-            goal_map_yaw = self.map_left_arc_entry_yaw
+            goal = self.local_left_entry_goal
+            goal_local_yaw = self.local_left_arc_entry_yaw
         else:
-            goal = self.map_right_entry_goal
-            goal_map_yaw = self.map_right_arc_entry_yaw
+            goal = self.local_right_entry_goal
+            goal_local_yaw = self.local_right_arc_entry_yaw
         self._prepare_active_entry_parameters()
-        tracking_start = Pose2D(*self._tracking_pose())
-        tracking_entry = self._map_to_tracking_point(
-            self.map_entry_start, tracking_from_map
+        tracking_start = Pose2D.from_value(synchronized_start_pose)
+        tracking_goal = self._local_to_tracking_point(goal, self.local_to_odom)
+        goal_yaw = self._local_to_tracking_yaw(
+            goal_local_yaw, self.local_to_odom
         )
-        entry_yaw = self._map_to_tracking_yaw(
-            self.map_entry_start_yaw, tracking_from_map
-        )
-        tracking_goal = self._map_to_tracking_point(goal, tracking_from_map)
-        goal_yaw = self._map_to_tracking_yaw(
-            goal_map_yaw, tracking_from_map
-        )
-        alignment_chord = math.hypot(
-            tracking_entry[0] - tracking_start.x,
-            tracking_entry[1] - tracking_start.y,
-        )
-        alignment_tangent = max(
-            0.005,
-            self.entry_alignment_tangent_ratio * alignment_chord,
-        )
-        alignment = self._cubic_path(
-            (tracking_start.x, tracking_start.y),
-            tracking_start.yaw,
-            tracking_entry,
-            entry_yaw,
-            alignment_tangent,
-            alignment_tangent,
-            self.entry_alignment_samples,
-        )
-        branch_chord = math.hypot(
-            tracking_goal[0] - tracking_entry[0],
-            tracking_goal[1] - tracking_entry[1],
+        route_chord = math.hypot(
+            tracking_goal[0] - tracking_start.x,
+            tracking_goal[1] - tracking_start.y,
         )
         start_tangent = max(
             0.005,
-            self.entry_start_tangent_ratio * branch_chord,
+            self.entry_start_tangent_ratio * route_chord,
         )
         end_tangent = max(
             0.005,
-            self.entry_end_tangent_ratio * branch_chord,
+            self.entry_end_tangent_ratio * route_chord,
         )
-        branch = self._cubic_path(
-            tracking_entry,
-            entry_yaw,
+        route = self._cubic_path(
+            (tracking_start.x, tracking_start.y),
+            tracking_start.yaw,
             tracking_goal,
             goal_yaw,
             start_tangent,
             end_tangent,
-            self.map_entry_samples,
+            self.entry_samples,
         )
-        route = alignment[:-1] + branch
         self.entry_elapsed = math.nan
         self.entry_goal_error = math.nan
         self.entry_yaw_error = math.nan
-        self.active_tracking_from_map = tracking_from_map
-        if not self._activate_path(route, goal_yaw, goal_yaw, "entry"):
+        self.active_tracking_from_local = self.local_to_odom
+        if not self._activate_path(
+            route,
+            goal_yaw,
+            goal_yaw,
+            "entry",
+            validation_start_pose=tracking_start,
+            begin_tracking=False,
+        ):
             return False
         direction = "LEFT" if self.direction == self.LEFT else "RIGHT"
         rospy.loginfo(
-            "Selected aligned %s arc-entry path; "
+            "Selected source-stamped local %s arc-entry path; "
             "start=(%.3f, %.3f, %.1fdeg), "
-            "alignment=(%.3f, %.3f, %.1fdeg), "
             "endpoint=(%.3f, %.3f, %.1fdeg), "
-            "tangents=(%.3f, %.3f, %.3f)m, "
+            "tangents=(%.3f, %.3f)m, "
             "length=%.3fm speed=%.3fm/s",
             direction,
             route[0][0],
             route[0][1],
             math.degrees(tracking_start.yaw),
-            tracking_entry[0],
-            tracking_entry[1],
-            math.degrees(entry_yaw),
             route[-1][0],
             route[-1][1],
             math.degrees(goal_yaw),
-            alignment_tangent,
             start_tangent,
             end_tangent,
             self._polyline_length(route),
@@ -1849,57 +2324,43 @@ class IntersectionMissionController:
         return True
 
     def _generate_exit_path(self):
-        """Freeze the selected branch plus shared exit in the tracking frame.
-
-        Return True on success, False for a deterministic unsafe path, and
-        None when fresh localization/TF data may still arrive before the
-        PREPARE_EXIT_PATH timeout.
-        """
+        """Build the exit with the same frozen local transform as the entry."""
         self._prepare_active_exit_parameters()
-        if not self._localized_map_pose_is_fresh():
-            rospy.logwarn_throttle(
-                0.5,
-                "Waiting for a fresh AMCL map pose for the shared exit path",
-            )
-            return None
-        # This is a new executable path, so align it once from the latest AMCL
-        # map->odom relation after the camera semicircle, then freeze it for
-        # the complete branch and shared exit. Reusing the entry snapshot here
-        # carries dead-reckoning drift accumulated while vision owns cmd_vel
-        # into the branch start.
-        tracking_from_map = self._lookup_tracking_from_map()
-        if tracking_from_map is None:
-            return None
+        if self.local_to_odom is None:
+            rospy.logerr("Shared exit has no frozen local->odom registration")
+            return False
         branch_control_points = self._selected_exit_control_points()
         branch_route = self._bezier_path(
-            branch_control_points, self.map_exit_branch_samples
+            branch_control_points, self.exit_branch_samples
         )
         shared_route = self._bezier_path(
-            self.map_exit_control_points, self.map_exit_samples
+            self.local_exit_control_points, self.exit_samples
         )
-        map_route = branch_route[:-1] + shared_route
-        map_common_path = path_from_xy(
-            map_route,
-            self.map_frame,
+        local_route = branch_route[:-1] + shared_route
+        local_common_path = path_from_xy(
+            local_route,
+            self.local_frame,
             target_speed=self.active_path_velocity,
         )
-        map_projection = project_to_path(
-            map_common_path,
-            self.localized_map_x,
-            self.localized_map_y,
+        tracking_pose = Pose2D(*self._tracking_pose())
+        local_pose = self.local_to_odom.inverse().apply_pose(tracking_pose)
+        local_projection = project_to_path(
+            local_common_path,
+            local_pose.x,
+            local_pose.y,
         )
-        snap_distance = map_projection.distance
-        if snap_distance > self.exit_map_snap_max_distance:
+        snap_distance = local_projection.distance
+        if snap_distance > self.exit_local_snap_max_distance:
             rospy.logerr(
-                "Localized pose is %.3f m from the selected map exit path "
+                "Odometry is %.3f m from the registered local exit path "
                 "(limit %.3f m)",
                 snap_distance,
-                self.exit_map_snap_max_distance,
+                self.exit_local_snap_max_distance,
             )
             return False
         fixed_branch_path = path_from_xy(
             branch_route,
-            self.map_frame,
+            self.local_frame,
             target_speed=self.active_path_velocity,
         )
         join_index = int(
@@ -1909,13 +2370,12 @@ class IntersectionMissionController:
             )
         )
         join_index = max(1, min(len(branch_route) - 2, join_index))
-        tracking_start = Pose2D(*self._tracking_pose())
-        tracking_join = self._map_to_tracking_point(
-            branch_route[join_index], tracking_from_map
+        tracking_start = tracking_pose
+        tracking_join = self._local_to_tracking_point(
+            branch_route[join_index], self.local_to_odom
         )
-        tracking_join_yaw = self._map_to_tracking_yaw(
-            float(fixed_branch_path.heading[join_index]),
-            tracking_from_map,
+        tracking_join_yaw = self._local_to_tracking_yaw(
+            float(fixed_branch_path.heading[join_index]), self.local_to_odom
         )
         connector_distance = math.hypot(
             tracking_join[0] - tracking_start.x,
@@ -1934,31 +2394,32 @@ class IntersectionMissionController:
             self.exit_adaptive_connector_samples,
         )
         downstream_branch = [
-            self._map_to_tracking_point(point, tracking_from_map)
+            self._local_to_tracking_point(point, self.local_to_odom)
             for point in branch_route[join_index:]
         ]
         downstream_shared = [
-            self._map_to_tracking_point(point, tracking_from_map)
+            self._local_to_tracking_point(point, self.local_to_odom)
             for point in shared_route
         ]
         route = connector[:-1] + downstream_branch[:-1] + downstream_shared
-        goal_yaw = self._map_to_tracking_yaw(
-            self.exit_goal_yaw, tracking_from_map
+        goal_yaw = self._local_to_tracking_yaw(
+            self.local_exit_goal_yaw, self.local_to_odom
         )
         rospy.loginfo(
-            "Shared exit alignment: AMCL gate pose=(%.3f, %.3f, %.1fdeg), "
+            "Shared exit uses frozen local registration: local_pose="
+            "(%.3f, %.3f, %.1fdeg), "
             "path_delta=%.3fm start_station=%.3fm",
-            self.localized_map_x,
-            self.localized_map_y,
-            math.degrees(self.localized_map_yaw),
+            local_pose.x,
+            local_pose.y,
+            math.degrees(local_pose.yaw),
             snap_distance,
-            map_projection.station,
+            local_projection.station,
         )
 
         self.exit_path_elapsed = math.nan
         self.exit_path_goal_error = math.nan
         self.exit_path_yaw_error = math.nan
-        self.active_tracking_from_map = tracking_from_map
+        self.active_tracking_from_local = self.local_to_odom
         if not self._activate_path(route, goal_yaw, goal_yaw, "exit"):
             return False
         rospy.loginfo(
@@ -1971,9 +2432,9 @@ class IntersectionMissionController:
             tracking_start.y,
             math.degrees(tracking_start.yaw),
             float(fixed_branch_path.station[join_index]),
-            self.map_exit_control_points[-1][0],
-            self.map_exit_control_points[-1][1],
-            math.degrees(self.exit_goal_yaw),
+            self.local_exit_control_points[-1][0],
+            self.local_exit_control_points[-1][1],
+            math.degrees(self.local_exit_goal_yaw),
             self._polyline_length(route),
             self.active_path_velocity,
         )
@@ -1981,31 +2442,38 @@ class IntersectionMissionController:
 
     def _selected_exit_control_points(self):
         if self.direction == self.LEFT:
-            return self.map_left_exit_control_points
+            return self.local_left_exit_control_points
         if self.direction == self.RIGHT:
-            return self.map_right_exit_control_points
+            return self.local_right_exit_control_points
         raise ValueError("intersection exit branch requested before selection")
 
-    def _selected_exit_map_projection(self):
-        """Project the live AMCL pose onto the selected fixed exit branch."""
+    def _selected_exit_local_projection(self):
+        """Project odometry onto the frozen local branch in odom."""
+        if self.local_to_odom is None:
+            raise ValueError("intersection exit projection has no registration")
         cache = getattr(self, "_exit_branch_path_cache", {})
-        branch_path = cache.get(self.direction)
+        cache_key = (self.direction, self.arm_seq)
+        branch_path = cache.get(cache_key)
         if branch_path is None:
-            branch_route = self._bezier_path(
+            local_branch_route = self._bezier_path(
                 self._selected_exit_control_points(),
-                self.map_exit_branch_samples,
+                self.exit_branch_samples,
             )
+            branch_route = [
+                self.local_to_odom.apply_point(point)
+                for point in local_branch_route
+            ]
             branch_path = path_from_xy(
                 branch_route,
-                self.map_frame,
+                self.odom_frame,
                 target_speed=max(0.005, self.exit_path_velocity),
             )
-            cache[self.direction] = branch_path
+            cache[cache_key] = branch_path
             self._exit_branch_path_cache = cache
         return project_to_path(
             branch_path,
-            self.localized_map_x,
-            self.localized_map_y,
+            self.x,
+            self.y,
         )
 
     @staticmethod
@@ -2017,7 +2485,7 @@ class IntersectionMissionController:
 
     def _inflate_course_boundaries(self, occupied, inflation):
         """Inflate paint by Euclidean distance instead of a square kernel."""
-        radius = max(0.0, float(inflation)) / self.map_resolution
+        radius = max(0.0, float(inflation)) / self.course_resolution
         cells = int(math.ceil(radius))
         if cells <= 0:
             return occupied.copy()
@@ -2057,9 +2525,9 @@ class IntersectionMissionController:
     def _publish_course_map(self):
         """Publish colour lane boundaries as an RViz OccupancyGrid."""
         try:
-            package_path = rospkg.RosPack().get_path(self.map_texture_package)
+            package_path = rospkg.RosPack().get_path(self.course_texture_package)
             texture_path = os.path.join(
-                package_path, self.map_texture_relative_path
+                package_path, self.course_texture_relative_path
             )
             texture = cv2.imread(texture_path, cv2.IMREAD_COLOR)
             if texture is None:
@@ -2086,13 +2554,13 @@ class IntersectionMissionController:
         native_occupied = native_white | native_yellow
         native_y, native_x = np.nonzero(native_occupied)
         texture_height, texture_width = texture.shape[:2]
-        native_cell_width = self.map_world_size / float(texture_width)
-        native_cell_height = self.map_world_size / float(texture_height)
+        native_cell_width = self.course_world_size / float(texture_width)
+        native_cell_height = self.course_world_size / float(texture_height)
         self.course_boundary_points = np.column_stack(
             (
-                0.5 * self.map_world_size
+                0.5 * self.course_world_size
                 - (native_x.astype(np.float64) + 0.5) * native_cell_width,
-                -0.5 * self.map_world_size
+                -0.5 * self.course_world_size
                 + (native_y.astype(np.float64) + 0.5) * native_cell_height,
             )
         )
@@ -2100,26 +2568,39 @@ class IntersectionMissionController:
             native_cell_width,
             native_cell_height,
         )
+        raw_boundary = RasterCellBoundary(
+            self.course_boundary_points,
+            cell_size=self.course_boundary_cell_size,
+        )
+        self.course_boundary_local = raw_boundary.transformed(
+            self.local_from_texture
+        )
+        self.course_bounds_local = AxisAlignedBoundsBoundary(
+            -0.5 * self.course_world_size,
+            0.5 * self.course_world_size,
+            -0.5 * self.course_world_size,
+            0.5 * self.course_world_size,
+        ).transformed(self.local_from_texture)
 
-        width = max(1, int(round(self.map_world_size / self.map_resolution)))
+        width = max(1, int(round(self.course_world_size / self.course_resolution)))
         height = width
         # Gazebo rotates the square course model by pi. For each ROS grid cell
         # (world x/y increasing), sample the corresponding texture pixel.
-        grid_x = -0.5 * self.map_world_size + (
+        grid_x = -0.5 * self.course_world_size + (
             np.arange(width, dtype=np.float32) + 0.5
-        ) * self.map_resolution
-        grid_y = -0.5 * self.map_world_size + (
+        ) * self.course_resolution
+        grid_y = -0.5 * self.course_world_size + (
             np.arange(height, dtype=np.float32) + 0.5
-        ) * self.map_resolution
+        ) * self.course_resolution
         world_x, world_y = np.meshgrid(grid_x, grid_y)
         image_u = np.clip(
-            ((0.5 * self.map_world_size - world_x) / self.map_world_size)
+            ((0.5 * self.course_world_size - world_x) / self.course_world_size)
             * texture.shape[1],
             0,
             texture.shape[1] - 1,
         ).astype(np.int32)
         image_v = np.clip(
-            ((0.5 * self.map_world_size + world_y) / self.map_world_size)
+            ((0.5 * self.course_world_size + world_y) / self.course_world_size)
             * texture.shape[0],
             0,
             texture.shape[0] - 1,
@@ -2131,18 +2612,18 @@ class IntersectionMissionController:
         raw_occupied = (white | yellow).astype(np.uint8)
         self.course_raw_occupied = raw_occupied
         occupied = self._inflate_course_boundaries(
-            raw_occupied, self.map_boundary_inflation
+            raw_occupied, self.course_boundary_inflation
         )
         self.course_occupied = occupied
 
         message = OccupancyGrid()
         message.header.stamp = rospy.Time.now()
-        message.header.frame_id = self.map_frame
-        message.info.resolution = self.map_resolution
+        message.header.frame_id = self.diagnostic_map_frame
+        message.info.resolution = self.course_resolution
         message.info.width = width
         message.info.height = height
-        message.info.origin.position.x = -0.5 * self.map_world_size
-        message.info.origin.position.y = -0.5 * self.map_world_size
+        message.info.origin.position.x = -0.5 * self.course_world_size
+        message.info.origin.position.y = -0.5 * self.course_world_size
         message.info.origin.orientation.w = 1.0
         message.data = (occupied.reshape(-1) * 100).astype(np.int8).tolist()
         self.course_map_pub.publish(message)
@@ -2180,10 +2661,10 @@ class IntersectionMissionController:
             tracking.path_index,
             tracking.target_speed,
             tracking.direction * measured_speed,
-            (
+            self.path_follower.stopping_angular_velocities(
+                tracking,
+                tracking.direction * measured_speed,
                 self.odom_angular_velocity,
-                self.path_follower.last_angular,
-                tracking.angular_velocity,
             ),
             self.safety_reaction_time,
             self.path_linear_deceleration,

@@ -19,7 +19,10 @@ if str(NODE_DIR) not in sys.path:
 
 import intersection_mission_controller as controller_module
 from intersection_mission_controller import IntersectionMissionController
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Header
+from custom_autorace_bringup.local_registration import (
+    registration_radial_uncertainties,
+)
 from custom_autorace_bringup.path_following import (
     AsymmetricFootprint,
     AxisAlignedBoundsBoundary,
@@ -43,6 +46,87 @@ class RecordingPublisher:
 
     def publish(self, message):
         self.messages.append(message)
+
+
+def load_mission_config():
+    """Load local production geometry plus test-only survey projections.
+
+    Historical trajectory regressions below are intentionally kept in their
+    recorded course coordinates. These derived aliases never enter production
+    configuration or controller code.
+    """
+    with (CONFIG_DIR / "intersection_mission.yaml").open(
+        "r", encoding="utf-8"
+    ) as stream:
+        mission = yaml.safe_load(stream)["mission"]
+    result = dict(mission)
+    calibration = mission["course_texture_to_local"]
+    local_from_survey = RigidTransform2D(
+        float(calibration[0]),
+        float(calibration[1]),
+        math.radians(float(calibration[2])),
+        source_frame="course_texture",
+        target_frame=mission["registration"]["local_frame"],
+    )
+    survey_from_local = local_from_survey.inverse()
+
+    def survey_point(point):
+        return list(survey_from_local.apply_point(point))
+
+    def survey_yaw(degrees):
+        return math.degrees(
+            survey_from_local.apply_pose(
+                Pose2D(0.0, 0.0, math.radians(float(degrees)))
+            ).yaw
+        )
+
+    result.update(
+        {
+            "map_frame": mission["diagnostic_map_frame"],
+            "map_world_size": mission["course_world_size"],
+            "map_resolution": mission["course_resolution"],
+            "map_boundary_inflation": mission["course_boundary_inflation"],
+            "map_texture_package": mission["course_texture_package"],
+            "map_texture_relative_path": mission[
+                "course_texture_relative_path"
+            ],
+            "map_entry_start": survey_point(mission["local_entry_start"]),
+            "map_entry_start_yaw_deg": survey_yaw(
+                mission["local_entry_start_yaw_deg"]
+            ),
+            "map_left_entry_goal": survey_point(
+                mission["local_left_entry_goal"]
+            ),
+            "map_right_entry_goal": survey_point(
+                mission["local_right_entry_goal"]
+            ),
+            "map_left_arc_entry_yaw_deg": survey_yaw(
+                mission["local_left_arc_entry_yaw_deg"]
+            ),
+            "map_right_arc_entry_yaw_deg": survey_yaw(
+                mission["local_right_arc_entry_yaw_deg"]
+            ),
+            "map_entry_samples": mission["entry_samples"],
+            "map_left_exit_control_points": [
+                survey_point(point)
+                for point in mission["local_left_exit_control_points"]
+            ],
+            "map_right_exit_control_points": [
+                survey_point(point)
+                for point in mission["local_right_exit_control_points"]
+            ],
+            "map_exit_branch_samples": mission["exit_branch_samples"],
+            "map_exit_control_points": [
+                survey_point(point)
+                for point in mission["local_exit_control_points"]
+            ],
+            "map_exit_samples": mission["exit_samples"],
+            "exit_goal_yaw_deg": survey_yaw(
+                mission["local_exit_goal_yaw_deg"]
+            ),
+        }
+    )
+    return result
 
 
 class IntersectionControllerTest(unittest.TestCase):
@@ -69,26 +153,36 @@ class IntersectionControllerTest(unittest.TestCase):
         self.seconds += seconds
 
     def make_course_map_harness(self):
-        with (CONFIG_DIR / "intersection_mission.yaml").open(
-            "r", encoding="utf-8"
-        ) as stream:
-            mission = yaml.safe_load(stream)["mission"]
+        mission = load_mission_config()
 
         controller = IntersectionMissionController.__new__(
             IntersectionMissionController
         )
-        controller.map_world_size = float(mission["map_world_size"])
-        controller.map_resolution = float(mission["map_resolution"])
-        controller.map_boundary_inflation = float(
-            mission["map_boundary_inflation"]
+        controller.course_world_size = float(mission["course_world_size"])
+        controller.course_resolution = float(mission["course_resolution"])
+        controller.course_boundary_inflation = float(
+            mission["course_boundary_inflation"]
         )
-        controller.map_texture_package = str(mission["map_texture_package"])
-        controller.map_texture_relative_path = str(
-            mission["map_texture_relative_path"]
+        controller.course_texture_package = str(
+            mission["course_texture_package"]
         )
-        controller.map_frame = str(mission["map_frame"])
+        controller.course_texture_relative_path = str(
+            mission["course_texture_relative_path"]
+        )
+        controller.diagnostic_map_frame = str(mission["diagnostic_map_frame"])
+        controller.local_frame = str(mission["registration"]["local_frame"])
+        calibration = mission["course_texture_to_local"]
+        controller.local_from_texture = RigidTransform2D(
+            float(calibration[0]),
+            float(calibration[1]),
+            math.radians(float(calibration[2])),
+            source_frame="course_texture",
+            target_frame=controller.local_frame,
+        )
         controller.course_occupied = None
         controller.course_raw_occupied = None
+        controller.course_boundary_local = None
+        controller.course_bounds_local = None
         controller.course_map_pub = RecordingPublisher()
 
         gazebo_package = (
@@ -131,27 +225,26 @@ class IntersectionControllerTest(unittest.TestCase):
 
     @classmethod
     def aligned_entry_path(cls, mission, direction, start):
-        """Build the production live-pose alignment plus selected branch."""
-        entry = mission["map_entry_start"]
-        entry_yaw = math.radians(float(mission["map_entry_start_yaw_deg"]))
-        alignment_chord = math.hypot(
-            float(entry[0]) - float(start[0]),
-            float(entry[1]) - float(start[1]),
+        """Build the production one-cubic path from a live handoff pose."""
+        goal = mission[
+            "map_%s_entry_goal" % direction.lower()
+        ]
+        goal_yaw = math.radians(
+            float(mission["map_%s_arc_entry_yaw_deg" % direction.lower()])
         )
-        alignment_tangent = (
-            float(mission["entry_alignment_tangent_ratio"])
-            * alignment_chord
+        chord = math.hypot(
+            float(goal[0]) - float(start[0]),
+            float(goal[1]) - float(start[1]),
         )
-        alignment = IntersectionMissionController._cubic_path(
+        return IntersectionMissionController._cubic_path(
             start[:2],
             float(start[2]),
-            entry,
-            entry_yaw,
-            alignment_tangent,
-            alignment_tangent,
-            int(mission["entry_alignment_samples"]),
+            goal,
+            goal_yaw,
+            float(mission["entry_start_tangent_ratio"]) * chord,
+            float(mission["entry_end_tangent_ratio"]) * chord,
+            int(mission["map_entry_samples"]),
         )
-        return alignment[:-1] + cls.selected_entry_path(mission, direction)
 
     @staticmethod
     def common_exit_path(mission):
@@ -182,7 +275,7 @@ class IntersectionControllerTest(unittest.TestCase):
             tuple(float(component) for component in point)
             for point in mission["map_right_exit_control_points"]
         )
-        controller.map_exit_branch_samples = int(
+        controller.exit_branch_samples = int(
             mission["map_exit_branch_samples"]
         )
         controller.exit_adaptive_join_ratio = float(
@@ -194,9 +287,9 @@ class IntersectionControllerTest(unittest.TestCase):
         controller.exit_adaptive_connector_samples = int(
             mission["exit_adaptive_connector_samples"]
         )
-        controller.map_exit_samples = int(mission["map_exit_samples"])
-        controller.exit_map_snap_max_distance = float(
-            mission["exit_map_snap_max_distance"]
+        controller.exit_samples = int(mission["map_exit_samples"])
+        controller.exit_local_snap_max_distance = float(
+            mission["exit_local_snap_max_distance"]
         )
         controller.exit_goal_yaw = math.radians(
             float(mission["exit_goal_yaw_deg"])
@@ -204,6 +297,16 @@ class IntersectionControllerTest(unittest.TestCase):
         controller.localized_map_x = pose[0]
         controller.localized_map_y = pose[1]
         controller.localized_map_yaw = math.radians(pose[2])
+        controller.local_frame = "intersection_local"
+        controller.odom_frame = "odom"
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, controller.local_frame, controller.odom_frame
+        )
+        controller.active_tracking_from_local = controller.local_to_odom
+        controller.local_left_exit_control_points = controller.map_left_exit_control_points
+        controller.local_right_exit_control_points = controller.map_right_exit_control_points
+        controller.local_exit_control_points = controller.map_exit_control_points
+        controller.local_exit_goal_yaw = controller.exit_goal_yaw
         controller.active_path_velocity = float(
             mission["exit_path_linear_velocity"]
         )
@@ -213,8 +316,6 @@ class IntersectionControllerTest(unittest.TestCase):
             pose[1],
             math.radians(pose[2]),
         )
-        controller._localized_map_pose_is_fresh = lambda: True
-        controller._lookup_tracking_from_map = lambda: (0.0, 0.0, 0.0)
         controller._activate_path = mock.Mock()
 
     def make_transition_harness(self, direction):
@@ -236,11 +337,17 @@ class IntersectionControllerTest(unittest.TestCase):
         controller.direction_count = 0
         controller.last_direction_confirmation_time = None
         controller.direction_search_timeout = 35.0
-        controller.entry_handoff_timeout = 5.0
+        controller.ready_gate_timeout = 5.0
         controller.entry_takeover_pose_timeout = 0.75
-        controller.entry_handoff_lead_distance = 0.200
         controller.yaw = 0.0
         controller.mission_has_control = False
+        controller.zone_gate_open = False
+        controller.arm_seq = 17
+        controller.ready_published_seq = 17
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "intersection_local", "odom"
+        )
+        controller.active_path_stage = "entry"
 
         controller.total_distance = 0.0
         controller.odom_sequence = 10
@@ -274,8 +381,12 @@ class IntersectionControllerTest(unittest.TestCase):
             (0.7622, -0.4647),
             (0.6000, -0.7500),
         )
-        controller.map_exit_branch_samples = 20
-        controller.map_frame = "map"
+        controller.exit_branch_samples = 20
+        controller.local_frame = "intersection_local"
+        controller.odom_frame = "odom"
+        controller.local_left_exit_control_points = controller.map_left_exit_control_points
+        controller.local_right_exit_control_points = controller.map_right_exit_control_points
+        controller.local_exit_control_points = controller.map_exit_control_points
         controller.exit_path_velocity = 0.10
         controller.map_entry_start = (1.395, -0.750)
         controller.map_entry_start_yaw = math.pi
@@ -311,7 +422,8 @@ class IntersectionControllerTest(unittest.TestCase):
 
         controller._set_state = set_state
         controller._set_lane_controller = set_lane_controller
-        controller._generate_map_entry_path = mock.Mock(return_value=True)
+        controller._generate_entry_path = mock.Mock(return_value=True)
+        controller._start_prepared_entry_path = mock.Mock(return_value=True)
         controller._generate_exit_path = mock.Mock(return_value=True)
         controller._path_goal_reached = mock.Mock(return_value=True)
         controller._tracking_pose = lambda: (
@@ -319,17 +431,21 @@ class IntersectionControllerTest(unittest.TestCase):
             0.0,
             controller.path_exit_yaw,
         )
-        controller._zone_signal_is_fresh = lambda *_args, **_kwargs: True
-        controller._localized_map_pose_is_fresh = lambda: True
+        controller._selected_exit_local_projection = lambda: SimpleNamespace(
+            distance=math.hypot(
+                controller.localized_map_x
+                - controller._selected_exit_control_points()[0][0],
+                controller.localized_map_y
+                - controller._selected_exit_control_points()[0][1],
+            ),
+            station=0.0,
+        )
         controller._final_lane_observation_valid = lambda _now: True
 
         return controller
 
     def make_direction_harness(self, state):
-        with (CONFIG_DIR / "intersection_mission.yaml").open(
-            "r", encoding="utf-8"
-        ) as stream:
-            mission = yaml.safe_load(stream)["mission"]
+        mission = load_mission_config()
 
         controller = IntersectionMissionController.__new__(
             IntersectionMissionController
@@ -344,6 +460,45 @@ class IntersectionControllerTest(unittest.TestCase):
         controller.shutting_down = False
         controller.mission_has_control = False
         controller.zone_gate_open = False
+        controller.arm_seq = 41 if state == controller.SEARCH_DIRECTION else None
+        controller.arm_stamp = self.now() if controller.arm_seq is not None else None
+        controller.ready_published_seq = None
+        controller.pending_direction_confirmation = None
+        controller.registration_source_max_age = 1.0
+        controller.registration_future_tolerance = 0.05
+        controller.registration_pose_stamp_tolerance = 0.06
+        controller.registration_entry_lead_min = float(
+            mission["registration"]["entry_lead_min"]
+        )
+        controller.registration_entry_lead_max = float(
+            mission["registration"]["entry_lead_max"]
+        )
+        controller.registration_entry_lateral_max = float(
+            mission["registration"]["entry_lateral_max"]
+        )
+        controller.registration_entry_heading_max = math.radians(
+            float(mission["registration"]["entry_heading_max_deg"])
+        )
+        controller.local_entry_start = tuple(mission["local_entry_start"])
+        controller.local_entry_start_yaw = math.radians(
+            float(mission["local_entry_start_yaw_deg"])
+        )
+        controller.registration_systematic_position_sigma = float(
+            mission["registration"]["systematic_position_error"]
+        )
+        controller.registration_systematic_heading_sigma = math.radians(
+            float(mission["registration"]["systematic_heading_error_deg"])
+        )
+        controller.local_frame = "intersection_local"
+        controller.odom_frame = "odom"
+        controller.local_to_odom = None
+        controller.active_path_stage = ""
+        controller.registration_source_stamp = None
+        controller.active_tracking_from_local = None
+        controller.path = None
+        controller.path_follower = None
+        controller.registration_covariance = tuple()
+        controller._exit_branch_path_cache = {}
         controller.direction = controller.direction_candidate = controller.NONE
         controller.direction_count = 0
         controller.last_direction_confirmation_time = None
@@ -376,11 +531,41 @@ class IntersectionControllerTest(unittest.TestCase):
         controller.camera_width = 640
         controller.camera_height = 480
         controller.direction_pub = RecordingPublisher()
-        controller._direction_observation_region_ready = mock.Mock(
-            return_value=True
-        )
+        controller.ready_pub = RecordingPublisher()
+        controller.mission_name = "intersection"
         controller._set_lane_controller = mock.Mock()
         controller._fail = mock.Mock()
+        controller._synchronized_odom_pose = mock.Mock(
+            return_value=Pose2D(1.0, -0.4, math.pi)
+        )
+        registered = RigidTransform2D(
+            0.9,
+            -0.4,
+            math.pi,
+            source_frame="intersection_local",
+            target_frame="odom",
+        )
+        controller._direction_registration_result = mock.Mock(
+            return_value=(
+                SimpleNamespace(accepted=True, transform=registered),
+                Pose2D(1.0, -0.4, math.pi),
+            )
+        )
+        controller.registration_filter = SimpleNamespace(
+            config=SimpleNamespace(
+                maximum_position_delta=0.04,
+                maximum_heading_delta=math.radians(4.0),
+            ),
+            reset=mock.Mock(),
+            update=mock.Mock(
+                return_value=SimpleNamespace(
+                    confirmed=True,
+                    transform=registered,
+                    covariance=tuple(),
+                )
+            ),
+        )
+        controller._generate_entry_path = mock.Mock(return_value=True)
 
         def set_state(next_state):
             controller.state = next_state
@@ -401,6 +586,14 @@ class IntersectionControllerTest(unittest.TestCase):
         message.roi.height = 100
         return message
 
+    def arm_direction_harness(self, controller, sequence=41):
+        message = Header()
+        message.seq = sequence
+        message.stamp = self.now()
+        message.frame_id = "intersection"
+        controller.arm_callback(message)
+        return message
+
     def direction_frame_period(self, controller):
         return (
             self.DIRECTION_EVIDENCE_WINDOW_SECONDS
@@ -412,6 +605,7 @@ class IntersectionControllerTest(unittest.TestCase):
             controller.direction_confirm_frames if count is None else int(count)
         )
         for _ in range(observations):
+            message.header.stamp = self.now()
             controller.sign_callback(message)
             self.advance(self.direction_frame_period(controller))
 
@@ -663,79 +857,35 @@ class IntersectionControllerTest(unittest.TestCase):
                 float(mission["safety"]["sweep_angle_step_deg"])
             ),
         )
-        # Every current handoff starts upstream of the measured entrance
-        # centre.  Exercise ideal, run-2 and run-3 callback timings for both
-        # selected branches through the same alignment-plus-branch builder.
+        # The adaptive selector waits until the robot reaches the measured
+        # local entry envelope, then creates one curvature-continuous cubic
+        # from that live pose. Exercise its nominal pose and the latest
+        # official-start source-stamped handoff for both directions.
+        survey_from_local = controller.local_from_texture.inverse()
+
+        def map_pose(local_pose):
+            return survey_from_local.apply_pose(Pose2D(*local_pose))
+
         starts = {
-            "left_camera_visible": (
+            "left_nominal": (
                 "left",
-                Pose2D(1.595, -0.750, math.pi),
+                map_pose((-0.100, 0.000, 0.0)),
             ),
-            "right_camera_visible": (
+            "right_nominal": (
                 "right",
-                Pose2D(1.595, -0.750, math.pi),
+                map_pose((-0.100, 0.000, 0.0)),
             ),
-            # Exact map-frame pose used to generate the run-2 RIGHT connector.
-            # The former 0.25 end tangent failed its full rectangular sweep at
-            # station 0.20116 m with -3.4886 mm line clearance.
-            "right_official_run2": (
-                "right",
-                Pose2D(
-                    1.576927153,
-                    -0.762103593,
-                    math.radians(164.122748),
-                ),
-            ),
-            # Earliest map pose received after the same ownership handoff.
-            # Keeping this end of the observed callback-timing envelope safe
-            # prevents the generated path from depending on timer ordering.
-            "right_official_run2_first_post_handoff": (
-                "right",
-                Pose2D(
-                    1.587471286,
-                    -0.765793892,
-                    math.radians(161.435489),
-                ),
-            ),
-            "left_official_run2": (
+            "left_latest_official": (
                 "left",
-                Pose2D(
-                    1.576927153,
-                    -0.762103593,
-                    math.radians(164.122748),
-                ),
+                map_pose((-0.105914, -0.012740, math.radians(-7.9))),
             ),
-            "left_official_run3": (
+            "left_camera_loss_handoff": (
                 "left",
-                Pose2D(
-                    1.571426921,
-                    -0.749866698,
-                    math.radians(161.102214),
-                ),
+                map_pose((-0.140, 0.012, math.radians(-8.0))),
             ),
-            "left_official_run3_first_post_handoff": (
-                "left",
-                Pose2D(
-                    1.584243874,
-                    -0.753903779,
-                    math.radians(162.530415),
-                ),
-            ),
-            "right_official_run3": (
+            "right_latest_official_pose": (
                 "right",
-                Pose2D(
-                    1.571426921,
-                    -0.749866698,
-                    math.radians(161.102214),
-                ),
-            ),
-            "right_official_run3_first_post_handoff": (
-                "right",
-                Pose2D(
-                    1.584243874,
-                    -0.753903779,
-                    math.radians(162.530415),
-                ),
+                map_pose((-0.105914, -0.012740, math.radians(-7.9))),
             ),
         }
         step = 0.02
@@ -862,7 +1012,11 @@ class IntersectionControllerTest(unittest.TestCase):
                 )
                 tracking = follower.calculate_tracking(pose)
                 initial = validator.validate_poses([pose], safety)
-                self.assertLess(initial.minimum_line_clearance, 0.0)
+                self.assertGreater(
+                    initial.minimum_line_clearance
+                    + float(path.line_overlap_allowance[0]),
+                    0.0,
+                )
                 first_safety = validator.motion_safety(
                     path,
                     pose,
@@ -963,10 +1117,7 @@ class IntersectionControllerTest(unittest.TestCase):
                 self.assertGreater(minimum_net_line_clearance, 0.0)
 
     def test_recorded_aligned_entries_keep_the_selected_turn_topology(self):
-        with (CONFIG_DIR / "intersection_mission.yaml").open(
-            "r", encoding="utf-8"
-        ) as stream:
-            mission = yaml.safe_load(stream)["mission"]
+        mission = load_mission_config()
 
         recorded = (
             (
@@ -1126,9 +1277,18 @@ class IntersectionControllerTest(unittest.TestCase):
         )
         controller.course_boundary_points = np.asarray([[1.5, 1.5]])
         controller.course_boundary_cell_size = 0.01
-        controller.map_world_size = 4.0
-        controller.map_frame = controller.odom_frame = "map"
-        controller.active_tracking_from_map = None
+        controller.local_frame = "intersection_local"
+        controller.odom_frame = "odom"
+        controller.active_tracking_from_local = RigidTransform2D(
+            0.0, 0.0, 0.0, controller.local_frame, controller.odom_frame
+        )
+        controller.course_boundary_local = RasterCellBoundary(
+            controller.course_boundary_points,
+            cell_size=controller.course_boundary_cell_size,
+        )
+        controller.course_bounds_local = AxisAlignedBoundsBoundary(
+            -2.0, 2.0, -2.0, 2.0
+        )
         controller.path_safety_margins = SafetyMargins()
         safe = SimpleNamespace(
             safe=True,
@@ -1239,10 +1399,10 @@ class IntersectionControllerTest(unittest.TestCase):
     def test_exit_handoff_projects_onto_branch_after_first_point(self):
         controller, mission, _ = self.make_course_map_harness()
         controller.direction = controller.RIGHT
-        controller.map_right_exit_control_points = tuple(
+        controller.local_right_exit_control_points = tuple(
             tuple(point) for point in mission["map_right_exit_control_points"]
         )
-        controller.map_exit_branch_samples = int(
+        controller.exit_branch_samples = int(
             mission["map_exit_branch_samples"]
         )
         controller.exit_path_velocity = float(
@@ -1250,18 +1410,24 @@ class IntersectionControllerTest(unittest.TestCase):
         )
         # Captured after the official-start RIGHT camera arc lost its last
         # lane frame. It is already beyond the branch's first stored point.
-        controller.localized_map_x = 0.7071549453
-        controller.localized_map_y = -0.5563684687
+        controller.x = 0.7071549453
+        controller.y = -0.5563684687
+        controller.odom_frame = "odom"
+        controller.local_frame = "intersection_local"
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, controller.local_frame, controller.odom_frame
+        )
+        controller.arm_seq = 9
 
-        first = controller.map_right_exit_control_points[0]
+        first = controller.local_right_exit_control_points[0]
         self.assertGreater(
             math.hypot(
-                controller.localized_map_x - first[0],
-                controller.localized_map_y - first[1],
+                controller.x - first[0],
+                controller.y - first[1],
             ),
             0.10,
         )
-        projection = controller._selected_exit_map_projection()
+        projection = controller._selected_exit_local_projection()
         self.assertLess(projection.distance, 0.04)
         self.assertGreater(projection.station, 0.09)
 
@@ -1691,6 +1857,215 @@ class IntersectionControllerTest(unittest.TestCase):
         self.assertTrue(downstream.safe)
         self.assertGreater(downstream.minimum_line_clearance, 0.0)
 
+    def test_source_stamped_right_exit_clears_measured_registration_covariance(self):
+        """The latest live exit and its full SE(2) uncertainty must be safe."""
+        controller, mission, _ = self.make_course_map_harness()
+        footprint_config = mission["footprint"]
+        footprint = AsymmetricFootprint(
+            float(footprint_config["front"]),
+            float(footprint_config["rear"]),
+            float(footprint_config["half_width"]),
+        )
+        pose = Pose2D(0.634, -0.324, math.radians(73.5))
+        branch = controller._bezier_path(
+            mission["local_right_exit_control_points"],
+            int(mission["exit_branch_samples"]),
+        )
+        branch_path = controller_module.path_from_xy(branch, "intersection_local")
+        join_index = int(
+            round(
+                float(mission["exit_adaptive_join_ratio"])
+                * float(len(branch) - 1)
+            )
+        )
+        join = branch[join_index]
+        chord = math.hypot(join[0] - pose.x, join[1] - pose.y)
+        tangent = float(mission["exit_adaptive_tangent_ratio"]) * chord
+        connector = controller._cubic_path(
+            (pose.x, pose.y),
+            pose.yaw,
+            join,
+            float(branch_path.heading[join_index]),
+            tangent,
+            tangent,
+            int(mission["exit_adaptive_connector_samples"]),
+        )
+        shared = controller._bezier_path(
+            mission["local_exit_control_points"],
+            int(mission["exit_samples"]),
+        )
+        route = connector[:-1] + branch[join_index:-1] + shared
+
+        # Last 12 usable RIGHT observations from the latest 2026-09-18
+        # official-start run, after the non-averaging systematic floors.
+        covariance = (
+            (1.21156383e-05, 3.89160326e-06, 6.16746873e-09),
+            (3.89160326e-06, 9.68540635e-06, 1.15256814e-07),
+            (6.16746873e-09, 1.15256814e-07, 8.16374685e-06),
+        )
+        registration_profile = registration_radial_uncertainties(
+            covariance,
+            footprint,
+            local_points=route,
+            target_from_source_yaw=math.radians(-179.890047),
+        )
+        safety = PathSafety(
+            line_boundaries=(controller.course_boundary_local,),
+            margins=SafetyMargins(
+                line=float(footprint_config["line_margin"]),
+                localization=float(footprint_config["localization_error"]),
+                tracking=float(footprint_config["tracking_error"]),
+            ),
+        )
+        speed_profile = SpeedProfile(
+            cruise_velocity=float(mission["exit_path_linear_velocity"]),
+            minimum_velocity=float(mission["exit_path_min_velocity"]),
+            entry_velocity=float(mission["exit_path_entry_velocity"]),
+            exit_velocity=float(mission["exit_path_exit_velocity"]),
+            maximum_angular_velocity=float(
+                mission["exit_path_max_angular_velocity"]
+            ),
+            maximum_lateral_acceleration=float(
+                mission["maximum_lateral_acceleration"]
+            ),
+            linear_acceleration=float(mission["linear_acceleration"]),
+            linear_deceleration=float(mission["linear_deceleration"]),
+            angular_acceleration=float(mission["path_angular_acceleration"]),
+        )
+        path = controller_module.path_from_xy(
+            route,
+            "intersection_local",
+            speed_profile=speed_profile,
+            initial_line_overlap_allowance=float(
+                mission["exit_path_initial_line_overlap_allowance"]
+            ),
+            line_egress_distance=float(
+                mission["exit_path_line_egress_distance"]
+            ),
+            localization_uncertainty=registration_profile,
+            final_heading=math.radians(
+                float(mission["local_exit_goal_yaw_deg"])
+            ),
+            goal_tolerance=GoalTolerance(
+                float(mission["exit_path_goal_tolerance"]),
+                math.radians(
+                    float(mission["exit_path_goal_heading_tolerance_deg"])
+                ),
+                float(mission["exit_path_goal_crossing_max_distance"]),
+            ),
+            safety=safety,
+        )
+        validator = SweptFootprintValidator(
+            footprint,
+            translation_step=float(mission["safety"]["sweep_step"]),
+            heading_step=math.radians(
+                float(mission["safety"]["sweep_angle_step_deg"])
+            ),
+        )
+
+        result = validator.validate_path(path)
+        zero_allowance_index = int(
+            np.flatnonzero(path.line_overlap_allowance <= 1e-12)[0]
+        )
+        downstream = validator.validate_path(
+            path,
+            start_station=float(path.station[zero_allowance_index]),
+        )
+
+        self.assertGreater(float(np.min(registration_profile)), 0.0043)
+        self.assertGreater(float(np.max(registration_profile)), 0.0053)
+        self.assertGreater(downstream.minimum_line_clearance, 0.0001)
+        self.assertTrue(
+            result.safe,
+            "measured registration sweep line clearance %.6fm"
+            % result.minimum_line_clearance,
+        )
+
+        follower = PathFollower(
+            TrackingConfig(
+                lookahead_distance=float(mission["exit_path_lookahead"]),
+                maximum_linear_velocity=float(
+                    mission["exit_path_linear_velocity"]
+                ),
+                maximum_angular_velocity=float(
+                    mission["exit_path_max_angular_velocity"]
+                ),
+                maximum_lateral_acceleration=float(
+                    mission["maximum_lateral_acceleration"]
+                ),
+                linear_acceleration=float(mission["linear_acceleration"]),
+                linear_deceleration=float(mission["linear_deceleration"]),
+                angular_acceleration=float(
+                    mission["path_angular_acceleration"]
+                ),
+                heading_gain=float(mission["path_heading_gain"]),
+                curvature_feedforward_weight=float(
+                    mission["path_curvature_weight"]
+                ),
+                lateral_feedback_gain=float(
+                    mission["path_lateral_feedback_gain"]
+                ),
+                search_ahead_distance=float(
+                    mission["path_search_ahead_distance"]
+                ),
+            )
+        )
+        follower.reset(path, pose, initial_linear=0.0, initial_angular=0.0)
+        minimum_stopping_clearance = math.inf
+        complete = False
+        step = 0.02
+        for _ in range(
+            int(math.ceil(float(mission["exit_path_follow_timeout"]) / step))
+        ):
+            tracking = follower.calculate_tracking(pose)
+            if follower.goal_status(pose, tracking=tracking).complete:
+                complete = True
+                break
+            stopping_speed = max(0.0, abs(follower.last_linear))
+            decision = validator.motion_safety(
+                path,
+                pose,
+                tracking.path_index,
+                tracking.target_speed,
+                stopping_speed,
+                follower.stopping_angular_velocities(
+                    tracking, stopping_speed, follower.last_angular
+                ),
+                float(mission["safety"]["reaction_time"]),
+                float(mission["linear_deceleration"]),
+                float(mission["safety"]["stop_distance_margin"]),
+                tracking=tracking,
+                route_safety=PathSafety(),
+            )
+            if tracking.station >= float(
+                mission["exit_path_line_egress_distance"]
+            ):
+                minimum_stopping_clearance = min(
+                    minimum_stopping_clearance,
+                    decision.stopping.minimum_line_clearance,
+                )
+            self.assertFalse(
+                decision.requires_stop,
+                "recorded exit stopped at station %.6fm with %.6fm clearance"
+                % (tracking.station, decision.stopping.minimum_line_clearance),
+            )
+            command, _ = follower.command(
+                pose,
+                step,
+                speed_limit=decision.speed_limit,
+                tracking=tracking,
+            )
+            pose = Pose2D(
+                pose.x + command.linear_velocity * math.cos(pose.yaw) * step,
+                pose.y + command.linear_velocity * math.sin(pose.yaw) * step,
+                controller_module.normalize_angle(
+                    pose.yaw + command.angular_velocity * step
+                ),
+            )
+
+        self.assertTrue(complete)
+        self.assertGreater(minimum_stopping_clearance, 0.0)
+
     def test_camera_choice_builds_aligned_entry_to_selected_fixed_goal(self):
         for direction, label in (
             (IntersectionMissionController.LEFT, "left"),
@@ -1699,59 +2074,67 @@ class IntersectionControllerTest(unittest.TestCase):
             with self.subTest(label=label):
                 controller, mission, _ = self.make_course_map_harness()
                 controller.direction = direction
-                controller.map_entry_start = tuple(mission["map_entry_start"])
-                controller.map_entry_start_yaw = math.radians(
-                    float(mission["map_entry_start_yaw_deg"])
-                )
+                controller.local_entry_start = (0.0, 0.0)
+                controller.local_entry_start_yaw = 0.0
                 for side in ("left", "right"):
+                    survey_goal = tuple(mission["map_%s_entry_goal" % side])
                     setattr(
                         controller,
-                        "map_%s_entry_goal" % side,
-                        tuple(mission["map_%s_entry_goal" % side]),
+                        "local_%s_entry_goal" % side,
+                        controller.local_from_texture.apply_point(survey_goal),
                     )
                     setattr(
                         controller,
-                        "map_%s_arc_entry_yaw" % side,
-                        math.radians(
-                            float(
-                                mission[
-                                    "map_%s_arc_entry_yaw_deg" % side
-                                ]
+                        "local_%s_arc_entry_yaw" % side,
+                        controller.local_from_texture.apply_pose(
+                            Pose2D(
+                                0.0,
+                                0.0,
+                                math.radians(
+                                    float(
+                                        mission[
+                                            "map_%s_arc_entry_yaw_deg" % side
+                                        ]
+                                    )
+                                ),
                             )
-                        ),
+                        ).yaw,
                     )
-                controller.map_entry_samples = int(mission["map_entry_samples"])
-                controller.entry_alignment_samples = int(
-                    mission["entry_alignment_samples"]
-                )
-                controller.entry_alignment_tangent_ratio = float(
-                    mission["entry_alignment_tangent_ratio"]
-                )
+                controller.entry_samples = int(mission["map_entry_samples"])
                 controller.entry_start_tangent_ratio = float(
                     mission["entry_start_tangent_ratio"]
                 )
                 controller.entry_end_tangent_ratio = float(
                     mission["entry_end_tangent_ratio"]
                 )
-                controller.map_snap_max_distance = float(
-                    mission["map_snap_max_distance"]
-                )
-                # Current early-handoff envelope, captured in official run 3.
+                # Odom pose is arbitrary here; its corresponding local pose is
+                # the latest source-stamped official-start handoff.
                 handoff = (
                     1.584243874,
                     -0.753903779,
                     math.radians(162.530415),
                 )
-                controller.localized_map_x = handoff[0]
-                controller.localized_map_y = handoff[1]
-                controller._localized_map_pose_is_fresh = lambda: True
-                controller._lookup_tracking_from_map = lambda: (0.0, 0.0, 0.0)
+                local_confirmation = Pose2D(
+                    -0.105914,
+                    -0.012740,
+                    math.radians(-7.9),
+                )
+                controller.odom_frame = "odom"
+                controller.local_to_odom = RigidTransform2D.from_pose_pair(
+                    local_confirmation,
+                    Pose2D(*handoff),
+                    source_frame=controller.local_frame,
+                    target_frame=controller.odom_frame,
+                )
+                controller.active_tracking_from_local = controller.local_to_odom
                 controller._tracking_pose = lambda: handoff
                 controller.active_path_velocity = 0.10
                 controller._prepare_active_entry_parameters = mock.Mock()
                 controller._activate_path = mock.Mock(return_value=True)
 
-                self.assertTrue(controller._generate_map_entry_path())
+                self.assertTrue(
+                    controller._generate_entry_path(Pose2D(*handoff))
+                )
 
                 route, goal_yaw, exit_yaw, stage = (
                     controller._activate_path.call_args.args
@@ -1760,21 +2143,41 @@ class IntersectionControllerTest(unittest.TestCase):
                 self.assertAlmostEqual(route[0][0], handoff[0])
                 self.assertAlmostEqual(route[0][1], handoff[1])
                 self.assertAlmostEqual(goal_yaw, exit_yaw)
-                expected = self.aligned_entry_path(
-                    mission, label.upper(), handoff
+                local_goal = getattr(
+                    controller, "local_%s_entry_goal" % label
                 )
+                local_goal_yaw = getattr(
+                    controller, "local_%s_arc_entry_yaw" % label
+                )
+                route_chord = math.hypot(
+                    local_goal[0] - local_confirmation.x,
+                    local_goal[1] - local_confirmation.y,
+                )
+                local_route = controller._cubic_path(
+                    (local_confirmation.x, local_confirmation.y),
+                    local_confirmation.yaw,
+                    local_goal,
+                    local_goal_yaw,
+                    float(mission["entry_start_tangent_ratio"])
+                    * route_chord,
+                    float(mission["entry_end_tangent_ratio"])
+                    * route_chord,
+                    int(mission["map_entry_samples"]),
+                )
+                expected = [
+                    controller.local_to_odom.apply_point(point)
+                    for point in local_route
+                ]
                 self.assertEqual(
                     len(route),
-                    int(mission["entry_alignment_samples"])
-                    + int(mission["map_entry_samples"])
-                    - 1,
+                    int(mission["map_entry_samples"]),
                 )
                 np.testing.assert_allclose(route, expected, atol=1.0e-12)
-                expected_goal = tuple(mission["map_%s_entry_goal" % label])
+                expected_goal = controller.local_to_odom.apply_point(local_goal)
                 self.assertAlmostEqual(route[-1][0], expected_goal[0])
                 self.assertAlmostEqual(route[-1][1], expected_goal[1])
                 path = controller_module.path_from_xy(
-                    route, "map", final_heading=goal_yaw
+                    route, "odom", final_heading=goal_yaw
                 )
                 heading = np.unwrap(np.asarray(path.heading))
                 heading_delta = np.diff(heading)
@@ -1798,11 +2201,11 @@ class IntersectionControllerTest(unittest.TestCase):
             IntersectionMissionController
         )
         controller.direction = controller.NONE
-        controller._localized_map_pose_is_fresh = mock.Mock(return_value=True)
         controller._activate_path = mock.Mock(return_value=True)
 
-        self.assertFalse(controller._generate_map_entry_path())
-        controller._localized_map_pose_is_fresh.assert_not_called()
+        self.assertFalse(
+            controller._generate_entry_path(Pose2D(0.0, 0.0, 0.0))
+        )
         controller._activate_path.assert_not_called()
 
     def test_camera_direction_is_confirmed_without_pre_path_cmd_vel(self):
@@ -1821,47 +2224,222 @@ class IntersectionControllerTest(unittest.TestCase):
         )
         self.assertEqual(controller.state, controller.WAIT_ENTRY_HANDOFF)
         self.assertEqual(len(controller.direction_pub.messages), 1)
+        self.assertEqual(len(controller.ready_pub.messages), 1)
+        ready = controller.ready_pub.messages[0]
+        self.assertEqual(ready.seq, controller.arm_seq)
+        self.assertEqual(ready.frame_id, "intersection")
+        self.assertEqual(ready.stamp, controller.last_direction_confirmation_time)
+        controller._generate_entry_path.assert_called_once()
         controller._set_state.assert_called_once_with(
             controller.WAIT_ENTRY_HANDOFF
         )
         controller._set_lane_controller.assert_not_called()
 
-    def test_direction_is_preconfirmed_without_starting_gate_timeout_or_handoff(self):
+    def test_forced_route_keeps_detected_sign_calibration_direction(self):
+        controller = self.make_direction_harness(
+            IntersectionMissionController.SEARCH_DIRECTION
+        )
+        controller.forced_direction = controller.RIGHT
+        generated_directions = []
+
+        def generate_entry(_pose):
+            generated_directions.append(controller.direction)
+            return True
+
+        controller._generate_entry_path.side_effect = generate_entry
+        message = self.direction_message(
+            controller_module.TrafficSign.DIRECTION_LEFT
+        )
+
+        self.observe_direction(controller, message)
+
+        self.assertEqual(controller.direction, controller.RIGHT)
+        self.assertEqual(generated_directions, [controller.RIGHT])
+        self.assertGreaterEqual(
+            controller._direction_registration_result.call_count,
+            controller.direction_confirm_frames,
+        )
+        self.assertTrue(
+            all(
+                call.args[0] == controller.LEFT
+                for call in controller._direction_registration_result.call_args_list
+            )
+        )
+
+    def test_missing_alignment_frame_does_not_erase_direction_selection(self):
+        controller = self.make_direction_harness(
+            IntersectionMissionController.SEARCH_DIRECTION
+        )
+        message = self.direction_message(
+            controller_module.TrafficSign.DIRECTION_RIGHT
+        )
+        accepted_result = controller._direction_registration_result.return_value
+        controller._direction_registration_result.return_value = (
+            None,
+            Pose2D(1.0, -0.4, math.pi),
+        )
+
+        self.observe_direction(controller, message, count=5)
+
+        self.assertEqual(controller.direction_candidate, controller.RIGHT)
+        self.assertEqual(controller.direction_count, 5)
+        self.assertEqual(controller.direction, controller.NONE)
+        controller.registration_filter.reset.assert_called_once()
+
+        controller._direction_registration_result.return_value = accepted_result
+        self.observe_direction(
+            controller,
+            message,
+            count=controller.direction_confirm_frames - 5,
+        )
+
+        self.assertEqual(controller.direction, controller.RIGHT)
+        self.assertEqual(controller.state, controller.WAIT_ENTRY_HANDOFF)
+        self.assertEqual(len(controller.ready_pub.messages), 1)
+
+    def test_registration_confirmation_waits_for_entry_pose(self):
+        controller = self.make_direction_harness(
+            IntersectionMissionController.SEARCH_DIRECTION
+        )
+        message = self.direction_message(
+            controller_module.TrafficSign.DIRECTION_RIGHT
+        )
+        outside_pose = Pose2D(1.0, -0.4, math.radians(140.0))
+        accepted_registration = (
+            controller._direction_registration_result.return_value[0],
+            outside_pose,
+        )
+        controller._direction_registration_result.return_value = (
+            accepted_registration
+        )
+
+        self.observe_direction(controller, message)
+
+        self.assertEqual(controller.direction, controller.NONE)
+        self.assertGreaterEqual(
+            controller.direction_count, controller.direction_confirm_frames
+        )
+        self.assertEqual(controller.ready_pub.messages, [])
+
+        controller._direction_registration_result.return_value = (
+            accepted_registration[0],
+            Pose2D(1.0, -0.4, math.pi),
+        )
+        message.header.stamp = self.now()
+        controller.sign_callback(message)
+
+        self.assertEqual(controller.direction, controller.RIGHT)
+        self.assertEqual(controller.state, controller.WAIT_ENTRY_HANDOFF)
+        self.assertEqual(len(controller.ready_pub.messages), 1)
+
+    def test_enable_before_matching_readiness_is_ignored(self):
+        controller = self.make_direction_harness(
+            IntersectionMissionController.SEARCH_DIRECTION
+        )
+        controller.path = None
+        controller.active_path_stage = ""
+
+        controller.zone_gate_callback(SimpleNamespace(data=True))
+
+        self.assertFalse(controller.zone_gate_open)
+        controller._set_lane_controller.assert_not_called()
+
+    def test_prepared_path_refreshes_ready_without_replanning_or_cmd_vel(self):
+        controller = self.make_direction_harness(
+            IntersectionMissionController.SEARCH_DIRECTION
+        )
+        controller.registration_entry_lead_min = -0.45
+        controller.registration_entry_lead_max = 0.03
+        controller.registration_entry_lateral_max = 0.10
+        controller.registration_entry_heading_max = math.radians(15.0)
+        message = self.direction_message(
+            controller_module.TrafficSign.DIRECTION_RIGHT
+        )
+        self.observe_direction(controller, message)
+        controller.path = object()
+        controller.active_path_stage = "entry"
+        initial_ready_count = len(controller.ready_pub.messages)
+
+        message.header.stamp = self.now()
+        controller.sign_callback(message)
+
+        self.assertEqual(len(controller.ready_pub.messages), initial_ready_count + 1)
+        self.assertEqual(controller.ready_pub.messages[-1].stamp, message.header.stamp)
+        controller._generate_entry_path.assert_called_once()
+        controller._set_lane_controller.assert_not_called()
+
+    def test_prepared_path_rejects_mismatched_sign_position_refresh(self):
+        controller = self.make_direction_harness(
+            IntersectionMissionController.SEARCH_DIRECTION
+        )
+        message = self.direction_message(
+            controller_module.TrafficSign.DIRECTION_RIGHT
+        )
+        self.observe_direction(controller, message)
+        controller.path = object()
+        controller.active_path_stage = "entry"
+        initial_ready_count = len(controller.ready_pub.messages)
+        mismatched = RigidTransform2D(
+            controller.local_to_odom.target_from_source_x + 0.10,
+            controller.local_to_odom.target_from_source_y,
+            controller.local_to_odom.target_from_source_yaw,
+            source_frame="intersection_local",
+            target_frame="odom",
+        )
+        controller._direction_registration_result.return_value = (
+            SimpleNamespace(accepted=True, transform=mismatched),
+            Pose2D(1.0, -0.4, math.pi),
+        )
+
+        message.header.stamp = self.now()
+        controller.sign_callback(message)
+
+        self.assertEqual(len(controller.ready_pub.messages), initial_ready_count)
+        controller._generate_entry_path.assert_called_once()
+        controller._set_lane_controller.assert_not_called()
+
+    def test_new_arm_generation_rejects_previous_source_frames(self):
         controller = self.make_direction_harness(
             IntersectionMissionController.WAIT_INTERSECTION
         )
+        self.arm_direction_harness(controller, sequence=90)
+        message = self.direction_message(
+            controller_module.TrafficSign.DIRECTION_LEFT
+        )
+        self.observe_direction(controller, message, count=4)
+        self.assertEqual(controller.direction_count, 4)
+
+        self.advance(0.10)
+        self.arm_direction_harness(controller, sequence=91)
+        self.assertEqual(controller.direction_count, 0)
+        message.header.stamp = controller_module.rospy.Time.from_sec(10.05)
+        controller.sign_callback(message)
+        self.assertEqual(controller.direction_count, 0)
+
+        self.observe_direction(controller, message)
+        self.assertEqual(controller.ready_pub.messages[-1].seq, 91)
+
+    def test_unsafe_entry_restarts_registration_without_control_side_effects(self):
+        controller = self.make_direction_harness(
+            IntersectionMissionController.SEARCH_DIRECTION
+        )
+        controller._generate_entry_path.return_value = False
         message = self.direction_message(
             controller_module.TrafficSign.DIRECTION_RIGHT
         )
 
         self.observe_direction(controller, message)
 
-        self.assertEqual(controller.direction, controller.RIGHT)
-        self.assertEqual(controller.state, controller.WAIT_INTERSECTION)
-        self.assertEqual(len(controller.direction_pub.messages), 1)
-        controller._set_state.assert_not_called()
-        controller._set_lane_controller.assert_not_called()
-
-        # Time spent observing before the ordered gate must not consume either
-        # the search timeout or the later entry-handoff timeout.
-        self.advance(controller.direction_search_timeout + 10.0)
-        controller.control_callback(None)
-        self.assertEqual(controller.state, controller.WAIT_INTERSECTION)
+        self.assertEqual(controller.ready_pub.messages, [])
         controller._fail.assert_not_called()
-
-        controller.zone_gate_open = True
-        controller.control_callback(None)
-        self.assertEqual(controller.state, controller.WAIT_ENTRY_HANDOFF)
-        controller._set_state.assert_called_once_with(
-            controller.WAIT_ENTRY_HANDOFF
-        )
         controller._set_lane_controller.assert_not_called()
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(controller.state, controller.SEARCH_DIRECTION)
 
-    def test_direction_is_ignored_outside_the_upstream_observation_window(self):
+    def test_direction_is_ignored_until_matching_header_arm(self):
         controller = self.make_direction_harness(
             IntersectionMissionController.WAIT_INTERSECTION
         )
-        controller._direction_observation_region_ready.return_value = False
         message = self.direction_message(
             controller_module.TrafficSign.DIRECTION_RIGHT
         )
@@ -1872,8 +2450,54 @@ class IntersectionControllerTest(unittest.TestCase):
         self.assertEqual(controller.direction_count, 0)
         self.assertEqual(controller.state, controller.WAIT_INTERSECTION)
         self.assertEqual(controller.direction_pub.messages, [])
+        controller._set_state.assert_not_called()
+        controller._set_lane_controller.assert_not_called()
 
-    def test_gate_preserves_a_fresh_partial_preconfirmation_streak(self):
+        arm = self.arm_direction_harness(controller, sequence=72)
+        self.assertEqual(controller.state, controller.SEARCH_DIRECTION)
+
+        self.observe_direction(controller, message)
+        self.assertEqual(controller.direction, controller.RIGHT)
+        self.assertEqual(controller.state, controller.WAIT_ENTRY_HANDOFF)
+        self.assertEqual(
+            [call.args[0] for call in controller._set_state.call_args_list],
+            [controller.SEARCH_DIRECTION, controller.WAIT_ENTRY_HANDOFF],
+        )
+        self.assertEqual(controller.ready_pub.messages[-1].seq, arm.seq)
+        controller._set_lane_controller.assert_not_called()
+
+    def test_header_arm_starts_direction_search_without_taking_control(self):
+        controller = self.make_direction_harness(
+            IntersectionMissionController.WAIT_INTERSECTION
+        )
+        self.arm_direction_harness(controller, sequence=73)
+
+        self.assertEqual(controller.direction, controller.NONE)
+        self.assertEqual(controller.direction_count, 0)
+        self.assertEqual(controller.state, controller.SEARCH_DIRECTION)
+        self.assertEqual(controller.direction_pub.messages, [])
+        controller._set_state.assert_called_once_with(
+            controller.SEARCH_DIRECTION
+        )
+        controller._set_lane_controller.assert_not_called()
+
+    def test_arm_requires_exact_mission_frame(self):
+        controller = self.make_direction_harness(
+            IntersectionMissionController.WAIT_INTERSECTION
+        )
+        for frame_id in ("", "obstacle"):
+            arm = Header()
+            arm.seq = 73
+            arm.stamp = self.now()
+            arm.frame_id = frame_id
+            controller.arm_callback(arm)
+
+        self.assertIsNone(controller.arm_seq)
+        self.assertEqual(controller.state, controller.WAIT_INTERSECTION)
+        controller._set_state.assert_not_called()
+        controller._set_lane_controller.assert_not_called()
+
+    def test_new_arm_starts_a_fresh_direction_streak(self):
         controller = self.make_direction_harness(
             IntersectionMissionController.WAIT_INTERSECTION
         )
@@ -1883,13 +2507,15 @@ class IntersectionControllerTest(unittest.TestCase):
 
         partial_count = controller.direction_confirm_frames - 1
         self.observe_direction(controller, message, count=partial_count)
-        self.assertEqual(controller.direction_count, partial_count)
+        self.assertEqual(controller.direction_count, 0)
 
-        controller.zone_gate_open = True
-        controller.control_callback(None)
+        self.arm_direction_harness(controller, sequence=74)
         self.assertEqual(controller.state, controller.SEARCH_DIRECTION)
-        self.assertEqual(controller.direction_count, partial_count)
+        self.assertEqual(controller.direction_count, 0)
 
+        self.observe_direction(controller, message, count=partial_count)
+        self.assertEqual(controller.direction_count, partial_count)
+        message.header.stamp = self.now()
         controller.sign_callback(message)
         self.assertEqual(controller.direction, controller.LEFT)
         self.assertEqual(controller.state, controller.WAIT_ENTRY_HANDOFF)
@@ -1898,16 +2524,17 @@ class IntersectionControllerTest(unittest.TestCase):
             [controller.SEARCH_DIRECTION, controller.WAIT_ENTRY_HANDOFF],
         )
 
-    def test_failed_run_timing_preserves_spatially_gated_observations(self):
+    def test_armed_generation_accepts_spaced_source_observations(self):
         controller = self.make_direction_harness(
             IntersectionMissionController.WAIT_INTERSECTION
         )
 
-        # Reproduce the useful sequence from the GUI/RViz failure trace: a
-        # small high-confidence sign before the ordered gate, followed by two
-        # usable frames 1.01 s and 0.796 s later. The gate does not discard the
-        # first three observations; the configured 10/30 Hz evidence count then
-        # completes normally.
+        self.arm_direction_harness(controller, sequence=75)
+        self.assertEqual(controller.state, controller.SEARCH_DIRECTION)
+
+        # Reproduce the useful spacing from the GUI/RViz trace entirely inside
+        # the unified gate. The configured maximum gap retains each usable
+        # observation, then the 30 Hz evidence count completes normally.
         first = self.direction_message(
             controller_module.TrafficSign.DIRECTION_RIGHT
         )
@@ -1921,23 +2548,19 @@ class IntersectionControllerTest(unittest.TestCase):
         self.assertGreaterEqual(
             first_area_ratio, controller.direction_acquire_min_roi_area_ratio
         )
+        first.header.stamp = self.now()
         controller.sign_callback(first)
         self.assertEqual(controller.direction_count, 1)
-        self.assertEqual(controller.state, controller.WAIT_INTERSECTION)
-
-        self.advance(0.42)
-        controller.zone_gate_open = True
-        controller.control_callback(None)
         self.assertEqual(controller.state, controller.SEARCH_DIRECTION)
-        self.assertEqual(controller.direction_count, 1)
 
-        self.advance(0.59)
+        self.advance(1.01)
         second = self.direction_message(
             controller_module.TrafficSign.DIRECTION_RIGHT
         )
         second.confidence = 0.61
         second.roi.width = 110
         second.roi.height = 106
+        second.header.stamp = self.now()
         controller.sign_callback(second)
         self.assertEqual(controller.direction_count, 2)
 
@@ -1948,10 +2571,12 @@ class IntersectionControllerTest(unittest.TestCase):
         third.confidence = 0.69
         third.roi.width = 170
         third.roi.height = 154
+        third.header.stamp = self.now()
         controller.sign_callback(third)
 
         for expected_count in range(4, controller.direction_confirm_frames + 1):
             self.advance(self.direction_frame_period(controller))
+            third.header.stamp = self.now()
             controller.sign_callback(third)
             self.assertEqual(controller.direction_count, expected_count)
 
@@ -1969,7 +2594,7 @@ class IntersectionControllerTest(unittest.TestCase):
 
     def test_direction_streak_resets_after_gap_or_opposite_observation(self):
         controller = self.make_direction_harness(
-            IntersectionMissionController.WAIT_INTERSECTION
+            IntersectionMissionController.SEARCH_DIRECTION
         )
         right = self.direction_message(
             controller_module.TrafficSign.DIRECTION_RIGHT
@@ -1978,13 +2603,16 @@ class IntersectionControllerTest(unittest.TestCase):
             controller_module.TrafficSign.DIRECTION_LEFT
         )
 
+        right.header.stamp = self.now()
         controller.sign_callback(right)
         self.advance(controller.direction_confirmation_max_gap + 0.01)
+        right.header.stamp = self.now()
         controller.sign_callback(right)
         self.assertEqual(controller.direction_candidate, controller.RIGHT)
         self.assertEqual(controller.direction_count, 1)
 
         self.advance(0.10)
+        left.header.stamp = self.now()
         controller.sign_callback(left)
         self.assertEqual(controller.direction_candidate, controller.LEFT)
         self.assertEqual(controller.direction_count, 1)
@@ -1992,74 +2620,340 @@ class IntersectionControllerTest(unittest.TestCase):
 
         for expected_count in range(2, controller.direction_confirm_frames + 1):
             self.advance(self.direction_frame_period(controller))
+            left.header.stamp = self.now()
             controller.sign_callback(left)
             self.assertEqual(controller.direction_count, expected_count)
 
         self.assertEqual(controller.direction, controller.LEFT)
-        self.assertEqual(controller.state, controller.WAIT_INTERSECTION)
+        self.assertEqual(controller.state, controller.WAIT_ENTRY_HANDOFF)
         self.assertEqual(len(controller.direction_pub.messages), 1)
 
-    def test_entry_handoff_uses_the_oriented_map_start_plane(self):
+    def test_source_stamp_odom_interpolation_fixes_local_entrance(self):
         controller = IntersectionMissionController.__new__(
             IntersectionMissionController
         )
-        controller.map_entry_start = (1.395, -0.750)
-        controller.map_entry_start_yaw = math.pi
-        controller.entry_handoff_lead_distance = 0.020
-        controller._localized_map_pose_is_fresh = lambda: True
-        controller.localized_map_y = -0.690
+        controller.registration_pose_stamp_tolerance = 0.06
+        controller.odom_history = controller_module.deque(
+            (
+                (controller_module.rospy.Time.from_sec(10.00), 1.0, 2.0, 3.10, "odom"),
+                (controller_module.rospy.Time.from_sec(10.10), 1.2, 2.4, -3.10, "odom"),
+            )
+        )
+        pose = controller._synchronized_odom_pose(
+            controller_module.rospy.Time.from_sec(10.05)
+        )
+        self.assertAlmostEqual(pose.x, 1.1)
+        self.assertAlmostEqual(pose.y, 2.2)
+        self.assertLess(abs(abs(pose.yaw) - math.pi), 0.03)
+        self.assertIsNone(
+            controller._synchronized_odom_pose(
+                controller_module.rospy.Time.from_sec(9.90)
+            )
+        )
 
-        controller.localized_map_x = 1.416
-        self.assertFalse(controller._entry_handoff_pose_ready())
-        controller.localized_map_x = 1.414
-        self.assertTrue(controller._entry_handoff_pose_ready())
-
-        controller.map_entry_start = (2.0, 3.0)
-        controller.map_entry_start_yaw = 0.5 * math.pi
-        controller.localized_map_x = 2.2
-        controller.localized_map_y = 2.979
-        self.assertFalse(controller._entry_handoff_pose_ready())
-        controller.localized_map_y = 2.981
-        self.assertTrue(controller._entry_handoff_pose_ready())
-
-        controller._localized_map_pose_is_fresh = lambda: False
-        self.assertFalse(controller._entry_handoff_pose_ready())
-
-    def test_production_handoff_precedes_recorded_camera_path_loss(self):
-        with (CONFIG_DIR / "intersection_mission.yaml").open(
-            "r", encoding="utf-8"
-        ) as stream:
-            mission = yaml.safe_load(stream)["mission"]
-
+    def test_left_and_right_calibrations_recover_direct_registration(self):
+        mission = load_mission_config()
+        registration = mission["registration"]
         controller = IntersectionMissionController.__new__(
             IntersectionMissionController
         )
-        controller.map_entry_start = tuple(mission["map_entry_start"])
-        controller.map_entry_start_yaw = math.radians(
-            float(mission["map_entry_start_yaw_deg"])
+        controller.local_frame = str(registration["local_frame"])
+        controller.odom_frame = "odom"
+        controller.camera_width = 640
+        controller.camera_height = 480
+        controller.camera_fx = float(registration["camera_fx_fallback"])
+        controller.camera_fy = float(registration["camera_fy_fallback"])
+        controller.camera_cx = float(registration["camera_cx_fallback"])
+        controller.sign_physical_height = float(
+            registration["sign_physical_height"]
         )
-        controller.entry_handoff_lead_distance = float(
-            mission["entry_handoff_lead_distance"]
+        controller.sign_range_scale = {
+            controller.LEFT: float(registration["left_sign_range_scale"]),
+            controller.RIGHT: float(registration["right_sign_range_scale"]),
+        }
+        controller.sign_center_bias_pixels = {
+            controller.LEFT: float(
+                registration["left_sign_center_bias_pixels"]
+            ),
+            controller.RIGHT: float(
+                registration["right_sign_center_bias_pixels"]
+            ),
+        }
+        controller.sign_landmarks_local = {
+            controller.LEFT: tuple(
+                registration["left_sign_landmark_in_local"]
+            ),
+            controller.RIGHT: tuple(
+                registration["right_sign_landmark_in_local"]
+            ),
+        }
+        controller.camera_offset_in_base = tuple(
+            registration["camera_offset_in_base"]
         )
-        controller._localized_map_pose_is_fresh = lambda: True
-        # Fresh official-start run1 stopped here after the connected camera
-        # path disappeared.  The mission must already own cmd_vel at this
-        # position; waiting longer cannot make a stopped vehicle reach the old
-        # 20 mm plane.
-        controller.localized_map_x = 1.530
-        controller.localized_map_y = -0.750
+        controller.registration_roi_edge_margin = int(
+            registration["roi_edge_margin_pixels"]
+        )
+        controller.registration_observation_position_sigma = float(
+            registration["observation_position_stddev"]
+        )
+        controller.registration_observation_heading_sigma = math.radians(
+            float(registration["observation_heading_stddev_deg"])
+        )
+        self.assertNotEqual(
+            controller.sign_range_scale[controller.LEFT],
+            controller.sign_range_scale[controller.RIGHT],
+        )
+        self.assertNotEqual(
+            controller.sign_center_bias_pixels[controller.LEFT],
+            controller.sign_center_bias_pixels[controller.RIGHT],
+        )
 
-        self.assertAlmostEqual(
-            controller._entry_handoff_progress(), -0.135, places=9
+        expected = RigidTransform2D(
+            1.25,
+            -0.45,
+            math.radians(17.0),
+            controller.local_frame,
+            controller.odom_frame,
         )
-        self.assertGreater(controller.entry_handoff_lead_distance, 0.135)
-        self.assertTrue(controller._entry_handoff_pose_ready())
+        robot_local = Pose2D(-0.20, 0.0, 0.0)
+        robot_odom = expected.apply_pose(robot_local)
+        controller._synchronized_odom_pose = mock.Mock(
+            return_value=robot_odom
+        )
+        controller._map_aligned_local_yaw = mock.Mock(
+            return_value=expected.target_from_source_yaw
+        )
+        source_stamp = self.now()
+
+        for direction in (controller.LEFT, controller.RIGHT):
+            with self.subTest(direction=direction):
+                sign = controller.sign_landmarks_local[direction]
+                forward = (
+                    sign[0]
+                    - robot_local.x
+                    - controller.camera_offset_in_base[0]
+                )
+                lateral = (
+                    sign[1]
+                    - robot_local.y
+                    - controller.camera_offset_in_base[1]
+                )
+                roi_height = (
+                    controller.sign_range_scale[direction]
+                    * controller.camera_fy
+                    * controller.sign_physical_height
+                    / forward
+                )
+                corrected_centre = (
+                    controller.camera_cx
+                    - lateral * controller.camera_fx / forward
+                )
+                raw_centre = (
+                    corrected_centre
+                    - controller.sign_center_bias_pixels[direction]
+                )
+                roi = SimpleNamespace(
+                    x_offset=raw_centre - 0.5 * roi_height,
+                    y_offset=100.0,
+                    width=roi_height,
+                    height=roi_height,
+                )
+
+                result, synchronized_pose = (
+                    controller._direction_registration_result(
+                        direction,
+                        source_stamp,
+                        raw_centre / controller.camera_width,
+                        roi,
+                    )
+                )
+
+                self.assertEqual(synchronized_pose, robot_odom)
+                self.assertTrue(result.accepted, result.diagnostics.reason)
+                self.assertAlmostEqual(
+                    result.transform.target_from_source_x,
+                    expected.target_from_source_x,
+                    places=6,
+                )
+                self.assertAlmostEqual(
+                    result.transform.target_from_source_y,
+                    expected.target_from_source_y,
+                    places=6,
+                )
+                self.assertAlmostEqual(
+                    controller_module.normalize_angle(
+                        result.transform.target_from_source_yaw
+                        - expected.target_from_source_yaw
+                    ),
+                    0.0,
+                    places=6,
+                )
+
+    def test_sign_and_map_heading_registration_tracks_shifted_straight_length(self):
+        mission = load_mission_config()
+        registration = mission["registration"]
+        source_stamp = self.now()
+
+        for expected in (
+            RigidTransform2D(
+                1.25,
+                -0.45,
+                math.radians(17.0),
+                "intersection_local",
+                "odom",
+            ),
+            # The same local intersection after a much longer upstream odom
+            # run. Route geometry must translate/rotate with the landmark fit.
+            RigidTransform2D(
+                2.05,
+                0.20,
+                math.radians(-11.0),
+                "intersection_local",
+                "odom",
+            ),
+        ):
+            with self.subTest(transform=expected):
+                controller = IntersectionMissionController.__new__(
+                    IntersectionMissionController
+                )
+                controller.local_frame = "intersection_local"
+                controller.odom_frame = "odom"
+                controller.camera_width = 640
+                controller.camera_height = 480
+                controller.camera_fx = float(registration["camera_fx_fallback"])
+                controller.camera_fy = float(registration["camera_fy_fallback"])
+                controller.camera_cx = float(registration["camera_cx_fallback"])
+                controller.sign_physical_height = float(
+                    registration["sign_physical_height"]
+                )
+                controller.sign_range_scale = {
+                    controller.LEFT: float(
+                        registration["left_sign_range_scale"]
+                    ),
+                    controller.RIGHT: float(
+                        registration["right_sign_range_scale"]
+                    ),
+                }
+                controller.sign_center_bias_pixels = {
+                    controller.LEFT: float(
+                        registration["left_sign_center_bias_pixels"]
+                    ),
+                    controller.RIGHT: float(
+                        registration["right_sign_center_bias_pixels"]
+                    ),
+                }
+                controller.registration_observation_position_sigma = float(
+                    registration["observation_position_stddev"]
+                )
+                controller.registration_observation_heading_sigma = math.radians(
+                    float(registration["observation_heading_stddev_deg"])
+                )
+                controller.registration_roi_edge_margin = int(
+                    registration["roi_edge_margin_pixels"]
+                )
+                controller.camera_offset_in_base = tuple(
+                    registration["camera_offset_in_base"]
+                )
+                controller.sign_landmarks_local = {
+                    controller.LEFT: tuple(
+                        registration["left_sign_landmark_in_local"]
+                    ),
+                    controller.RIGHT: tuple(
+                        registration["right_sign_landmark_in_local"]
+                    ),
+                }
+                robot_local = Pose2D(-0.20, 0.0, 0.0)
+                robot_odom = expected.apply_pose(robot_local)
+                controller._synchronized_odom_pose = mock.Mock(
+                    return_value=robot_odom
+                )
+                controller._map_aligned_local_yaw = mock.Mock(
+                    return_value=expected.target_from_source_yaw
+                )
+
+                sign = controller.sign_landmarks_local[controller.LEFT]
+                forward = (
+                    sign[0]
+                    - robot_local.x
+                    - controller.camera_offset_in_base[0]
+                )
+                lateral = (
+                    sign[1]
+                    - robot_local.y
+                    - controller.camera_offset_in_base[1]
+                )
+                range_scale = controller.sign_range_scale[controller.LEFT]
+                roi_height = (
+                    range_scale
+                    * controller.camera_fy
+                    * controller.sign_physical_height
+                    / forward
+                )
+                corrected_centre_pixels = (
+                    controller.camera_cx
+                    - lateral * controller.camera_fx / forward
+                )
+                raw_centre_pixels = (
+                    corrected_centre_pixels
+                    - controller.sign_center_bias_pixels[controller.LEFT]
+                )
+                roi = SimpleNamespace(
+                    x_offset=raw_centre_pixels - 0.5 * roi_height,
+                    y_offset=100.0,
+                    width=roi_height,
+                    height=roi_height,
+                )
+                result, synchronized_pose = (
+                    controller._direction_registration_result(
+                        controller.LEFT,
+                        source_stamp,
+                        raw_centre_pixels / controller.camera_width,
+                        roi,
+                    )
+                )
+
+                self.assertIsNotNone(synchronized_pose)
+                self.assertTrue(result.accepted, result.diagnostics.reason)
+                self.assertAlmostEqual(
+                    result.transform.target_from_source_x,
+                    expected.target_from_source_x,
+                    places=6,
+                )
+                self.assertAlmostEqual(
+                    result.transform.target_from_source_y,
+                    expected.target_from_source_y,
+                    places=6,
+                )
+                self.assertAlmostEqual(
+                    controller_module.normalize_angle(
+                        result.transform.target_from_source_yaw
+                        - expected.target_from_source_yaw
+                    ),
+                    0.0,
+                    places=6,
+                )
+
+                roi.x_offset = 0.0
+                clipped, _ = controller._direction_registration_result(
+                    controller.LEFT,
+                    source_stamp,
+                    raw_centre_pixels / controller.camera_width,
+                    roi,
+                )
+                self.assertIsNone(clipped)
+
+                roi.x_offset = raw_centre_pixels - 0.5 * roi_height
+                controller._map_aligned_local_yaw.return_value = None
+                missing_heading, _ = controller._direction_registration_result(
+                    controller.LEFT,
+                    source_stamp,
+                    raw_centre_pixels / controller.camera_width,
+                    roi,
+                )
+                self.assertIsNone(missing_heading)
 
     def test_common_follower_completes_all_four_production_routes(self):
-        with (CONFIG_DIR / "intersection_mission.yaml").open(
-            "r", encoding="utf-8"
-        ) as stream:
-            mission = yaml.safe_load(stream)["mission"]
+        mission = load_mission_config()
 
         routes = (
             (
@@ -2233,23 +3127,22 @@ class IntersectionControllerTest(unittest.TestCase):
             with self.subTest(direction=direction):
                 controller = self.make_transition_harness(direction)
 
-                # Camera confirmation latches the branch, but normal lane
-                # following keeps cmd_vel until the AMCL entry plane.
+                # A validated readiness still leaves normal lane following in
+                # control until the ordered manager opens enable.
                 controller.direction = direction
                 controller._set_state(controller.WAIT_ENTRY_HANDOFF)
-                controller.localized_map_x = 1.60
                 controller.control_callback(None)
                 self.assertEqual(
                     controller.state, controller.WAIT_ENTRY_HANDOFF
                 )
                 self.assertEqual(controller.handoff_history, [])
-                controller._generate_map_entry_path.assert_not_called()
+                controller._start_prepared_entry_path.assert_not_called()
 
-                controller.localized_map_x = 1.53
+                controller.zone_gate_open = True
                 self.advance()
                 controller.control_callback(None)
                 self.assertEqual(controller.state, controller.PREPARE_ENTRY_PATH)
-                controller._generate_map_entry_path.assert_not_called()
+                controller._start_prepared_entry_path.assert_not_called()
                 entry_takeover_stop = controller.cmd_pub.messages[-1]
                 self.assertEqual(entry_takeover_stop.linear.x, 0.0)
                 self.assertEqual(entry_takeover_stop.angular.z, 0.0)
@@ -2259,13 +3152,13 @@ class IntersectionControllerTest(unittest.TestCase):
                 self.advance(0.05)
                 controller.control_callback(None)
                 self.assertEqual(controller.state, controller.PREPARE_ENTRY_PATH)
-                controller._generate_map_entry_path.assert_not_called()
+                controller._start_prepared_entry_path.assert_not_called()
 
                 controller.odom_sequence += 1
                 self.advance(0.05)
                 controller.control_callback(None)
                 self.assertEqual(controller.state, controller.FOLLOW_ENTRY_PATH)
-                controller._generate_map_entry_path.assert_called_once_with()
+                controller._start_prepared_entry_path.assert_called_once_with()
 
                 publishes_before_arc_handoff = len(controller.cmd_pub.messages)
                 self.advance()
@@ -2403,7 +3296,7 @@ class IntersectionControllerTest(unittest.TestCase):
         self.assertEqual(stop.angular.z, 0.0)
         self.assertEqual(controller.lane_speed_limit_pub.messages[-1].data, 0.0)
 
-    def test_entry_handoff_timeout_fails_without_taking_lane_control(self):
+    def test_ready_gate_timeout_reacquires_without_control_side_effects(self):
         controller = self.make_transition_harness(
             IntersectionMissionController.LEFT
         )
@@ -2411,19 +3304,17 @@ class IntersectionControllerTest(unittest.TestCase):
         controller.state = controller.WAIT_ENTRY_HANDOFF
         controller.state_started = self.now()
         controller.localized_map_x = 1.60
-        controller.entry_handoff_timeout = 1.0
+        controller.ready_gate_timeout = 1.0
         controller._fail = mock.Mock()
 
         self.advance(1.01)
         controller.control_callback(None)
 
-        controller._fail.assert_called_once()
-        self.assertIn(
-            "AMCL entry handoff plane timed out",
-            controller._fail.call_args.args[0],
-        )
+        controller._fail.assert_not_called()
         self.assertEqual(controller.handoff_history, [])
-        controller._generate_map_entry_path.assert_not_called()
+        controller._start_prepared_entry_path.assert_not_called()
+        self.assertEqual(controller.state, controller.SEARCH_DIRECTION)
+        self.assertFalse(controller.mission_has_control)
 
     def test_prepare_entry_times_out_without_post_handoff_odometry(self):
         controller = self.make_transition_harness(
@@ -2445,12 +3336,12 @@ class IntersectionControllerTest(unittest.TestCase):
             "no post-handoff EKF pose",
             controller._fail.call_args.args[0],
         )
-        controller._generate_map_entry_path.assert_not_called()
+        controller._start_prepared_entry_path.assert_not_called()
         stop = controller.cmd_pub.messages[-1]
         self.assertEqual(stop.linear.x, 0.0)
         self.assertEqual(stop.angular.z, 0.0)
 
-    def test_prepare_exit_retries_transient_tf_then_follows_generated_path(self):
+    def test_prepare_exit_retries_transient_generation_then_follows_path(self):
         controller = self.make_transition_harness(
             IntersectionMissionController.LEFT
         )
@@ -2473,10 +3364,7 @@ class IntersectionControllerTest(unittest.TestCase):
         self.assertEqual(controller._generate_exit_path.call_count, 2)
 
     def test_both_directions_feed_one_fixed_common_exit(self):
-        with (CONFIG_DIR / "intersection_mission.yaml").open(
-            "r", encoding="utf-8"
-        ) as stream:
-            mission = yaml.safe_load(stream)["mission"]
+        mission = load_mission_config()
 
         route = self.common_exit_path(mission)
         self.assertEqual(len(route), int(mission["map_exit_samples"]))
@@ -2491,16 +3379,21 @@ class IntersectionControllerTest(unittest.TestCase):
         self.assertAlmostEqual(route[0][1], route[1][1], places=4)
         self.assertAlmostEqual(route[-2][0], route[-1][0], places=4)
 
-    def test_generate_exit_path_freezes_latest_alignment_then_uses_common_activation(self):
+    def test_generate_exit_path_reuses_entry_local_alignment(self):
         controller, mission, _ = self.make_course_map_harness()
         pose = tuple(mission["map_left_exit_control_points"][0]) + (109.6,)
         self.configure_left_exit_generation(controller, mission, pose)
-        frozen = (0.31, -0.22, math.radians(7.0))
-        controller._lookup_tracking_from_map = mock.Mock(
-            return_value=frozen
+        frozen = RigidTransform2D(
+            0.31,
+            -0.22,
+            math.radians(7.0),
+            source_frame=controller.local_frame,
+            target_frame=controller.odom_frame,
         )
-        expected_start = controller._map_to_tracking_point(pose[:2], frozen)
-        expected_start_yaw = controller._map_to_tracking_yaw(
+        controller.local_to_odom = frozen
+        controller.active_tracking_from_local = frozen
+        expected_start = controller._local_to_tracking_point(pose[:2], frozen)
+        expected_start_yaw = controller._local_to_tracking_yaw(
             math.radians(pose[2]), frozen
         )
         controller._tracking_pose = lambda: (
@@ -2510,13 +3403,12 @@ class IntersectionControllerTest(unittest.TestCase):
         )
 
         self.assertTrue(controller._generate_exit_path())
-        controller._lookup_tracking_from_map.assert_called_once_with()
         controller._activate_path.assert_called_once()
         route, goal_yaw, exit_yaw, stage = (
             controller._activate_path.call_args.args
         )
         self.assertEqual(stage, "exit")
-        expected_yaw = controller._map_to_tracking_yaw(
+        expected_yaw = controller._local_to_tracking_yaw(
             math.pi / 2.0, frozen
         )
         self.assertAlmostEqual(goal_yaw, expected_yaw)
@@ -2536,22 +3428,24 @@ class IntersectionControllerTest(unittest.TestCase):
         )
         self.assertAlmostEqual(route[0][0], expected_start[0], places=9)
         self.assertAlmostEqual(route[0][1], expected_start[1], places=9)
-        self.assertEqual(controller.active_tracking_from_map, frozen)
+        self.assertEqual(controller.active_tracking_from_local, frozen)
 
-    def test_map_transform_round_trip_and_ekf_tracking_source(self):
-        tracking_from_map = (1.2, -0.4, math.radians(37.0))
-        map_point = (0.75, -0.9475)
-        tracking_point = IntersectionMissionController._map_to_tracking_point(
-            map_point, tracking_from_map
+    def test_local_transform_round_trip_and_ekf_tracking_source(self):
+        tracking_from_local = (1.2, -0.4, math.radians(37.0))
+        local_point = (0.75, -0.9475)
+        tracking_point = IntersectionMissionController._local_to_tracking_point(
+            local_point, tracking_from_local
         )
         recovered = RigidTransform2D(
-            *tracking_from_map, source_frame="map", target_frame="odom"
+            *tracking_from_local,
+            source_frame="intersection_local",
+            target_frame="odom",
         ).inverse().apply_point(tracking_point)
-        self.assertAlmostEqual(recovered[0], map_point[0], places=9)
-        self.assertAlmostEqual(recovered[1], map_point[1], places=9)
+        self.assertAlmostEqual(recovered[0], local_point[0], places=9)
+        self.assertAlmostEqual(recovered[1], local_point[1], places=9)
         self.assertAlmostEqual(
-            IntersectionMissionController._map_to_tracking_yaw(
-                math.radians(90.0), tracking_from_map
+            IntersectionMissionController._local_to_tracking_yaw(
+                math.radians(90.0), tracking_from_local
             ),
             math.radians(127.0),
             places=9,

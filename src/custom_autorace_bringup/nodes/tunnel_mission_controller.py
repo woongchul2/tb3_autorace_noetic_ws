@@ -12,7 +12,7 @@ import tf2_ros
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, OccupancyGrid as OccupancyGridMessage, Path
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Float64, Float64MultiArray, String
+from std_msgs.msg import Bool, Float64, Float64MultiArray, Header, String
 from std_srvs.srv import SetBool
 
 from custom_autorace_bringup.msg import TrafficSign
@@ -22,6 +22,10 @@ from custom_autorace_bringup.parking_geometry import (
     quintic_pose_path,
 )
 from custom_autorace_bringup.tunnel_costmap import TunnelCostmap
+from custom_autorace_bringup.tunnel_registration import (
+    PortalRegistrationConfig,
+    detect_portal,
+)
 from custom_autorace_bringup.tunnel_planner import (
     HybridAStarPlanner,
     OccupancyGrid,
@@ -98,6 +102,7 @@ def portal_alignment_path(
     sample_step,
     target_speed,
     frame_id,
+    label="tunnel_entry_alignment",
 ):
     """Build a smooth zero-end-curvature path to a portal staging pose."""
     distance = math.hypot(target.x - start.x, target.y - start.y)
@@ -123,7 +128,7 @@ def portal_alignment_path(
         poses,
         frame_id=frame_id,
         target_speed=target_speed,
-        label="tunnel_entry_alignment",
+        label=label,
     )
 
 
@@ -280,6 +285,84 @@ def tracking_path_from_plan(
     )
 
 
+def tracking_path_with_exit_connector(
+    plan,
+    connector,
+    cruise_velocity,
+    minimum_velocity,
+    entry_velocity,
+    exit_velocity,
+    maximum_angular_velocity,
+    maximum_lateral_acceleration,
+    linear_acceleration,
+    linear_deceleration,
+    maximum_angular_acceleration,
+    frame_id,
+):
+    """Join a Hybrid A* prefix and zero-curvature exit without a stop."""
+    prefix = tracking_path_from_plan(
+        plan,
+        cruise_velocity,
+        minimum_velocity,
+        entry_velocity,
+        exit_velocity,
+        maximum_angular_velocity,
+        maximum_lateral_acceleration,
+        linear_acceleration,
+        linear_deceleration,
+        maximum_angular_acceleration,
+    )
+    if connector is None or connector.x.size < 2:
+        raise ValueError("an exit connector needs at least two poses")
+    position_gap = math.hypot(
+        float(connector.x[0]) - float(prefix.x[-1]),
+        float(connector.y[0]) - float(prefix.y[-1]),
+    )
+    heading_gap = abs(
+        normalize_angle(
+            float(connector.heading[0]) - float(prefix.heading[-1])
+        )
+    )
+    if position_gap > 1e-6 or heading_gap > 1e-6:
+        raise ValueError("Hybrid A* and exit connector poses do not meet")
+
+    x = np.concatenate((prefix.x, connector.x[1:]))
+    y = np.concatenate((prefix.y, connector.y[1:]))
+    heading = np.concatenate((prefix.heading, connector.heading[1:]))
+    # Preserve the planner's exact constant-curvature primitives.  The plan
+    # requests zero terminal curvature and the quintic connector begins with
+    # zero curvature, so keeping the prefix endpoint is the conservative seam.
+    curvature = np.concatenate((prefix.curvature, connector.curvature[1:]))
+    station = np.concatenate(
+        ([0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y))))
+    )
+    speed = build_speed_profile(
+        station=station,
+        curvature=curvature,
+        cruise_velocity=cruise_velocity,
+        minimum_velocity=minimum_velocity,
+        entry_velocity=entry_velocity,
+        exit_velocity=exit_velocity,
+        maximum_angular_velocity=maximum_angular_velocity,
+        maximum_lateral_acceleration=maximum_lateral_acceleration,
+        linear_acceleration=linear_acceleration,
+        linear_deceleration=linear_deceleration,
+        maximum_angular_acceleration=maximum_angular_acceleration,
+    )
+    path = CommonPath(
+        x=x,
+        y=y,
+        heading=heading,
+        curvature=curvature,
+        station=station,
+        speed=speed,
+        frame_id=frame_id,
+        label="tunnel_hybrid_moving_exit",
+    )
+    connector_station = float(path.station[prefix.x.size - 1])
+    return path, connector_station
+
+
 class TunnelMissionController:
     """Own ``cmd_vel`` from the ordered entrance gate through lane rejoin."""
 
@@ -289,9 +372,7 @@ class TunnelMissionController:
     ENTERING = "ENTERING"
     PLANNING = "PLANNING"
     FOLLOWING = "FOLLOWING"
-    ALIGNING_EXIT = "ALIGNING_EXIT"
     EXITING = "EXITING"
-    VERIFY_EXIT = "VERIFY_EXIT"
     JOINING_LANE = "JOINING_LANE"
     COMPLETE = "COMPLETE"
     FAILED = "FAILED"
@@ -310,6 +391,12 @@ class TunnelMissionController:
         )
         self.gate_topic = str(
             get(prefix + "topics/zone_gate", "/mission/enable/tunnel")
+        )
+        self.arm_topic = str(
+            get(prefix + "topics/arm", "/mission/arm/tunnel")
+        )
+        self.ready_topic = str(
+            get(prefix + "topics/ready", "/mission/ready/tunnel")
         )
         self.lane_path_topic = str(
             get(
@@ -409,6 +496,116 @@ class TunnelMissionController:
         self.maximum_future_stamp = max(
             0.0, float(get(prefix + "scan/maximum_future_stamp", 0.06))
         )
+        self.registration_samples = max(
+            1, int(get(prefix + "registration/confirmation_samples", 3))
+        )
+        self.registration_maximum_gap = max(
+            0.01, float(get(prefix + "registration/maximum_sample_gap", 0.20))
+        )
+        self.registration_maximum_position_delta = max(
+            0.001,
+            float(get(prefix + "registration/maximum_position_delta", 0.04)),
+        )
+        self.registration_maximum_heading_delta = math.radians(
+            max(
+                0.1,
+                abs(
+                    float(
+                        get(
+                            prefix + "registration/maximum_heading_delta_deg",
+                            4.0,
+                        )
+                    )
+                ),
+            )
+        )
+        try:
+            self.portal_registration_config = PortalRegistrationConfig(
+                minimum_forward_distance=float(
+                    get(prefix + "registration/minimum_forward_distance", 0.10)
+                ),
+                maximum_forward_distance=float(
+                    get(prefix + "registration/maximum_forward_distance", 1.20)
+                ),
+                minimum_absolute_lateral=float(
+                    get(prefix + "registration/minimum_absolute_lateral", 0.04)
+                ),
+                maximum_absolute_lateral=float(
+                    get(prefix + "registration/maximum_absolute_lateral", 0.65)
+                ),
+                maximum_adjacent_beam_gap=int(
+                    get(prefix + "registration/maximum_adjacent_beam_gap", 3)
+                ),
+                maximum_point_gap=float(
+                    get(prefix + "registration/maximum_point_gap", 0.12)
+                ),
+                minimum_wall_points=int(
+                    get(prefix + "registration/minimum_wall_points", 6)
+                ),
+                minimum_wall_length=float(
+                    get(prefix + "registration/minimum_wall_length", 0.18)
+                ),
+                maximum_wall_residual=float(
+                    get(prefix + "registration/maximum_wall_residual", 0.018)
+                ),
+                maximum_heading_deviation=math.radians(
+                    abs(
+                        float(
+                            get(
+                                prefix
+                                + "registration/maximum_heading_deviation_deg",
+                                30.0,
+                            )
+                        )
+                    )
+                ),
+                maximum_orthogonal_angle=math.radians(
+                    abs(
+                        float(
+                            get(
+                                prefix
+                                + "registration/maximum_orthogonal_angle_deg",
+                                10.0,
+                            )
+                        )
+                    )
+                ),
+                expected_portal_width=float(
+                    get(prefix + "registration/expected_portal_width", 0.316)
+                ),
+                portal_width_tolerance=float(
+                    get(prefix + "registration/portal_width_tolerance", 0.06)
+                ),
+                maximum_corner_skew=float(
+                    get(prefix + "registration/maximum_corner_skew", 0.06)
+                ),
+            )
+        except ValueError as error:
+            raise rospy.ROSInitException(
+                "invalid tunnel portal registration: %s" % error
+            )
+        self.ready_minimum_entry_lead = max(
+            0.0,
+            float(get(prefix + "registration/ready_minimum_entry_lead", 0.20)),
+        )
+        self.ready_maximum_entry_lead = max(
+            self.ready_minimum_entry_lead,
+            float(get(prefix + "registration/ready_maximum_entry_lead", 0.50)),
+        )
+        self.ready_maximum_heading_error = math.radians(
+            max(
+                0.1,
+                abs(
+                    float(
+                        get(
+                            prefix
+                            + "registration/ready_maximum_heading_error_deg",
+                            30.0,
+                        )
+                    )
+                ),
+            )
+        )
 
         self.front = max(0.01, float(get(prefix + "footprint/front", 0.067645)))
         self.rear = max(0.01, float(get(prefix + "footprint/rear", 0.118073)))
@@ -457,6 +654,20 @@ class TunnelMissionController:
         self.entry_portal_plane_y = float(
             get(prefix + "entry/portal_plane_y", -0.105857)
         )
+        try:
+            self.registration_reference_pose = pose_from_degrees(
+                get(
+                    prefix + "registration/reference_pose",
+                    [
+                        self.entry_staging_pose.x,
+                        self.entry_portal_plane_y,
+                        math.degrees(self.entry_staging_pose.yaw),
+                    ],
+                ),
+                "tunnel registration reference_pose",
+            )
+        except ValueError as error:
+            raise rospy.ROSInitException(str(error))
         self.entry_clearance_margin = max(
             0.0, float(get(prefix + "entry/clearance_margin", 0.010))
         )
@@ -609,17 +820,12 @@ class TunnelMissionController:
             self.cruise_velocity,
         )
         self.exit_velocity = clamp(
-            float(get(prefix + "control/exit_velocity", 0.040)),
+            float(get(prefix + "control/exit_velocity", 0.075)),
             0.005,
             self.cruise_velocity,
         )
         self.entry_portal_velocity = clamp(
             float(get(prefix + "entry/velocity", 0.035)),
-            0.005,
-            self.cruise_velocity,
-        )
-        self.exit_straight_velocity = clamp(
-            float(get(prefix + "exit/straight_velocity", 0.040)),
             0.005,
             self.cruise_velocity,
         )
@@ -728,63 +934,24 @@ class TunnelMissionController:
         self.exit_position_tolerance = max(
             0.02, float(get(prefix + "exit/position_tolerance", 0.060))
         )
-        self.exit_staging_remaining_tolerance = max(
-            0.005,
-            float(get(prefix + "exit/staging_remaining_tolerance", 0.025)),
+        self.exit_connector_tangent_ratio = max(
+            0.01,
+            float(get(prefix + "exit/connector_tangent_ratio", 0.20)),
         )
-        self.exit_staging_position_tolerance = max(
-            0.005,
-            float(get(prefix + "exit/staging_position_tolerance", 0.025)),
+        self.exit_connector_minimum_tangent_length = max(
+            0.001,
+            float(get(prefix + "exit/minimum_tangent_length", 0.008)),
         )
-        self.exit_staging_heading_tolerance = math.radians(
-            abs(
-                float(
-                    get(prefix + "exit/staging_heading_tolerance_deg", 10.0)
-                )
-            )
+        self.exit_connector_maximum_tangent_length = max(
+            self.exit_connector_minimum_tangent_length,
+            float(get(prefix + "exit/maximum_tangent_length", 0.055)),
         )
-        self.exit_staging_lateral_tolerance = max(
-            0.005,
-            float(get(prefix + "exit/staging_lateral_tolerance", 0.045)),
+        self.exit_connector_sample_step = max(
+            0.002,
+            float(get(prefix + "exit/connector_sample_step", 0.010)),
         )
         self.exit_heading_tolerance = math.radians(
             abs(float(get(prefix + "exit/heading_tolerance_deg", 10.0)))
-        )
-        self.exit_alignment_tolerance = math.radians(
-            abs(float(get(prefix + "exit/alignment_tolerance_deg", 1.0)))
-        )
-        self.exit_alignment_gain = max(
-            0.0, float(get(prefix + "exit/alignment_gain", 2.0))
-        )
-        self.exit_alignment_max_angular_velocity = min(
-            self.maximum_angular_velocity,
-            max(
-                0.01,
-                abs(
-                    float(
-                        get(
-                            prefix
-                            + "exit/alignment_max_angular_velocity",
-                            0.30,
-                        )
-                    )
-                ),
-            ),
-        )
-        self.exit_alignment_min_angular_velocity = min(
-            self.exit_alignment_max_angular_velocity,
-            max(
-                0.0,
-                abs(
-                    float(
-                        get(
-                            prefix
-                            + "exit/alignment_min_angular_velocity",
-                            0.08,
-                        )
-                    )
-                ),
-            ),
         )
         self.exit_confirmation_frames = max(
             1, int(get(prefix + "exit/confirmation_frames", 6))
@@ -835,12 +1002,6 @@ class TunnelMissionController:
         self.mission_timeout = max(
             5.0, float(get(prefix + "timeouts/mission", 120.0))
         )
-        self.exit_confirmation_timeout = max(
-            0.5, float(get(prefix + "timeouts/exit_confirmation", 3.0))
-        )
-        self.exit_alignment_timeout = max(
-            0.5, float(get(prefix + "timeouts/exit_alignment", 3.0))
-        )
         self.exit_straight_timeout = max(
             0.5, float(get(prefix + "timeouts/exit_straight", 12.0))
         )
@@ -856,6 +1017,7 @@ class TunnelMissionController:
         self.state_started = rospy.Time.now()
         self.mission_started = None
         self.zone_gate = False
+        self.gate_requested = False
         self.start_requested = False
         self.revoke_requested = False
         self.manual_stop = False
@@ -878,6 +1040,14 @@ class TunnelMissionController:
         self.odom_history = deque(maxlen=100)
         self.map_from_odom = None
         self.frozen_odom_frame = ""
+        self.arm_generation = 0
+        self.armed_at = None
+        self.registered_map_from_odom = None
+        self.registered_odom_frame = ""
+        self.registration_source_stamp = None
+        self.registration_candidates = deque(maxlen=self.registration_samples)
+        self.last_registration_stamp = None
+        self.ready_published_generation = 0
 
         self.costmap = None
         self.costmap_version = 0
@@ -896,6 +1066,7 @@ class TunnelMissionController:
         self.map_path = None
         self.odom_path = None
         self.entry_staging_station = None
+        self.exit_connector_station = None
         self.path_index = 0
         self.map_path_index = 0
         self.remaining_distance = math.inf
@@ -926,8 +1097,6 @@ class TunnelMissionController:
         self.last_lane_path_confirmation_time = None
         self.exit_confirmation_started = False
         self.confirmation_started_at = None
-        self.exit_alignment_started = False
-        self.exit_alignment_settling = False
         self.join_start_x = self.join_start_y = self.join_start_yaw = 0.0
         self.join_origin_ready = False
 
@@ -946,6 +1115,9 @@ class TunnelMissionController:
         )
         self.diagnostics_pub = rospy.Publisher(
             "/tunnel/diagnostics", Float64MultiArray, queue_size=1, latch=True
+        )
+        self.ready_pub = rospy.Publisher(
+            self.ready_topic, Header, queue_size=1, latch=True
         )
 
         # Laser endpoints must be projected with the transform that was valid
@@ -966,6 +1138,7 @@ class TunnelMissionController:
             self.map_pose_topic, PoseStamped, self.map_pose_callback, queue_size=1
         )
         rospy.Subscriber(self.gate_topic, Bool, self.gate_callback, queue_size=1)
+        rospy.Subscriber(self.arm_topic, Header, self.arm_callback, queue_size=1)
         rospy.Subscriber(
             self.lane_path_topic,
             Float64MultiArray,
@@ -1008,13 +1181,235 @@ class TunnelMissionController:
         self._publish_state()
         rospy.loginfo("Tunnel mission state: %s", state)
 
+    def _reset_registration(self):
+        self.registered_map_from_odom = None
+        self.registered_odom_frame = ""
+        self.registration_source_stamp = None
+        self.registration_candidates.clear()
+        self.last_registration_stamp = None
+        self.ready_published_generation = 0
+
+    def arm_callback(self, message):
+        """Start one source-stamped portal-registration generation."""
+        if message.frame_id != "tunnel":
+            return
+        with self.lock:
+            generation = int(message.seq)
+            if generation == self.arm_generation:
+                return
+            if self.state not in (self.WAIT_GATE, self.COMPLETE):
+                rospy.logwarn(
+                    "Ignoring tunnel arm generation %d while %s",
+                    generation,
+                    self.state,
+                )
+                return
+            self.arm_generation = generation
+            self.armed_at = (
+                message.stamp
+                if generation > 0 and message.stamp != rospy.Time()
+                else rospy.Time.now()
+                if generation > 0
+                else None
+            )
+            self.zone_gate = False
+            self.gate_requested = False
+            self.start_requested = False
+            self.revoke_requested = False
+            self._reset_registration()
+            if generation > 0 and self.costmap is not None:
+                # Start collecting the live mission-local layer while the
+                # lane controller still drives.  Carry this prepared layer
+                # across the later gate instead of inserting a scan dwell.
+                self.costmap.reset_dynamic()
+                self.costmap_version += 1
+                self.grid_cache = None
+                self.grid_cache_version = -1
+                self.scan_updates = 0
+                self.last_processed_scan_stamp = None
+                self._publish_costmap(self.armed_at)
+            if generation > 0 and self.state == self.COMPLETE:
+                self._set_state(self.WAIT_GATE)
+            if generation > 0:
+                rospy.loginfo(
+                    "Tunnel portal registration armed: generation=%d "
+                    "stamp=%.3f",
+                    generation,
+                    self.armed_at.to_sec(),
+                )
+
+    def _registration_stamp_is_eligible(self, stamp):
+        if (
+            self.arm_generation <= 0
+            or self.armed_at is None
+            or self.registered_map_from_odom is not None
+        ):
+            return False
+        if stamp == rospy.Time() or stamp <= self.armed_at:
+            return False
+        now = rospy.Time.now()
+        if (stamp - now).to_sec() > self.maximum_future_stamp:
+            return False
+        if self.last_registration_stamp is not None and (
+            stamp <= self.last_registration_stamp
+        ):
+            return False
+        return True
+
+    def _submit_registration_candidate(
+        self, map_from_odom, odom_frame, stamp
+    ):
+        """Confirm and freeze a single mission-template transform."""
+        if not self._registration_stamp_is_eligible(stamp):
+            return False
+        candidate = tuple(float(value) for value in map_from_odom)
+        if not all(math.isfinite(value) for value in candidate):
+            return False
+        if self.registration_candidates:
+            previous_stamp, previous, previous_frame = (
+                self.registration_candidates[-1]
+            )
+            gap = (stamp - previous_stamp).to_sec()
+            position_delta = math.hypot(
+                candidate[0] - previous[0], candidate[1] - previous[1]
+            )
+            heading_delta = abs(normalize_angle(candidate[2] - previous[2]))
+            if (
+                gap <= 0.0
+                or gap > self.registration_maximum_gap
+                or odom_frame != previous_frame
+                or position_delta > self.registration_maximum_position_delta
+                or heading_delta > self.registration_maximum_heading_delta
+            ):
+                self.registration_candidates.clear()
+        self.registration_candidates.append((stamp, candidate, odom_frame))
+        self.last_registration_stamp = stamp
+        if len(self.registration_candidates) < self.registration_samples:
+            return False
+
+        count = float(len(self.registration_candidates))
+        x = sum(item[1][0] for item in self.registration_candidates) / count
+        y = sum(item[1][1] for item in self.registration_candidates) / count
+        sine = sum(
+            math.sin(item[1][2]) for item in self.registration_candidates
+        )
+        cosine = sum(
+            math.cos(item[1][2]) for item in self.registration_candidates
+        )
+        self.registered_map_from_odom = (x, y, math.atan2(sine, cosine))
+        self.registered_odom_frame = odom_frame
+        self.registration_source_stamp = stamp
+        rospy.loginfo(
+            "Tunnel portal transform frozen: generation=%d "
+            "template_from_%s=(%.3f, %.3f, %.1fdeg)",
+            self.arm_generation,
+            odom_frame,
+            self.registered_map_from_odom[0],
+            self.registered_map_from_odom[1],
+            math.degrees(self.registered_map_from_odom[2]),
+        )
+        return True
+
+    def _try_publish_ready(self, stamp):
+        """Publish readiness only at a safe, no-dwell lane handoff lead."""
+        if (
+            self.arm_generation <= 0
+            or self.registered_map_from_odom is None
+            or not self.registered_odom_frame
+            or self.ready_published_generation == self.arm_generation
+            or stamp == rospy.Time()
+            or self.registration_source_stamp is None
+            or stamp < self.registration_source_stamp
+        ):
+            return False
+        synchronized = self._synchronized_odom_pose(stamp)
+        if synchronized is None or self.odom_frame != self.registered_odom_frame:
+            return False
+        pose = Pose2D(
+            *odom_pose_to_map(synchronized, self.registered_map_from_odom)
+        )
+        travel_x = math.cos(self.entry_staging_pose.yaw)
+        travel_y = math.sin(self.entry_staging_pose.yaw)
+        progress = (
+            (pose.x - self.entry_staging_pose.x) * travel_x
+            + (pose.y - self.entry_portal_plane_y) * travel_y
+        )
+        lead = -progress
+        if not (
+            self.ready_minimum_entry_lead
+            <= lead
+            <= self.ready_maximum_entry_lead
+        ):
+            return False
+        if abs(normalize_angle(pose.yaw - self.entry_staging_pose.yaw)) > (
+            self.ready_maximum_heading_error
+        ):
+            return False
+        if self.costmap is None:
+            return False
+        if self.scan_updates < self.minimum_initial_scans:
+            return False
+        try:
+            entry_path, _ = portal_entry_path(
+                pose,
+                self.entry_staging_pose,
+                self.entry_inside_pose,
+                self.entry_tangent_ratio,
+                self.entry_minimum_tangent_length,
+                self.entry_maximum_tangent_length,
+                self.portal_sample_step,
+                self.entry_portal_velocity,
+                self.map_frame,
+            )
+            grid = self._planner_grid()
+        except (TypeError, ValueError):
+            return False
+        if (
+            not self._path_is_safe(grid, entry_path, 0)
+            or not self.planner.pose_is_collision_free(grid, self.goal)
+        ):
+            return False
+
+        self.ready_published_generation = self.arm_generation
+        ready = Header()
+        ready.seq = self.arm_generation
+        # Readiness is tied to the source scan whose synchronized odometry
+        # lies inside the configured handoff lead.  The SE(2) estimate itself
+        # remains the earlier frozen registration.
+        ready.stamp = stamp
+        ready.frame_id = "tunnel"
+        self.ready_pub.publish(ready)
+        rospy.loginfo(
+            "Tunnel locally ready: generation=%d entry_lead=%.3fm",
+            self.arm_generation,
+            lead,
+        )
+        if self.gate_requested and self.state in (self.WAIT_GATE, self.COMPLETE):
+            self.zone_gate = True
+            self.start_requested = True
+        return True
+
     def gate_callback(self, message):
         with self.lock:
             was_open = self.zone_gate
-            self.zone_gate = bool(message.data)
+            self.gate_requested = bool(message.data)
+            prepared = bool(
+                self.arm_generation > 0
+                and self.ready_published_generation == self.arm_generation
+                and self.registered_map_from_odom is not None
+                and self.registered_odom_frame
+            )
+            self.zone_gate = self.gate_requested and prepared
+            if self.gate_requested and not prepared:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Ignoring tunnel enable before matching local portal "
+                    "registration readiness",
+                )
+                return
             if self.zone_gate and not was_open:
                 self.start_requested = True
-            elif not self.zone_gate and was_open and self.state != self.COMPLETE:
+            elif not self.gate_requested and was_open and self.state != self.COMPLETE:
                 self.revoke_requested = True
 
     def sign_callback(self, message):
@@ -1177,21 +1572,54 @@ class TunnelMissionController:
             )
             return
         with self.lock:
-            if (
-                not self.zone_gate
-                or self.costmap is None
-                or self.map_from_odom is None
-                or not self.frozen_odom_frame
-            ):
+            registration_needed = self._registration_stamp_is_eligible(
+                source_stamp
+            )
+            pre_gate_scan = bool(
+                self.arm_generation > 0
+                and self.registered_map_from_odom is not None
+                and self.registered_odom_frame
+                and self.ready_published_generation != self.arm_generation
+                and self.costmap is not None
+            )
+            active_scan = bool(
+                self.zone_gate
+                and self.costmap is not None
+                and self.map_from_odom is not None
+                and self.frozen_odom_frame
+            )
+            if not registration_needed and not pre_gate_scan and not active_scan:
                 return
             if (
+                (pre_gate_scan or active_scan)
+                and
                 self.last_processed_scan_stamp is not None
                 and source_stamp <= self.last_processed_scan_stamp
             ):
                 return
-            map_from_odom = self.map_from_odom
-            target_frame = self.frozen_odom_frame
-            run_generation = self.run_generation
+            target_frame = (
+                self.odom_frame
+                if registration_needed
+                else self.registered_odom_frame
+                if pre_gate_scan
+                else self.frozen_odom_frame
+            )
+
+        detection = None
+        if registration_needed:
+            try:
+                detection = detect_portal(
+                    message.ranges,
+                    message.angle_min,
+                    message.angle_increment,
+                    message.range_min,
+                    message.range_max,
+                    self.portal_registration_config,
+                )
+            except ValueError as error:
+                rospy.logwarn_throttle(
+                    1.0, "Rejected tunnel portal scan: %s", error
+                )
 
         # Do not hold the controller lock while waiting for TF; odometry and
         # the fail-closed control timer must remain responsive.
@@ -1224,13 +1652,77 @@ class TunnelMissionController:
             float(translation.y),
             yaw_from_quaternion(rotation),
         )
-        sensor_pose = odom_pose_to_map(sensor_odom_pose, map_from_odom)
-        if not all(math.isfinite(value) for value in sensor_pose):
+        if not all(math.isfinite(value) for value in sensor_odom_pose):
             rospy.logerr_throttle(1.0, "Rejected non-finite tunnel scan TF")
             return
         processed = rospy.Time.now()
         if (processed - source_stamp).to_sec() > self.maximum_scan_age:
             rospy.logwarn_throttle(1.0, "Tunnel scan TF arrived too late")
+            return
+
+        with self.lock:
+            if registration_needed and self._registration_stamp_is_eligible(
+                source_stamp
+            ):
+                if detection is None:
+                    # Advance the source-stamp watermark even when geometry is
+                    # incomplete, so an older scan can never complete a newer
+                    # arm generation out of order.
+                    self.last_registration_stamp = source_stamp
+                elif target_frame == self.odom_frame:
+                    portal_in_odom = odom_pose_to_map(
+                        (
+                            detection.center_x,
+                            detection.center_y,
+                            detection.yaw,
+                        ),
+                        sensor_odom_pose,
+                    )
+                    template_feature = (
+                        self.registration_reference_pose.x,
+                        self.registration_reference_pose.y,
+                        self.registration_reference_pose.yaw,
+                    )
+                    candidate = map_from_odom_transform(
+                        template_feature, portal_in_odom
+                    )
+                    self._submit_registration_candidate(
+                        candidate, target_frame, source_stamp
+                    )
+
+            active_scan = bool(
+                self.zone_gate
+                and self.costmap is not None
+                and self.map_from_odom is not None
+                and self.frozen_odom_frame == target_frame
+            )
+            pre_gate_scan = bool(
+                not active_scan
+                and self.arm_generation > 0
+                and self.registered_map_from_odom is not None
+                and self.registered_odom_frame == target_frame
+                and self.ready_published_generation != self.arm_generation
+                and self.costmap is not None
+            )
+            if not active_scan and not pre_gate_scan:
+                return
+            if (
+                self.last_processed_scan_stamp is not None
+                and source_stamp <= self.last_processed_scan_stamp
+            ):
+                return
+            map_from_odom = (
+                self.map_from_odom
+                if active_scan
+                else self.registered_map_from_odom
+            )
+            scan_generation = (
+                self.run_generation if active_scan else self.arm_generation
+            )
+
+        sensor_pose = odom_pose_to_map(sensor_odom_pose, map_from_odom)
+        if not all(math.isfinite(value) for value in sensor_pose):
+            rospy.logerr_throttle(1.0, "Rejected non-finite tunnel scan TF")
             return
         effective_maximum = min(
             float(message.range_max), self.maximum_planning_range
@@ -1241,13 +1733,23 @@ class TunnelMissionController:
             return
 
         with self.lock:
-            if (
-                not self.zone_gate
-                or self.costmap is None
-                or self.map_from_odom != map_from_odom
-                or self.frozen_odom_frame != target_frame
-                or self.run_generation != run_generation
-            ):
+            if active_scan:
+                context_valid = bool(
+                    self.zone_gate
+                    and self.costmap is not None
+                    and self.map_from_odom == map_from_odom
+                    and self.frozen_odom_frame == target_frame
+                    and self.run_generation == scan_generation
+                )
+            else:
+                context_valid = bool(
+                    self.arm_generation == scan_generation
+                    and self.costmap is not None
+                    and self.registered_map_from_odom == map_from_odom
+                    and self.registered_odom_frame == target_frame
+                    and self.ready_published_generation != self.arm_generation
+                )
+            if not context_valid:
                 return
             if (
                 self.last_processed_scan_stamp is not None
@@ -1276,6 +1778,8 @@ class TunnelMissionController:
                 self.grid_cache = None
                 self.grid_cache_version = -1
                 self._publish_costmap(self.scan_stamp)
+            if not active_scan:
+                self._try_publish_ready(source_stamp)
 
     def lane_path_diagnostics_callback(self, message):
         now = rospy.Time.now()
@@ -1371,18 +1875,14 @@ class TunnelMissionController:
         self.start_requested = False
         self.revoke_requested = False
         self.speed_limit_pub.publish(Float64(data=self.entry_velocity_cap))
-        if self.costmap is not None:
-            self.costmap.reset_dynamic()
-            self.costmap_version += 1
-            self.grid_cache = None
-            self.grid_cache_version = -1
-            self.scan_updates = 0
-            self.last_processed_scan_stamp = None
-            self._publish_costmap(now)
+        # Registration already projected confirmed live scans through the
+        # frozen portal transform. Preserve that prepared costmap and its scan
+        # count so activation adds no registration/planning dwell.
         self.minimum_planning_scan_updates = self.minimum_initial_scans
         self.map_path = None
         self.odom_path = None
         self.entry_staging_station = None
+        self.exit_connector_station = None
         self.planned_grid = None
         self.soft_replan_contact_station = None
         self.path_index = 0
@@ -1404,8 +1904,6 @@ class TunnelMissionController:
         self.maximum_heading_error_seen = 0.0
         self.exit_confirmation_started = False
         self.confirmation_started_at = None
-        self.exit_alignment_started = False
-        self.exit_alignment_settling = False
         self.lane_path_stamp = None
         self.lane_path_valid = False
         self.lane_path_minimum_line_clearance = math.nan
@@ -1421,31 +1919,19 @@ class TunnelMissionController:
         problem = self._input_problem(now, require_scan=False)
         if problem is not None:
             rospy.logwarn_throttle(
-                1.0, "Waiting to anchor tunnel frame: %s", problem
-            )
-            return False
-        synchronized = self._synchronized_odom_pose(self.map_stamp)
-        if synchronized is None:
-            rospy.logwarn_throttle(
-                1.0, "Waiting to synchronize tunnel map pose and odometry"
+                1.0, "Waiting to use locally registered tunnel frame: %s", problem
             )
             return False
         if not self._set_lane_controller(False):
             self._fail("could not acquire cmd_vel")
             return False
-        self.map_from_odom = map_from_odom_transform(
-            (self.map_x, self.map_y, self.map_yaw), synchronized
-        )
-        self.frozen_odom_frame = self.odom_frame
+        self.map_from_odom = self.registered_map_from_odom
+        self.frozen_odom_frame = self.registered_odom_frame
         rospy.loginfo(
-            "Tunnel frame anchored: map=(%.4f, %.4f, %.2fdeg) "
-            "odom=(%.4f, %.4f, %.2fdeg) map_from_odom=(%.4f, %.4f, %.2fdeg)",
-            self.map_x,
-            self.map_y,
-            math.degrees(self.map_yaw),
-            synchronized[0],
-            synchronized[1],
-            math.degrees(synchronized[2]),
+            "Tunnel mission-local frame frozen from LiDAR: generation=%d "
+            "template_from_%s=(%.4f, %.4f, %.2fdeg)",
+            self.arm_generation,
+            self.frozen_odom_frame,
             self.map_from_odom[0],
             self.map_from_odom[1],
             math.degrees(self.map_from_odom[2]),
@@ -1459,18 +1945,21 @@ class TunnelMissionController:
         if self.costmap is None:
             return "static map"
         if self.map_from_odom is None:
-            if not self.map_ready or self.map_received is None:
-                return "AMCL map pose"
-            map_age = (now - self.map_stamp).to_sec()
-            if map_age < -self.maximum_pose_stamp_skew:
-                return "future AMCL map pose"
             if (
-                map_age > self.map_pose_timeout
-                or (now - self.map_received).to_sec() > self.map_pose_timeout
+                self.arm_generation <= 0
+                or self.ready_published_generation != self.arm_generation
+                or self.registered_map_from_odom is None
+                or not self.registered_odom_frame
+                or self.registration_source_stamp is None
             ):
-                return "stale AMCL map pose"
+                return "source-stamped local portal registration"
         if not self.odom_ready or self.odom_received is None:
             return "odometry"
+        if (
+            self.map_from_odom is None
+            and self.odom_frame != self.registered_odom_frame
+        ):
+            return "changed odometry frame since portal registration"
         if (
             self.map_from_odom is not None
             and self.odom_frame != self.frozen_odom_frame
@@ -1546,6 +2035,7 @@ class TunnelMissionController:
         self.map_path = None
         self.odom_path = None
         self.entry_staging_station = None
+        self.exit_connector_station = None
         self.planned_grid = None
         self.soft_replan_contact_station = None
         self.path_index = 0
@@ -1811,6 +2301,80 @@ class TunnelMissionController:
         worker.start()
         return False
 
+    def _build_moving_exit_path(self, plan, grid):
+        """Append the mandatory, fully swept forward exit connector."""
+        terminal = Pose2D(
+            float(plan.x[-1]),
+            float(plan.y[-1]),
+            float(plan.yaw[-1]),
+        )
+        forward_distance = (
+            (self.exit_outside_pose.x - terminal.x)
+            * math.cos(self.goal.yaw)
+            + (self.exit_outside_pose.y - terminal.y)
+            * math.sin(self.goal.yaw)
+        )
+        if forward_distance <= 1e-6:
+            return None, None, "outside pose is not ahead of the terminal pose"
+        try:
+            connector = portal_alignment_path(
+                terminal,
+                self.exit_outside_pose,
+                self.exit_connector_tangent_ratio,
+                self.exit_connector_minimum_tangent_length,
+                self.exit_connector_maximum_tangent_length,
+                self.exit_connector_sample_step,
+                self.exit_velocity,
+                self.map_frame,
+                label="tunnel_moving_exit_connector",
+            )
+            forward_step = (
+                np.diff(connector.x) * math.cos(self.goal.yaw)
+                + np.diff(connector.y) * math.sin(self.goal.yaw)
+            )
+            if np.any(forward_step <= 1e-9):
+                return None, None, "exit connector is not strictly forward"
+            maximum_curvature = float(np.max(np.abs(connector.curvature)))
+            minimum_turning_radius = float(
+                getattr(self.planner, "minimum_turning_radius", 0.0)
+            )
+            if (
+                minimum_turning_radius > 0.0
+                and maximum_curvature
+                > 1.0 / minimum_turning_radius + 1e-6
+            ):
+                return (
+                    None,
+                    None,
+                    "exit connector curvature %.3f exceeds %.3f"
+                    % (
+                        maximum_curvature,
+                        1.0 / minimum_turning_radius,
+                    ),
+                )
+            path, connector_station = tracking_path_with_exit_connector(
+                plan,
+                connector,
+                self.cruise_velocity,
+                self.minimum_velocity,
+                self.entry_velocity,
+                self.exit_velocity,
+                self.maximum_angular_velocity,
+                self.maximum_lateral_acceleration,
+                self.linear_acceleration,
+                self.linear_deceleration,
+                self.angular_acceleration,
+                self.map_frame,
+            )
+        except ValueError as error:
+            return None, None, str(error)
+        # Hybrid A* validates only its prefix.  The connector and its seam must
+        # pass the same exact oriented-footprint sweep even when no newer scan
+        # arrived while the planning thread was running.
+        if not self._path_is_safe(grid, path, 0):
+            return None, None, "exit connector is not collision-free"
+        return path, connector_station, ""
+
     def _plan_worker(
         self,
         generation,
@@ -1830,23 +2394,14 @@ class TunnelMissionController:
             plan = None
         plan_seconds = time.perf_counter() - wall_start
         map_path = None
+        exit_connector_station = None
+        exit_connector_problem = ""
         if plan is not None:
-            try:
-                map_path = tracking_path_from_plan(
-                    plan,
-                    self.cruise_velocity,
-                    self.minimum_velocity,
-                    self.entry_velocity,
-                    self.exit_velocity,
-                    self.maximum_angular_velocity,
-                    self.maximum_lateral_acceleration,
-                    self.linear_acceleration,
-                    self.linear_deceleration,
-                    self.angular_acceleration,
-                )
-            except ValueError as error:
-                rospy.logerr("Rejected Hybrid A* tracking path: %s", error)
-                plan = None
+            (
+                map_path,
+                exit_connector_station,
+                exit_connector_problem,
+            ) = self._build_moving_exit_path(plan, grid)
 
         with self.lock:
             if (
@@ -1860,11 +2415,13 @@ class TunnelMissionController:
             self.planning_thread = None
             self.last_plan_seconds = plan_seconds
             self.last_expanded_nodes = 0 if plan is None else plan.expanded_nodes
-            if plan is None:
+            if plan is None or map_path is None:
                 rospy.logwarn_throttle(
                     1.0,
-                    "Hybrid A* has no collision-free tunnel path (attempt %d)",
+                    "Hybrid A* has no complete collision-free tunnel path "
+                    "(attempt %d): %s",
                     attempt,
+                    exit_connector_problem or "planner returned no path",
                 )
                 self._publish_diagnostics()
                 return
@@ -1939,6 +2496,7 @@ class TunnelMissionController:
             )
             self.map_path = map_path
             self.odom_path = odom_path
+            self.exit_connector_station = exit_connector_station
             # Preserve the immutable layer used by Hybrid A*.  Later soft
             # evidence is compared cell-by-cell with this baseline, so an
             # already-priced clearance band cannot cause a scan-by-scan loop.
@@ -1960,6 +2518,12 @@ class TunnelMissionController:
                 plan.expanded_nodes,
                 self.last_plan_seconds,
                 self.costmap_version,
+            )
+            rospy.loginfo(
+                "Tunnel continuous exit appended at %.3fm; terminal speed "
+                "%.3fm/s",
+                exit_connector_station,
+                float(map_path.speed[-1]),
             )
             return
 
@@ -2310,6 +2874,7 @@ class TunnelMissionController:
         self.last_plan_attempt = None
         self.map_path = None
         self.odom_path = None
+        self.exit_connector_station = None
         self.planned_grid = None
         self.soft_replan_contact_station = None
         self.path_index = 0
@@ -2368,24 +2933,19 @@ class TunnelMissionController:
                 self.entry_path_position_tolerance,
                 self.entry_path_heading_tolerance,
             )
-        if self.state == self.FOLLOWING:
-            return self._path_endpoint_ready(
-                self.exit_staging_remaining_tolerance,
-                self.exit_staging_position_tolerance,
-                self.exit_staging_heading_tolerance,
-            )
         if self.state == self.EXITING:
             return self._exit_pose_ready()
         return False
 
     def _finish_tracking_phase(self, now):
         phase = self.state
-        self._publish_stop()
         if phase == self.ALIGNING_ENTRY:
+            self._publish_stop()
             self._clear_tracking_path()
             self._set_state(self.ENTERING, now)
             return
         if phase == self.ENTERING:
+            self._publish_stop()
             if not self._entry_clearance_ready():
                 self._fail("robot footprint did not clear the tunnel entrance")
                 return
@@ -2400,20 +2960,22 @@ class TunnelMissionController:
             )
             return
         if phase == self.FOLLOWING:
-            self._clear_tracking_path()
-            self.exit_alignment_started = False
-            self.exit_alignment_settling = False
-            self._set_state(self.ALIGNING_EXIT, now)
+            self._fail(
+                "continuous tunnel exit connector was not reached before "
+                "the tracking endpoint"
+            )
             return
         if phase == self.EXITING:
             if not self._exit_clearance_ready():
                 self._fail("robot footprint did not clear the tunnel exit")
                 return
-            self.exit_confirmation_started = False
-            self.confirmation_started_at = None
-            self.lane_path_confirmation_count = 0
-            self.last_lane_path_confirmation_time = None
-            self._set_state(self.VERIFY_EXIT, now)
+            if not self._lane_confirmed(now, self.exit_confirmation_frames):
+                self._fail(
+                    "safe rolling lane path was not confirmed before the "
+                    "continuous tunnel exit ended"
+                )
+                return
+            self._start_lane_join(now)
             return
         self._fail("unknown tunnel tracking phase %s" % phase)
 
@@ -2537,6 +3099,27 @@ class TunnelMissionController:
             # recommitting at the seam lets a constant-speed tracker overshoot
             # the narrow staging pose before its final heading has converged.
             self._set_state(self.ENTERING, now)
+        if (
+            self.state == self.FOLLOWING
+            and self.exit_connector_station is not None
+            and float(self.odom_path.station[self.path_index])
+            >= self.exit_connector_station
+        ):
+            # The Hybrid A* endpoint and exit connector are one continuous,
+            # prevalidated path.  Change only the mission phase so the speed
+            # limiter and the commanded motion remain continuous at the seam.
+            self._start_exit_confirmation(now)
+            self._set_state(self.EXITING, now)
+        if (
+            self.state == self.EXITING
+            and self._exit_clearance_ready()
+            and self._lane_confirmed(now, self.exit_confirmation_frames)
+        ):
+            # The camera path is generated while tunnel control still owns
+            # cmd_vel.  Hand it over as soon as the rear footprint clears the
+            # portal; neither controller inserts a zero command at the seam.
+            self._start_lane_join(now)
+            return
         self._publish_diagnostics()
         if self._tracking_endpoint_ready():
             self._finish_tracking_phase(now)
@@ -2579,146 +3162,6 @@ class TunnelMissionController:
         self.last_linear = limited.linear_velocity
         self.last_angular = limited.angular_velocity
         self.last_command_time = now
-
-    def _align_exit(self, now):
-        if self._portal_path_problem(
-            now, self.exit_alignment_timeout, "exit alignment"
-        ):
-            return
-        problem = self._input_problem(now, require_scan=True)
-        if problem is not None:
-            self._publish_stop()
-            self._fail("tunnel exit alignment lost %s" % problem)
-            return
-        current = Pose2D(*self._actual_map_pose())
-        grid = self._planner_grid()
-        if not self.planner.pose_is_collision_free(grid, current):
-            self._publish_stop()
-            self._fail("localized footprint is not free at exit staging")
-            return
-        if not self.exit_alignment_started:
-            self._publish_stop()
-            if (
-                abs(self.odom_linear_velocity) > self.planning_stopped_linear
-                or abs(self.odom_angular_velocity)
-                > self.planning_stopped_angular
-            ):
-                return
-            self.exit_alignment_started = True
-        delta_x = current.x - self.goal.x
-        delta_y = current.y - self.goal.y
-        lateral_error = abs(
-            -math.sin(self.goal.yaw) * delta_x
-            + math.cos(self.goal.yaw) * delta_y
-        )
-        if lateral_error > self.exit_staging_lateral_tolerance:
-            self._publish_stop()
-            self._fail(
-                "Hybrid A* exit staging lateral error %.3fm exceeds %.3fm"
-                % (lateral_error, self.exit_staging_lateral_tolerance)
-            )
-            return
-        heading_error = normalize_angle(self.goal.yaw - current.yaw)
-        if self.exit_alignment_settling:
-            self._publish_stop()
-            if (
-                abs(self.odom_linear_velocity) > self.planning_stopped_linear
-                or abs(self.odom_angular_velocity)
-                > self.planning_stopped_angular
-            ):
-                return
-            self.exit_alignment_settling = False
-        if abs(heading_error) > self.exit_alignment_tolerance:
-            target_angular = clamp(
-                self.exit_alignment_gain * heading_error,
-                -self.exit_alignment_max_angular_velocity,
-                self.exit_alignment_max_angular_velocity,
-            )
-            if abs(target_angular) < self.exit_alignment_min_angular_velocity:
-                target_angular = math.copysign(
-                    self.exit_alignment_min_angular_velocity,
-                    heading_error,
-                )
-            elapsed = (
-                self.control_period
-                if self.last_command_time is None
-                else max(0.0, (now - self.last_command_time).to_sec())
-            )
-            angular_delta = self.angular_acceleration * elapsed
-            angular = clamp(
-                target_angular,
-                self.last_angular - angular_delta,
-                self.last_angular + angular_delta,
-            )
-            if not self._command_is_safe(grid, 0.0, angular):
-                self._publish_stop()
-                self._fail("tunnel exit heading alignment is not collision-free")
-                return
-            command = Twist()
-            command.angular.z = angular
-            self.cmd_pub.publish(command)
-            self.last_linear = 0.0
-            self.last_angular = angular
-            self.last_command_time = now
-            return
-
-        self.exit_alignment_settling = True
-        self._publish_stop()
-        if (
-            abs(self.odom_linear_velocity) > self.planning_stopped_linear
-            or abs(self.odom_angular_velocity) > self.planning_stopped_angular
-        ):
-            return
-        self.exit_alignment_settling = False
-        distance = (
-            (self.exit_outside_pose.x - current.x) * math.cos(self.goal.yaw)
-            + (self.exit_outside_pose.y - current.y) * math.sin(self.goal.yaw)
-        )
-        try:
-            path = portal_straight_path(
-                current,
-                self.goal.yaw,
-                distance,
-                self.portal_sample_step,
-                self.exit_straight_velocity,
-                self.map_frame,
-                "tunnel_straight_exit",
-            )
-        except ValueError as error:
-            self._fail("invalid tunnel straight exit: %s" % error)
-            return
-        if not self._path_is_safe(grid, path, 0):
-            self._fail("surveyed tunnel straight exit is not collision-free")
-            return
-        self._commit_tracking_path(path, grid, now)
-        self._set_state(self.EXITING, now)
-        rospy.loginfo("Tunnel straight exit path: %.3fm", path.length)
-
-    def _verify_exit(self, now):
-        self._publish_stop()
-        problem = self._input_problem(now, require_scan=False)
-        if problem is not None:
-            self._fail("tunnel exit verification lost %s" % problem)
-            return
-        if (
-            abs(self.odom_linear_velocity) > self.planning_stopped_linear
-            or abs(self.odom_angular_velocity) > self.planning_stopped_angular
-        ):
-            if (now - self.state_started).to_sec() > self.exit_confirmation_timeout:
-                self._fail("tunnel exit motion did not settle")
-            return
-        if not self.exit_confirmation_started:
-            self._start_exit_confirmation(now)
-            return
-        if (
-            self._exit_pose_ready()
-            and self._exit_clearance_ready()
-            and self._lane_confirmed(now, self.exit_confirmation_frames)
-        ):
-            self._start_lane_join(now)
-            return
-        if (now - self.state_started).to_sec() > self.exit_confirmation_timeout:
-            self._fail("tunnel exit or safe rolling lane path was not confirmed")
 
     def _start_lane_join(self, now):
         self.speed_limit_pub.publish(Float64(data=self.join_velocity_cap))
@@ -2926,12 +3369,8 @@ class TunnelMissionController:
                 self._planning_tick(now)
             elif self.state == self.FOLLOWING:
                 self._follow(now)
-            elif self.state == self.ALIGNING_EXIT:
-                self._align_exit(now)
             elif self.state == self.EXITING:
                 self._follow(now)
-            elif self.state == self.VERIFY_EXIT:
-                self._verify_exit(now)
             elif self.state == self.JOINING_LANE:
                 self._join_lane(now)
 

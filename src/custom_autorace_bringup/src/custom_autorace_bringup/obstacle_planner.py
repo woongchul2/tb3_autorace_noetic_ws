@@ -11,11 +11,15 @@ import math
 
 import numpy as np
 
+from custom_autorace_bringup.parking_geometry import (
+    curvature_matched_quintic,
+)
 from custom_autorace_bringup.path_following import (
     AsymmetricFootprint,
     CommonPath,
     GoalTolerance,
     PathSafety,
+    Pose2D,
     SafetyMargins,
     SpeedProfile,
     StraightCorridorBoundary,
@@ -43,14 +47,6 @@ class Footprint(AsymmetricFootprint):
         )
         if not all(math.isfinite(value) and value >= 0.0 for value in margins):
             raise ValueError("footprint margins must be finite and non-negative")
-
-
-@dataclass
-class CourseAlignment:
-    progress: float
-    lateral: float
-    inliers: int
-    rms: float
 
 
 class RectanglePathChecker:
@@ -165,15 +161,21 @@ class CourseSplinePlanner:
         goal_position_tolerance=0.04,
         goal_heading_tolerance=math.radians(10.0),
         goal_crossing_max_distance=0.10,
-        registration_longitudinal_search=0.18,
-        registration_lateral_search=0.14,
-        registration_coarse_step=0.02,
-        registration_fine_window=0.012,
-        registration_fine_step=0.002,
-        registration_inlier_distance=0.025,
-        registration_minimum_inliers=15,
-        registration_maximum_rms=0.015,
-        registration_line_exclusion=0.025,
+        barrier_association_distance=0.025,
+        entry_connector_minimum_join_distance=0.12,
+        entry_connector_maximum_join_distance=0.32,
+        entry_connector_join_step=0.02,
+        entry_connector_tangent_ratios=(
+            0.12,
+            0.14,
+            0.16,
+            0.18,
+            0.20,
+            0.22,
+            0.10,
+            0.24,
+            0.28,
+        ),
     ):
         self.collision_checker = collision_checker
         self.validation_footprint = validation_footprint
@@ -250,40 +252,40 @@ class CourseSplinePlanner:
             heading=float(goal_heading_tolerance),
             terminal_crossing=float(goal_crossing_max_distance),
         )
-        self.registration_longitudinal_search = max(
-            0.02, float(registration_longitudinal_search)
+        self.barrier_association_distance = max(
+            0.005, float(barrier_association_distance)
         )
-        self.registration_lateral_search = max(
-            0.02, float(registration_lateral_search)
+        self.entry_connector_minimum_join_distance = max(
+            self.sample_spacing,
+            float(entry_connector_minimum_join_distance),
         )
-        self.registration_coarse_step = max(
-            0.005, float(registration_coarse_step)
+        self.entry_connector_maximum_join_distance = max(
+            self.entry_connector_minimum_join_distance,
+            float(entry_connector_maximum_join_distance),
         )
-        self.registration_fine_step = max(
-            0.001, float(registration_fine_step)
+        self.entry_connector_join_step = max(
+            self.sample_spacing, float(entry_connector_join_step)
         )
-        self.registration_fine_window = max(
-            self.registration_fine_step,
-            float(registration_fine_window),
-        )
-        self.registration_inlier_distance = max(
-            0.005, float(registration_inlier_distance)
-        )
-        self.registration_minimum_inliers = max(
-            5, int(registration_minimum_inliers)
-        )
-        self.registration_maximum_rms = max(
-            0.002, float(registration_maximum_rms)
-        )
-        self.registration_line_exclusion = max(
-            0.0, float(registration_line_exclusion)
+        try:
+            tangent_ratios = tuple(
+                float(value) for value in entry_connector_tangent_ratios
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "entry connector tangent ratios must be finite and positive"
+            ) from error
+        if not tangent_ratios or not all(
+            math.isfinite(value) and value > 0.0 for value in tangent_ratios
+        ):
+            raise ValueError(
+                "entry connector tangent ratios must be finite and positive"
+            )
+        self.entry_connector_tangent_ratios = tuple(
+            dict.fromkeys(tangent_ratios)
         )
         self._template = None
         self._nominal_obstacles = np.empty((0, 2), dtype=np.float64)
-        self._registration_obstacles = np.empty((0, 2), dtype=np.float64)
         self._registration_boxes = np.empty((0, 4), dtype=np.float64)
-        self._nominal_right_line = -math.inf
-        self._nominal_left_line = math.inf
 
     @staticmethod
     def _clamped_second_derivatives(x, y, start_slope=0.0, end_slope=0.0):
@@ -493,7 +495,6 @@ class CourseSplinePlanner:
             nominal_obstacle_points, dtype=np.float64
         ).reshape((-1, 2))
         self._nominal_obstacles = nominal_obstacle_points.copy()
-        self._registration_obstacles = nominal_obstacle_points[::3].copy()
         sorted_x = np.sort(np.unique(nominal_obstacle_points[:, 0]))
         breaks = np.flatnonzero(np.diff(sorted_x) > 0.15) + 1
         x_groups = np.split(sorted_x, breaks)
@@ -515,8 +516,6 @@ class CourseSplinePlanner:
         self._registration_boxes = np.asarray(
             boxes, dtype=np.float64
         ).reshape((-1, 4))
-        self._nominal_right_line = float(right_line)
-        self._nominal_left_line = float(left_line)
 
         path = self._make_template()
         path.safety = self.collision_checker.safety(
@@ -539,188 +538,6 @@ class CourseSplinePlanner:
         self._template = path
         return True
 
-    def _rectangle_surface_matches(self, points, sensor_origin=None):
-        """Return distance and face axis, excluding faces hidden from LiDAR."""
-        count = points.shape[0]
-        if count == 0 or self._registration_boxes.shape[0] == 0:
-            return (
-                np.full(count, math.inf),
-                np.full(count, -1, dtype=np.int32),
-            )
-        all_distances = []
-        all_axes = []
-        for minimum_x, maximum_x, minimum_y, maximum_y in self._registration_boxes:
-            clipped_y = np.clip(points[:, 1], minimum_y, maximum_y)
-            clipped_x = np.clip(points[:, 0], minimum_x, maximum_x)
-            faces = np.column_stack(
-                (
-                    np.hypot(points[:, 0] - minimum_x, points[:, 1] - clipped_y),
-                    np.hypot(points[:, 0] - maximum_x, points[:, 1] - clipped_y),
-                    np.hypot(points[:, 0] - clipped_x, points[:, 1] - minimum_y),
-                    np.hypot(points[:, 0] - clipped_x, points[:, 1] - maximum_y),
-                )
-            )
-            if sensor_origin is not None:
-                sensor_x, sensor_y = sensor_origin
-                visible = np.zeros(4, dtype=bool)
-                if sensor_x <= minimum_x:
-                    visible[0] = True
-                elif sensor_x >= maximum_x:
-                    visible[1] = True
-                if sensor_y <= minimum_y:
-                    visible[2] = True
-                elif sensor_y >= maximum_y:
-                    visible[3] = True
-                faces[:, ~visible] = math.inf
-            face = np.argmin(faces, axis=1)
-            all_distances.append(faces[np.arange(count), face])
-            all_axes.append((face >= 2).astype(np.int32))
-        distance_matrix = np.column_stack(all_distances)
-        rectangle = np.argmin(distance_matrix, axis=1)
-        distance = distance_matrix[np.arange(count), rectangle]
-        axes = np.column_stack(all_axes)[np.arange(count), rectangle]
-        return distance, axes
-
-    def align_pose(self, seed_progress, seed_lateral, live_obstacle_points):
-        """Refine the AMCL translation with coarse/fine LiDAR matching."""
-        points = np.asarray(live_obstacle_points, dtype=np.float64).reshape(
-            (-1, 2)
-        )
-        points = points[np.all(np.isfinite(points), axis=1)]
-        if (
-            points.shape[0] < self.registration_minimum_inliers
-            or self._registration_obstacles.shape[0] < 4
-            or not math.isfinite(seed_progress)
-            or not math.isfinite(seed_lateral)
-        ):
-            return None
-
-        minimum_x = float(np.min(self._registration_obstacles[:, 0])) - 0.10
-        maximum_x = float(np.max(self._registration_obstacles[:, 0])) + 0.10
-        minimum_y = self._nominal_right_line - 0.10
-        maximum_y = self._nominal_left_line + 0.10
-
-        def evaluate(progress, lateral):
-            absolute = points + np.asarray([progress, lateral])
-            usable = (
-                (absolute[:, 0] >= minimum_x)
-                & (absolute[:, 0] <= maximum_x)
-                & (absolute[:, 1] >= minimum_y)
-                & (absolute[:, 1] <= maximum_y)
-            )
-            if self.registration_line_exclusion > 0.0:
-                usable &= (
-                    np.abs(absolute[:, 1] - self._nominal_right_line)
-                    >= self.registration_line_exclusion
-                ) & (
-                    np.abs(absolute[:, 1] - self._nominal_left_line)
-                    >= self.registration_line_exclusion
-                )
-            if np.count_nonzero(usable) < self.registration_minimum_inliers:
-                return None
-            distance, axes = self._rectangle_surface_matches(
-                absolute[usable], (progress, lateral)
-            )
-            inlier_mask = distance < self.registration_inlier_distance
-            inliers = int(np.count_nonzero(inlier_mask))
-            inlier_distance = distance[inlier_mask]
-            inlier_mse = (
-                float(np.mean(inlier_distance ** 2))
-                if inlier_distance.size
-                else math.inf
-            )
-            robust_loss = float(
-                np.mean(
-                    np.minimum(
-                        (distance / self.registration_inlier_distance) ** 2,
-                        1.0,
-                    )
-                )
-            )
-            prior = 1e-7 * (
-                ((progress - seed_progress) / 0.12) ** 2
-                + ((lateral - seed_lateral) / 0.10) ** 2
-            )
-            return (
-                robust_loss + prior,
-                -inliers,
-                inlier_mse,
-                axes,
-                distance,
-            )
-
-        def search(progress_values, lateral_values):
-            best = None
-            for progress in progress_values:
-                for lateral in lateral_values:
-                    score = evaluate(float(progress), float(lateral))
-                    if score is None:
-                        continue
-                    candidate = score + (float(progress), float(lateral))
-                    if best is None or candidate[:3] + candidate[-2:] < (
-                        best[:3] + best[-2:]
-                    ):
-                        best = candidate
-            return best
-
-        coarse = search(
-            np.arange(
-                seed_progress - self.registration_longitudinal_search,
-                seed_progress
-                + self.registration_longitudinal_search
-                + 0.5 * self.registration_coarse_step,
-                self.registration_coarse_step,
-            ),
-            np.arange(
-                seed_lateral - self.registration_lateral_search,
-                seed_lateral
-                + self.registration_lateral_search
-                + 0.5 * self.registration_coarse_step,
-                self.registration_coarse_step,
-            ),
-        )
-        if coarse is None:
-            return None
-        coarse_progress, coarse_lateral = coarse[-2:]
-        fine = search(
-            np.arange(
-                coarse_progress - self.registration_fine_window,
-                coarse_progress
-                + self.registration_fine_window
-                + 0.5 * self.registration_fine_step,
-                self.registration_fine_step,
-            ),
-            np.arange(
-                coarse_lateral - self.registration_fine_window,
-                coarse_lateral
-                + self.registration_fine_window
-                + 0.5 * self.registration_fine_step,
-                self.registration_fine_step,
-            ),
-        )
-        if fine is None:
-            return None
-        inliers = int(-fine[1])
-        rms = math.sqrt(max(0.0, float(fine[2])))
-        axes = fine[3]
-        distances = fine[4]
-        inlier_mask = distances < self.registration_inlier_distance
-        x_normal_count = int(np.count_nonzero(inlier_mask & (axes == 0)))
-        y_normal_count = int(np.count_nonzero(inlier_mask & (axes == 1)))
-        if (
-            inliers < self.registration_minimum_inliers
-            or rms > self.registration_maximum_rms
-            or x_normal_count < 4
-            or y_normal_count < 4
-        ):
-            return None
-        return CourseAlignment(
-            progress=float(fine[-2]),
-            lateral=float(fine[-1]),
-            inliers=inliers,
-            rms=rms,
-        )
-
     def stabilize_known_barrier_returns(
         self,
         relative_points,
@@ -735,11 +552,13 @@ class CourseSplinePlanner:
         rectangles.  Feeding every noisy ray hit back as an additional point
         obstacle double-counts those rectangles and turns isolated range noise
         into a false collision.  The registration step has already frozen the
-        measured course frame in odom, so a coherent return cluster belonging
-        to a known face is represented by that face's surveyed plane.  Points
-        that do not form a known face remain unchanged and continue to
-        represent real, previously unknown obstacles.  A displacement larger
-        than the association gate is likewise preserved as live geometry.
+        measured course frame in odom.  A coherent return cluster belonging
+        to a known face is flattened at its measured face-normal median: this
+        removes ray noise without erasing a real displacement from the
+        surveyed plane.  Points that do not form a known face remain unchanged
+        and continue to represent real, previously unknown obstacles.  A
+        displacement larger than the association gate is likewise preserved
+        as live geometry.
         """
         points = np.asarray(relative_points, dtype=np.float64).reshape((-1, 2))
         if points.size == 0 or self._registration_boxes.size == 0:
@@ -750,7 +569,7 @@ class CourseSplinePlanner:
             return points.copy()
 
         threshold = (
-            self.registration_inlier_distance
+            self.barrier_association_distance
             if association_distance is None
             else max(0.0, float(association_distance))
         )
@@ -808,7 +627,10 @@ class CourseSplinePlanner:
             nominal_position = face_positions[face]
             axis = 0 if face < 2 else 1
             tangent_axis = 1 - axis
-            stabilized[selected, axis] = nominal_position
+            normal_offset = float(
+                np.median(absolute[selected, axis] - nominal_position)
+            )
+            stabilized[selected, axis] = nominal_position + normal_offset
             tangent_minimum, tangent_maximum = (
                 (minimum_y, maximum_y)
                 if axis == 0
@@ -824,6 +646,214 @@ class CourseSplinePlanner:
         return stabilized - np.asarray(
             [float(sensor_progress), float(sensor_lateral)], dtype=np.float64
         )
+
+    def _entry_tangent_pairs(self):
+        """Use balanced controls so the bounded search stays sensor-rate safe."""
+
+        ratios = self.entry_connector_tangent_ratios
+        return tuple((ratio, ratio) for ratio in ratios)
+
+    def _entry_connector_passes_sampled_boundaries(self, connector, path):
+        """Cheap necessary boundary check before the exact swept validator.
+
+        A negative clearance at an already sampled connector pose proves the
+        continuous sweep unsafe.  Positive samples are not treated as proof:
+        the normal validator still checks every translation/heading interval,
+        fixed obstacle and map boundary for the surviving candidates.
+        """
+
+        points, heading, _ = connector
+        safety = path.safety
+        uncertainty = (
+            safety.margins.uncertainty
+            + float(path.localization_uncertainty[0])
+        )
+        footprint = self.collision_checker.validator.footprint.expanded(
+            safety.margins.line + uncertainty
+        )
+        boundaries = (*safety.line_boundaries, *safety.map_boundaries)
+        for point, yaw in zip(points, heading):
+            pose = Pose2D(float(point[0]), float(point[1]), float(yaw))
+            if any(
+                boundary.clearance(pose, footprint) <= 0.0
+                for boundary in boundaries
+            ):
+                return False
+        return True
+
+    def _join_entry_connector(self, path, connector, join_index):
+        """Join one G2 connector to a suffix and rebuild common metadata."""
+
+        points, heading, curvature = connector
+        join_index = int(join_index)
+        tail = slice(join_index + 1, None)
+        count = int(points.shape[0])
+        direction = int(path.direction[join_index])
+        feedforward = float(path.feedforward_scale[join_index])
+        line_overlap = float(path.line_overlap_allowance[join_index])
+        localization = float(path.localization_uncertainty[join_index])
+        connected = CommonPath(
+            x=np.concatenate((points[:, 0], path.x[tail])),
+            y=np.concatenate((points[:, 1], path.y[tail])),
+            heading=np.concatenate((heading, path.heading[tail])),
+            curvature=np.concatenate((curvature, path.curvature[tail])),
+            speed=0.0,
+            direction=np.concatenate(
+                (
+                    np.full(count, direction, dtype=np.int8),
+                    path.direction[tail],
+                )
+            ),
+            feedforward_scale=np.concatenate(
+                (
+                    np.full(count, feedforward, dtype=np.float64),
+                    path.feedforward_scale[tail],
+                )
+            ),
+            line_overlap_allowance=np.concatenate(
+                (
+                    np.full(count, line_overlap, dtype=np.float64),
+                    path.line_overlap_allowance[tail],
+                )
+            ),
+            localization_uncertainty=np.concatenate(
+                (
+                    np.full(count, localization, dtype=np.float64),
+                    path.localization_uncertainty[tail],
+                )
+            ),
+            frame_id=path.frame_id,
+            goal_tolerance=path.goal_tolerance,
+            safety=path.safety,
+            label=path.label + "_entry_connected",
+        )
+        connected.speed = build_speed_profile(
+            connected.station,
+            connected.curvature * connected.feedforward_scale,
+            self.speed_profile,
+        )
+        connected.curvature_variation = float(
+            np.sum(np.abs(np.diff(connected.curvature)))
+        )
+        segment = np.diff(connected.station)
+        connected.expected_time = float(
+            np.sum(
+                2.0
+                * segment
+                / np.maximum(
+                    connected.speed[:-1] + connected.speed[1:], 1e-6
+                )
+            )
+        )
+        return connected
+
+    def connect_entry(self, path, start_heading, start_curvature=0.0):
+        """Connect the live body pose to a safe downstream spline pose.
+
+        ``path`` is already expressed relative to the live body position by
+        :meth:`plan`.  Every candidate therefore starts at exactly ``(0, 0)``
+        with the measured heading.  A candidate is executable only when its
+        curvature stays inside the configured yaw/lateral limits and its
+        rectangle sweep is safe.  The controller freezes the returned complete
+        connector-plus-suffix path and performs the one authoritative full
+        sweep (including the seam) before readiness.  No direct two-point or
+        lateral-jump fallback is retained.
+        """
+
+        if not isinstance(path, CommonPath) or path.size < 3:
+            return None
+        start_heading = float(start_heading)
+        start_curvature = float(start_curvature)
+        if not all(math.isfinite(value) for value in (start_heading, start_curvature)):
+            return None
+        maximum_curvature = min(
+            self.maximum_angular_velocity / self.minimum_velocity,
+            self.maximum_lateral_acceleration / self.minimum_velocity ** 2,
+        )
+        if abs(start_curvature) > maximum_curvature + 1e-9:
+            return None
+
+        join_distances = np.arange(
+            self.entry_connector_minimum_join_distance,
+            self.entry_connector_maximum_join_distance
+            + 0.5 * self.entry_connector_join_step,
+            self.entry_connector_join_step,
+            dtype=np.float64,
+        )
+        join_indexes = []
+        for distance in join_distances:
+            index = int(np.searchsorted(path.station, distance, side="left"))
+            if 1 <= index < path.size - 1 and index not in join_indexes:
+                join_indexes.append(index)
+
+        start_pose = (0.0, 0.0, start_heading)
+        for join_index in join_indexes:
+            end_pose = (
+                float(path.x[join_index]),
+                float(path.y[join_index]),
+                float(path.heading[join_index]),
+            )
+            chord = math.hypot(end_pose[0], end_pose[1])
+            if chord <= self.sample_spacing:
+                continue
+            end_curvature = float(path.curvature[join_index])
+            if abs(end_curvature) > maximum_curvature + 1e-9:
+                continue
+            for start_ratio, end_ratio in self._entry_tangent_pairs():
+                try:
+                    connector = curvature_matched_quintic(
+                        start_pose,
+                        end_pose,
+                        start_curvature,
+                        end_curvature,
+                        start_ratio * chord,
+                        end_ratio * chord,
+                        self.sample_spacing,
+                    )
+                    connector_path = CommonPath(
+                        x=connector[0][:, 0],
+                        y=connector[0][:, 1],
+                        heading=connector[1],
+                        curvature=connector[2],
+                        direction=int(path.direction[join_index]),
+                        frame_id=path.frame_id,
+                        safety=path.safety,
+                        label="obstacle_entry_connector",
+                    )
+                except ValueError:
+                    continue
+                if (
+                    float(np.max(np.abs(connector_path.curvature)))
+                    > maximum_curvature + 1e-9
+                ):
+                    continue
+                if not self._entry_connector_passes_sampled_boundaries(
+                    connector, path
+                ):
+                    continue
+                connector_validation = self.collision_checker.validator.validate_path(
+                    connector_path
+                )
+                if not connector_validation.safe:
+                    continue
+
+                connected = self._join_entry_connector(
+                    path, connector, join_index
+                )
+                connected.line_clearance = min(
+                    path.line_clearance,
+                    connector_validation.minimum_line_clearance,
+                )
+                connected.obstacle_clearance = min(
+                    path.obstacle_clearance,
+                    connector_validation.minimum_obstacle_clearance,
+                )
+                connected.map_clearance = min(
+                    path.map_clearance,
+                    connector_validation.minimum_map_clearance,
+                )
+                return connected
+        return None
 
     def plan(
         self,

@@ -1,0 +1,10 @@
+# Deterministic Gazebo tunnel regression layouts.  Each layout rotates the
+# original three-cylinder group around the tunnel_obstacle model origin; the
+# source world remains unchanged and layout_a exactly preserves its geometry.
+layouts:
+  layout_a:
+    rotation_deg: 0.0
+  layout_b:
+    rotation_deg: 90.0
+  layout_c:
+    rotation_deg: 180.0

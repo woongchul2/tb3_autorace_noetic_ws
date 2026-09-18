@@ -8,8 +8,8 @@ import threading
 
 import numpy as np
 import rospy
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, Float64, Float64MultiArray, UInt8
 from std_srvs.srv import SetBool, SetBoolResponse
 from turtlebot3_autorace_msgs.msg import LaneCenterline
@@ -186,6 +186,32 @@ class RollingLanePath:
     mean_confidence: float
     horizon: float
     observed_start_station: float
+
+
+@dataclass(frozen=True)
+class RollingLanePathSelection:
+    """One camera calculation split into observation and drive decisions."""
+
+    observation: object
+    executable: object
+    rejection_reason: str
+
+
+def common_path_message(path, stamp):
+    """Expose the already-built rolling path without recomputing geometry."""
+
+    message = Path()
+    message.header.stamp = stamp
+    message.header.frame_id = path.frame_id
+    for x, y, heading in zip(path.x, path.y, path.heading):
+        pose = PoseStamped()
+        pose.header = message.header
+        pose.pose.position.x = float(x)
+        pose.pose.position.y = float(y)
+        pose.pose.orientation.z = math.sin(0.5 * float(heading))
+        pose.pose.orientation.w = math.cos(0.5 * float(heading))
+        message.poses.append(pose)
+    return message
 
 
 @dataclass(frozen=True)
@@ -957,6 +983,21 @@ def validate_local_lane_path(
     offset limit in the camera blind zone.
     """
 
+    validate_local_lane_path_geometry(local_path)
+    minimum_executable_velocity = validated_minimum_executable_velocity(
+        speed_profile, minimum_executable_velocity
+    )
+    validate_local_lane_path_execution(
+        local_path, minimum_executable_velocity
+    )
+
+
+def validated_minimum_executable_velocity(
+    speed_profile,
+    minimum_executable_velocity,
+):
+    """Validate the measured crawl threshold once per camera frame."""
+
     minimum_executable_velocity = float(minimum_executable_velocity)
     if (
         not math.isfinite(minimum_executable_velocity)
@@ -964,13 +1005,15 @@ def validate_local_lane_path(
         or minimum_executable_velocity > speed_profile.minimum_velocity
     ):
         raise ValueError("minimum executable lane velocity is invalid")
-    if not (
-        np.all(np.isfinite(local_path.curvature))
-        and np.all(np.isfinite(local_path.speed))
-        and np.all(np.diff(local_path.x) > 1e-6)
-        and np.all(np.diff(local_path.station) > 1e-9)
-    ):
-        raise ValueError("reference lane path geometry is invalid")
+    return minimum_executable_velocity
+
+
+def validate_local_lane_path_execution(
+    local_path,
+    minimum_executable_velocity,
+):
+    """Apply normal-lane drive authority after geometry is accepted once."""
+
     if float(np.min(local_path.speed)) < (
         minimum_executable_velocity * (1.0 - 1e-9)
     ):
@@ -979,7 +1022,19 @@ def validate_local_lane_path(
         )
 
 
-def build_rolling_lane_path(
+def validate_local_lane_path_geometry(local_path):
+    """Validate geometry independently from normal-lane control authority."""
+
+    if not (
+        np.all(np.isfinite(local_path.curvature))
+        and np.all(np.isfinite(local_path.speed))
+        and np.all(np.diff(local_path.x) > 1e-6)
+        and np.all(np.diff(local_path.station) > 1e-9)
+    ):
+        raise ValueError("reference lane path geometry is invalid")
+
+
+def build_rolling_lane_path_selection(
     message,
     capture_pose,
     odom_frame,
@@ -1097,7 +1152,13 @@ def build_rolling_lane_path(
         confidence,
         calibration,
     )
+    minimum_executable_velocity = validated_minimum_executable_velocity(
+        speed_profile, calibration.minimum_executable_velocity
+    )
+    first_observation = None
+    executable = None
     last_geometry_error = None
+    last_execution_error = None
     for (
         local_forward,
         local_lateral,
@@ -1136,19 +1197,38 @@ def build_rolling_lane_path(
                 ),
                 label="camera_lane",
             )
-            validate_local_lane_path(
-                local_path,
-                speed_profile,
-                calibration.minimum_executable_velocity,
-            )
         except (ValueError, np.linalg.LinAlgError) as error:
             last_geometry_error = error
             continue
+        try:
+            validate_local_lane_path_geometry(local_path)
+        except ValueError as error:
+            last_geometry_error = error
+            continue
+        candidate = (
+            local_path,
+            selected_samples,
+            selected_confidence,
+            selected_horizon,
+            observed_start_index,
+        )
+        if first_observation is None:
+            first_observation = candidate
+        try:
+            validate_local_lane_path_execution(
+                local_path,
+                minimum_executable_velocity,
+            )
+        except ValueError as error:
+            last_execution_error = error
+            continue
+        executable = candidate
         break
-    else:
+    if first_observation is None:
         if last_geometry_error is not None:
             raise last_geometry_error
         raise ValueError("no lane boundary has valid reference geometry")
+
     capture_pose = Pose2D.from_value(capture_pose)
     transform = RigidTransform2D(
         capture_pose.x,
@@ -1157,15 +1237,53 @@ def build_rolling_lane_path(
         source_frame="base_footprint",
         target_frame=str(odom_frame) or "odom",
     )
-    return RollingLanePath(
-        path=transform.apply_path(local_path),
-        valid_samples=selected_samples,
-        mean_confidence=selected_confidence,
-        horizon=selected_horizon,
-        observed_start_station=float(
-            local_path.station[observed_start_index]
+
+    def transformed(candidate):
+        local_path, samples, confidence, horizon, start_index = candidate
+        return RollingLanePath(
+            path=transform.apply_path(local_path),
+            valid_samples=samples,
+            mean_confidence=confidence,
+            horizon=horizon,
+            observed_start_station=float(local_path.station[start_index]),
+        )
+
+    selected_observation = (
+        executable if executable is not None else first_observation
+    )
+    observation = transformed(selected_observation)
+    return RollingLanePathSelection(
+        observation=observation,
+        executable=observation if executable is not None else None,
+        rejection_reason=(
+            ""
+            if executable is not None
+            else str(last_execution_error or "lane path is not executable")
         ),
     )
+
+
+def build_rolling_lane_path(
+    message,
+    capture_pose,
+    odom_frame,
+    calibration,
+    speed_profile,
+    safety_config=None,
+):
+    """Build the normal-lane path, retaining the historical strict API."""
+
+    selection = build_rolling_lane_path_selection(
+        message,
+        capture_pose,
+        odom_frame,
+        calibration,
+        speed_profile,
+        safety_config,
+    )
+    if selection.executable is None:
+        raise ValueError(selection.rejection_reason)
+    return selection.executable
 
 
 class SafeLaneController:
@@ -1179,6 +1297,9 @@ class SafeLaneController:
         self.cmd_vel_topic = rospy.get_param("~cmd_vel_topic", "/cmd_vel")
         self.diagnostics_topic = rospy.get_param(
             "~diagnostics_topic", "/control/lane_path_diagnostics"
+        )
+        self.path_topic = rospy.get_param(
+            "~path_topic", "/control/lane_path"
         )
         self.target_center = float(rospy.get_param("~target_center", 500.0))
         self.maximum_velocity = float(rospy.get_param("~maximum_velocity", 0.1))
@@ -1468,6 +1589,7 @@ class SafeLaneController:
         self.diagnostics_pub = rospy.Publisher(
             self.diagnostics_topic, Float64MultiArray, queue_size=1
         )
+        self.path_pub = rospy.Publisher(self.path_topic, Path, queue_size=1)
         rospy.Subscriber(
             self.centerline_topic,
             LaneCenterline,
@@ -1633,7 +1755,7 @@ class SafeLaneController:
                 )
                 return
             try:
-                rolling = build_rolling_lane_path(
+                selection = build_rolling_lane_path_selection(
                     message,
                     capture.pose,
                     capture.frame_id,
@@ -1644,6 +1766,19 @@ class SafeLaneController:
             except (TypeError, ValueError, np.linalg.LinAlgError) as error:
                 rospy.logwarn_throttle(
                     1.0, "Rejecting invalid lane centreline: %s", str(error)
+                )
+                return
+            self.path_pub.publish(
+                common_path_message(
+                    selection.observation.path, message.header.stamp
+                )
+            )
+            rolling = selection.executable
+            if rolling is None:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Rejecting invalid lane centreline: %s",
+                    selection.rejection_reason,
                 )
                 return
 
@@ -1677,10 +1812,10 @@ class SafeLaneController:
                 tracking.path_index,
                 desired_speed=desired_speed,
                 linear_velocity=latest.linear_velocity,
-                angular_velocities=(
+                angular_velocities=self.path_follower.stopping_angular_velocities(
+                    tracking,
+                    latest.linear_velocity,
                     latest.angular_velocity,
-                    self.path_follower.last_angular,
-                    tracking.angular_velocity,
                 ),
                 reaction_time=self.path_safety_config.reaction_time,
                 linear_deceleration=self.speed_profile.linear_deceleration,

@@ -10,7 +10,11 @@
 [`README.md`](README.md), 과거 A/B 결과는
 [`docs/VALIDATION_HISTORY.md`](docs/VALIDATION_HISTORY.md)를 참조합니다.
 
-## 이전 전 중복 조사
+## 공통화 이전 코드의 중복 조사
+
+아래 표는 제거한 이전 구현을 조사한 기록이며 현재 런타임 구조가 아닙니다. 당시 각
+컨트롤러에 흩어져 있던 계산 중 미션 판단만 남기고, 경로 표현·추종·제한·완료·sweep를
+공통 라이브러리로 옮겼습니다.
 
 | 미션 | 경로·정렬 | 이전 추종·속도 | 이전 완료 판정 | 안전 검사 | 유지한 미션 판단 |
 |---|---|---|---|---|---|
@@ -21,14 +25,18 @@
 
 ## 공통 계산 경로
 
-각 미션 컨트롤러는 경로 선택과 센서 기반 정렬까지만 소유합니다. 실행 경로를 odom에
-한 번 고정한 뒤 모든 계산은 다음 순서를 따릅니다.
+순차 매니저는 다음 미션 하나에 세대 번호가 있는 `arm`만 보냅니다. 각 미션 컨트롤러는
+그 세대의 센서 표본으로 경로를 선택·정렬하고, 실행 경로 전체 검증이 끝난 뒤에만
+`ready`를 보냅니다. 매니저의 enable gate는 이 fresh `ready`로만 열립니다. 연결 직선의
+절대 길이나 AMCL polygon은 활성화 조건이 아닙니다. 실행 경로를 odom에 한 번 고정한 뒤
+모든 계산은 다음 순서를 따릅니다.
 
 ```text
 미션 경로 선택기
   → 미션 경로 정렬기
   → CommonPath 생성
   → SweptFootprintValidator
+  → generation/source stamp가 일치하는 ready
   → PathFollower
   → 활성 제어기의 /cmd_vel 발행
   → 일반 차선 제어권 반환
@@ -44,7 +52,10 @@
 
 ## 라이브러리 인터페이스
 
-`src/custom_autorace_bringup/path_following.py`가 다음 기능을 한 번만 구현합니다.
+`src/custom_autorace_bringup/local_registration.py`는 명명된 점·방향성 면과 카메라
+곡선을 이용한 mission-local→odom SE(2), 퇴화 검사, covariance와 연속 표본 확인을
+공통으로 구현합니다. `src/custom_autorace_bringup/path_following.py`는 다음 실행 기능을
+한 번만 구현합니다.
 
 - `path_from_xy`, `path_from_poses`: 위치 또는 자세열에서 `CommonPath` 생성
 - `RigidTransform2D`, `freeze_path_in_odom`: map·미션 경로를 odom에 고정
@@ -136,12 +147,16 @@ solid arm과 그 사이의 paint-free opening을 합성해 합법적인 개구�
 
 | 미션 | 선택기 | 정렬기 | 경로 생성 | 공통 실행 | 완료와 인계 |
 |---|---|---|---|---|---|
-| Intersection | 카메라 LEFT/RIGHT | 진입·탈출 때 최신 AMCL map→odom | 실제 인계 자세의 진입 cubic, 방향 branch와 공통 출구; 반원은 rolling lane path | 모든 구간 validator와 follower 공유 | 진입 뒤 반원에 반환, 탈출 뒤 최종 차선에 반환 |
-| Obstacle | 측량된 단일 spline | AMCL seed 뒤 LiDAR 장애물 면으로 course→odom | 남은 spline suffix와 곡률 연속 출구 | 고정 라인·course와 live LiDAR 검사 | 종단과 출구 여유 확인 뒤 반환 |
-| Parking | LiDAR 좌·우 ROI로 빈 공간 선택 | 인계 시점 map→odom 고정, 실행은 local odom | 진입·주차·후진·복귀를 방향별 여러 구간으로 생성 | 이동과 제자리회전의 전체·정지 sweep | rolling 차선 확인 뒤 이동 중 반환 |
-| Zigzag | YAML 고정 spline | Gazebo identity, 실물 동시각 AMCL map→odom | 현재 투영점 이후 suffix | 바깥 도색·live LiDAR 검사 | 종단과 새 차선 확인 뒤 저속 반환 |
+| Intersection | 카메라 LEFT/RIGHT | source stamp의 AMCL 방향과 표지 높이·베어링 평행이동으로 `intersection_local→odom` 고정 | 실제 인계 자세의 진입 cubic, 방향 branch와 공통 출구; 반원은 rolling lane path | 모든 구간 validator와 follower 공유 | 진입 뒤 반원에 반환, 탈출 뒤 최종 차선에 반환 |
+| Obstacle | 측량된 단일 spline | 서로 독립인 LiDAR 장벽 면으로 `obstacle_local→odom` 완전 SE(2) 고정 | 현재 투영점 이후 spline과 곡률 연속 출구 | 고정 라인·course와 live LiDAR 검사 | 종단과 로컬 출구 통과 확인 뒤 반환 |
+| Parking | LiDAR 좌·우 ROI로 빈 공간 선택 | 고정 주차 표지의 비평행 면으로 `parking_local→odom` 고정 | 진입·주차·후진·복귀를 방향별 여러 구간으로 생성 | 이동과 제자리회전의 전체·정지 sweep | rolling 차선 확인 뒤 이동 중 반환 |
+| Zigzag | YAML 고정 spline | rolling 카메라 곡선으로 고유 station과 SE(2) 확인; Gazebo 실행 경로는 검증된 identity | 현재 투영점 이후 suffix | 바깥 도색·live LiDAR 검사 | 종단과 새 차선 확인 뒤 저속 반환 |
 
 Level Crossing과 Tunnel의 상태·제어 책임은 [`README.md`](README.md)에 설명합니다.
+두 미션은 공통 follower 대상은 아니지만 같은 ordered arm/ready 계약을 사용합니다.
+Level Crossing은 source-stamped 고정 landmark로 통과 평면을 고정하고, Tunnel은 LiDAR의
+종방향 벽·직교 입구벽·끝점으로 mission-local tunnel template을 고정한 뒤에만 ready가
+됩니다.
 
 ## 공통 진단 배열
 
@@ -169,25 +184,31 @@ Tunnel 고유 `/tunnel/diagnostics`는 이 배열이 아닙니다. Tunnel은 출
 
 ## 현재 검증 범위
 
-`run23`은 Gazebo 공식 시작점에서 일반 차선과 네 공통화 대상 미션을 거쳐 차단봉,
-Tunnel과 결승선까지 완료했습니다. malformed 또는 non-finite 공통 진단 표본은 네
-미션 모두 0개였습니다.
+2026-09-18 `run20`은 현재 mission-local adaptive registration 코드와 새 Gazebo의
+공식 시작 자세 `(0.800, -1.747, 0°)`에서 출발했습니다. 앞선 미션을 생략하거나
+순간이동하지 않고 6개 미션과 결승선 footprint를 `283.053 s`에 통과했습니다. 네 공통화
+미션의 malformed 또는 non-finite core 진단 표본은 0개였습니다.
 
-| 미션 | 수행시간 | 최대 위치 오차 | 최대 절대 횡오차 | 최소 raw line 여유 | 최소 obstacle 여유 | 최소 map 여유 |
-|---|---:|---:|---:|---:|---:|---:|
-| Intersection | `33.909 s` | `7.003 mm` | `7.003 mm` | `-9.422 mm`* | 경계 없음 | `312.704 mm` |
-| Obstacle | `27.610 s` | `5.419 mm` | `5.418 mm` | `3.391 mm` | `4.245 mm` | `118.879 mm` |
-| Parking LEFT | `62.944 s` | `6.231 mm` | `6.231 mm` | `3.100 mm` | `8.867 mm` | `126.049 mm` |
-| Zigzag | `16.792 s` | `16.542 mm` | `4.690 mm` | `2.857 mm` | `30.610 mm` | `98.227 mm` |
+| 미션 | 수행시간 | 최대 위치 오차 | 최대 절대 횡오차 | 최소 raw line | 최소 obstacle | 최소 map | 최대 진행률 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Intersection LEFT | `25.972 s` | `1.825 mm` | `1.825 mm` | `-2.610 mm`* | 경계 없음 | `316.372 mm` | `98.227%` |
+| Obstacle | `35.125 s` | `6.557 mm` | `6.557 mm` | `3.391 mm` | `4.245 mm` | `156.879 mm` | `97.360%` |
+| Parking LEFT | `57.886 s` | `10.954 mm` | `7.161 mm` | `3.702 mm` | `8.141 mm` | `126.378 mm` | `100%` |
+| Zigzag | `16.222 s` | `18.917 mm` | `5.355 mm` | `3.026 mm` | `28.498 mm` | `98.227 mm` | `100%` |
 
-\* Intersection의 raw 음수값은 시작 자세의 명시적 `line_overlap_allowance` 적용 전
-값입니다. 허용량은 시작 station에서 0으로 수렴하며 validator의 유효 판정은 전 구간
-PASS였습니다. 같은 run에서 Parking 후진은 `7.491 s`, 음수 명령 151개, 최저
-`-0.08234 m/s`로 확인했습니다.
+\* Intersection 값은 허용 envelope 적용 전 raw 진단값이므로 양수 안전 여유라고
+표현하지 않습니다. validator의 유효 판정은 통과했습니다. Parking 후진은 `6.303 s`,
+음수 명령 127개, 최저 `-0.1034 m/s`였습니다.
 
-당시 등록된 bringup `504`개와 전체 workspace `557`개 시험도 오류·실패·건너뜀 없이
-통과했습니다. 이 수치는 해당 코드 상태의 검증 기록이며 현재 작업트리의 자동 보증으로
-해석하지 않습니다.
+같은 실행에서 Level Crossing은 `14.386 s`, 공통화 대상이 아닌 Tunnel은 `75.283 s`에
+완료했습니다. `/cmd_vel` 발행자는 기대한 lane/mission 순서만 나타났고 발행자 교차는
+없었습니다. 제어권 인계 공백은 `3.582–121.699 ms`였습니다. 두 번째 공식 시작
+주행에서도 Intersection RIGHT, Parking RIGHT, Tunnel layout C로 6개 미션과 결승을
+모두 완료했습니다. 두 번째 bag은 출발 뒤 녹화를 시작했으므로 시간 비교 자료로 쓰지
+않습니다.
 
-실제 D405·Mid-360·OpenCR과 실제 경기장에서는 아직 공식 시작점 통합 주행을 수행하지
-않았습니다. 실물 보정과 전체 검증이 끝날 때까지 완료 범위는 Gazebo로 한정합니다.
+현재 코드의 자동 회귀는 bringup `669/669`, description `7/7`, 합계 `676/676`이며 두
+패키지 build와 `git diff --check`도 통과했습니다. `run20` bag의 종합 분석은 recorder
+시작 시각과 누락 토픽 때문에 `19/22`였지만 미션 순서·공통 진단·제어권·결승 검사는
+통과했습니다. 실제 D405·Mid-360·OpenCR 보정과 실물 공식 시작점 통합 주행은 아직
+수행하지 않았습니다.

@@ -12,6 +12,11 @@ maximum_velocity: 0.30
 # Stop when /detect/lane_centerline is stale this long.
 lane_timeout: 0.5
 
+# This is the single generated CommonPath. Mission aligners may observe it
+# before the normal controller's independent drive-authority check; only paths
+# passing that check update the follower or produce a normal-lane command.
+path_topic: /control/lane_path
+
 # Camera-derived rolling path. No map, AMCL pose, course texture, or surveyed
 # knots are inputs to this path.
 lane_path:

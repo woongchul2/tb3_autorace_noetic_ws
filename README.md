@@ -51,23 +51,26 @@ roslaunch custom_autorace_bringup hardware.launch \
   lane_detector_config:=/workspace/src/custom_autorace_bringup/config/lane_detector_d405_measured.yaml
 ```
 
-실물 전체 자동주행에는 실측 지도·AMCL 설정, 미션 구역·경로 YAML과 이를 묶는 실물
-통합 launch가 추가로 필요하다. Gazebo용 지도와 미션 YAML은 실물에 사용하지 않는다.
+실물 전체 자동주행에는 실물 odom·AMCL 설정, 각 미션 형상의 sensor-relative 등록값과
+이를 묶는 실물 통합 launch가 추가로 필요하다. 연결 직선 전체를 다시 측량할 필요는
+없으며 Gazebo용 좌표와 미션 YAML은 실물에 사용하지 않는다.
 
 ## 현재 검증 기준
 
-2026-09-13의 공식 시작점 통합 **run23**에서 실제 카메라가 선택한 LEFT 교차로부터
-Obstacle, Parking LEFT, Zigzag, Level Crossing, Tunnel을 순서대로 완료한 뒤 결승선
-footprint 통과까지 확인했다.
+2026-09-18의 현재 adaptive registration 코드 공식 시작점 통합 **run20**에서 실제
+카메라가 선택한 Intersection LEFT부터 Obstacle, Parking LEFT, Zigzag,
+Level Crossing, Tunnel layout B를 순서대로 완료한 뒤 결승선 footprint를 통과했다.
 
-- 오프라인 통합 판정: **22/22 PASS**, 실패 항목 0
-- 출발 명령부터 결승선 통과까지: **280.472 s**
-- 등록 시험: `custom_autorace_bringup` **505개**, 전체 workspace **558개**가 각각
-  `0 errors`, `0 failures`, `0 skipped`로 통과
+- 출발 명령부터 결승선 통과까지: **283.053 s**
+- 6개 미션 `COMPLETE`, `FAILED` 0건, `/cmd_vel` 발행자 교차 0건
+- 반대 조건 반복: Intersection RIGHT, Parking RIGHT, Tunnel layout C도 전 미션·결승 완료
+- 자동 회귀: bringup **669개**, description **7개**, 합계 **676개**가
+  `0 errors`, `0 failures`로 통과
 
-여기서 `505/558`은 성공 비율이 아니라 패키지 범위와 전체 workspace 범위에서 실행한
-두 테스트 모음의 개수다. 상세한 조건, 미션별 시간과 여유 값은
-[공통 경로 주행 구조 및 검증 기록](src/custom_autorace_bringup/PATH_FOLLOWING.md)을 따른다.
+`run20` bag 종합 판정은 recorder 시각 설정과 차선 토픽 녹화 누락 때문에 `19/22`였고,
+미션 순서·공통 진단·제어권·결승 검사는 모두 통과했다. 실제 D405·Mid-360·OpenCR
+주행은 아직 검증하지 않았다. 상세 조건, 미션별 시간과 여유 값은
+[검증 이력](src/custom_autorace_bringup/docs/VALIDATION_HISTORY.md)을 따른다.
 
 ## 문서 지도
 
@@ -91,5 +94,5 @@ README에는 최초 실행만 두고, 나머지 실행 옵션과 시험 명령�
 
 ROS bag을 포함한 원시 진단 자료는 크기가 크고 실행마다 생성되므로 Git 저장소에
 포함하지 않는다. 로컬 `diagnostics/` 또는 별도 보관소에 원본을 유지하고, 재현에 필요한
-조건과 최종 지표만 추적되는 문서에 남긴다. 따라서 저장소를 clone해도 run23의 원시
-bag은 내려받아지지 않는다.
+조건과 최종 지표만 추적되는 문서에 남긴다. 따라서 저장소를 clone해도 run20·run21의
+원시 bag은 내려받아지지 않는다.

@@ -22,6 +22,8 @@
     <arg name="gui" value="$(arg gui)"/>
     <arg name="course_texture" value="$(arg course_texture)"/>
     <arg name="rviz" value="$(arg rviz)"/>
+    <!-- Keep the timed headless benchmark free of visualization recording. -->
+    <arg name="publish_trajectories" value="false"/>
     <arg name="x_pos" value="$(arg x_pos)"/>
     <arg name="y_pos" value="$(arg y_pos)"/>
     <arg name="yaw_pos" value="$(arg yaw_pos)"/>

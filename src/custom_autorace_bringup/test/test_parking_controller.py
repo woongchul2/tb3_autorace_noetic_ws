@@ -40,10 +40,11 @@ from custom_autorace_bringup.path_following import (
     RigidTransform2D,
     footprint_points,
 )
+from custom_autorace_bringup.local_registration import entry_plane_progress
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Float64MultiArray
+from std_msgs.msg import Bool, Float64MultiArray, Header
 
 class RecordingPublisher:
     def __init__(self, topic, events):
@@ -241,6 +242,7 @@ class ParkingControllerTest(unittest.TestCase):
         self.seconds = 10.0
         self.events = []
         self.publishers = {}
+        self.publisher_options = {}
         self.lane_service = RecordingLaneService(self.events)
         self.param_overrides = {}
 
@@ -289,9 +291,10 @@ class ParkingControllerTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _publisher_factory(self, topic, *_args, **_kwargs):
+    def _publisher_factory(self, topic, *_args, **options):
         publisher = RecordingPublisher(topic, self.events)
         self.publishers[topic] = publisher
+        self.publisher_options[topic] = options
         return publisher
 
     def now(self):
@@ -342,12 +345,14 @@ class ParkingControllerTest(unittest.TestCase):
         self.assertAlmostEqual(math.cos(actual[2]), math.cos(expected[2]), places=9)
 
     @staticmethod
-    def rigid_route_transform(x=0.0, y=0.0, yaw=0.0):
-        return RigidTransform2D(x, y, yaw, "odom", "map")
+    def rigid_local_to_odom(x=0.0, y=0.0, yaw=0.0):
+        return RigidTransform2D(
+            x, y, yaw, "odom", "parking_local"
+        ).inverse()
 
     @staticmethod
     def route_pose_to_odom(pose, transform):
-        transformed = transform.inverse().apply_pose(Pose2D(*pose))
+        transformed = transform.apply_pose(Pose2D(*pose))
         return transformed.x, transformed.y, transformed.yaw
 
     @staticmethod
@@ -378,9 +383,41 @@ class ParkingControllerTest(unittest.TestCase):
         controller.command_observer_callback(command)
         return command
 
+    @staticmethod
+    def mark_local_ready(controller, sequence=1):
+        controller.arm_seq = sequence
+        controller.ready_published_seq = sequence
+        controller.ready_source_stamp = controller_module.rospy.Time.now()
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "parking_local", "odom"
+        )
+        controller.entry_connector_path = SimpleNamespace()
+        controller.entry_curve_path = SimpleNamespace()
+
     def start_controller(self, controller):
+        return self.start_controller_at(
+            controller, (0.90, 1.75, math.pi)
+        )
+
+    def start_controller_at(self, controller, local_pose, transform=None):
+        if transform is None:
+            transform = RigidTransform2D(
+                0.0, 0.0, 0.0, "parking_local", "odom"
+            )
+        arm = Header()
+        arm.seq = 1
+        arm.stamp = self.now()
+        arm.frame_id = "parking"
+        controller.arm_callback(arm)
+        controller.local_to_odom = transform
+        transformed = transform.apply_pose(Pose2D(*local_pose))
+        odom_pose = (transformed.x, transformed.y, transformed.yaw)
+        self.update_poses(controller, local_pose, odom_pose)
+        self.lane_command(controller)
+        controller.control_callback(None)
+        self.assertEqual(controller.ready_published_seq, arm.seq)
         controller.gate_callback(Bool(data=True))
-        self.update_poses(controller, (0.90, 1.75, math.pi))
+        self.update_poses(controller, local_pose, odom_pose)
         self.lane_command(controller)
         self.events.clear()
         self.lane_service.calls.clear()
@@ -391,7 +428,7 @@ class ParkingControllerTest(unittest.TestCase):
         # Lane control keeps moving during PREPARE. The path is latched from a
         # post-gate moving pose before parking acquires cmd_vel.
         self.advance(controller.prepare_settle_time + 0.01)
-        controller.odom_callback(self.odom_message((0.90, 1.75, math.pi)))
+        controller.odom_callback(self.odom_message(odom_pose))
         self.lane_command(controller)
         controller.control_callback(None)
         self.assertEqual(controller.state, controller.APPROACH)
@@ -459,6 +496,80 @@ class ParkingControllerTest(unittest.TestCase):
         with self.assertRaises(controller_module.rospy.ROSInitException):
             controller._validate_route_geometry()
 
+    def test_constructor_latches_both_surveyed_parking_routes_before_gate(self):
+        controller = self.make_controller()
+        topics = {
+            LEFT: "/parking/planned_path/left",
+            RIGHT: "/parking/planned_path/right",
+        }
+        routes = {
+            LEFT: controller.planned_left_route,
+            RIGHT: controller.planned_right_route,
+        }
+        expected_goals = {
+            LEFT: (controller.left_park_x, controller.decision_y, 0.0),
+            RIGHT: (controller.right_park_x, controller.decision_y, math.pi),
+        }
+
+        for branch, topic in topics.items():
+            with self.subTest(branch=branch):
+                route = np.asarray(routes[branch], dtype=np.float64)
+                self.assertEqual(route.ndim, 2)
+                self.assertEqual(route.shape[1], 3)
+                self.assertGreater(route.shape[0], 2)
+                self.assertTrue(np.all(np.isfinite(route)))
+
+                self.assertIn(topic, self.publishers)
+                self.assertTrue(self.publisher_options[topic]["latch"])
+                self.assertEqual(self.publisher_options[topic]["queue_size"], 1)
+                self.assertEqual(len(self.publishers[topic].messages), 1)
+
+                message = self.publishers[topic].messages[0]
+                self.assertEqual(message.header.stamp, controller_module.rospy.Time())
+                self.assertEqual(message.header.frame_id, controller.route_frame)
+                self.assertEqual(len(message.poses), route.shape[0])
+
+                for index, pose_stamped in enumerate(message.poses):
+                    self.assertEqual(pose_stamped.header, message.header)
+                    pose = pose_stamped.pose
+                    values = (
+                        pose.position.x,
+                        pose.position.y,
+                        pose.position.z,
+                        pose.orientation.x,
+                        pose.orientation.y,
+                        pose.orientation.z,
+                        pose.orientation.w,
+                    )
+                    self.assertTrue(all(math.isfinite(value) for value in values))
+                    self.assertAlmostEqual(pose.position.x, route[index, 0], places=12)
+                    self.assertAlmostEqual(pose.position.y, route[index, 1], places=12)
+                    self.assertAlmostEqual(
+                        pose.orientation.z,
+                        math.sin(0.5 * route[index, 2]),
+                        places=12,
+                    )
+                    self.assertAlmostEqual(
+                        pose.orientation.w,
+                        math.cos(0.5 * route[index, 2]),
+                        places=12,
+                    )
+
+                goal = expected_goals[branch]
+                distances = np.hypot(route[:, 0] - goal[0], route[:, 1] - goal[1])
+                goal_index = int(np.argmin(distances))
+                self.assertLessEqual(float(distances[goal_index]), 1e-12)
+                self.assertAlmostEqual(
+                    math.sin(route[goal_index, 2]), math.sin(goal[2]), places=12
+                )
+                self.assertAlmostEqual(
+                    math.cos(route[goal_index, 2]), math.cos(goal[2]), places=12
+                )
+
+        np.testing.assert_allclose(
+            routes[LEFT][-1], routes[RIGHT][-1], atol=1e-12, rtol=0.0
+        )
+
     def test_route_validation_rejects_invalid_rotation_stages(self):
         cases = (
             (
@@ -479,18 +590,6 @@ class ParkingControllerTest(unittest.TestCase):
                 0.52,
                 "right goal must be beyond its in-place turn centre",
             ),
-            (
-                "entry_anchor_lower",
-                "entry_anchor_min_y",
-                1.7430,
-                "entry anchor y bounds must contain entry_y",
-            ),
-            (
-                "entry_anchor_upper",
-                "entry_anchor_max_y",
-                1.7420,
-                "entry anchor y bounds must contain entry_y",
-            ),
         )
         for label, attribute, value, message in cases:
             with self.subTest(label=label):
@@ -501,7 +600,7 @@ class ParkingControllerTest(unittest.TestCase):
                 ):
                     controller._validate_route_geometry()
 
-    def test_gazebo_config_uses_frozen_amcl_map_to_odom_alignment(self):
+    def test_gazebo_config_uses_frozen_parking_local_registration(self):
         config_path = (
             Path(__file__).resolve().parents[1]
             / "config"
@@ -509,21 +608,84 @@ class ParkingControllerTest(unittest.TestCase):
         )
         with config_path.open(encoding="utf-8") as stream:
             config = yaml.safe_load(stream)["parking"]
-        self.assertFalse(config["route"]["odom_aligned"])
+        self.assertNotIn("odom_aligned", config["route"])
         self.assertEqual(
             config["topics"]["lane_path_diagnostics"],
             "/control/lane_path_diagnostics",
         )
+        self.assertEqual(
+            config["topics"]["planned_path_left"],
+            "/parking/planned_path/left",
+        )
+        self.assertEqual(
+            config["topics"]["planned_path_right"],
+            "/parking/planned_path/right",
+        )
+        self.assertEqual(config["route"]["frame_id"], "parking_local")
+        self.assertEqual(config["registration"]["local_frame"], "parking_local")
+        self.assertEqual(config["registration"]["confirmation_scans"], 2)
+        self.assertTrue(config["registration"]["use_fixed_obstacle_faces"])
+        self.assertNotIn("segment_landmarks", config["registration"])
+        self.assertEqual(config["topics"]["arm"], "/mission/arm/parking")
+        self.assertEqual(config["topics"]["ready"], "/mission/ready/parking")
         self.assertNotIn("lane_boundaries", config["topics"])
+        self.assertNotIn("entry_anchor_min_y", config["route"])
+        self.assertNotIn("entry_anchor_max_y", config["route"])
+        self.assertIn("local_bounds", config["safety"])
+        self.assertNotIn("map_bounds", config["safety"])
         self.assertAlmostEqual(
-            float(config["route"]["entry_anchor_min_y"]), 1.7425
+            float(config["route"]["turn_curve_offset"]), 0.1950
         )
         self.assertAlmostEqual(
-            float(config["route"]["entry_anchor_max_y"]), 1.7580
+            float(config["route"]["turn_curve_tangent"]), 0.0780
+        )
+        self.assertEqual(int(config["route"]["turn_curve_samples"]), 101)
+        for removed_name in (
+            "entry_curve_offset",
+            "entry_curve_tangent",
+            "entry_curve_samples",
+            "zigzag_turn_offset",
+            "zigzag_turn_tangent",
+            "zigzag_turn_samples",
+        ):
+            self.assertNotIn(removed_name, config["route"])
+        self.assertAlmostEqual(
+            float(config["route"]["zigzag_turn_start_x"]), 0.4930
+        )
+        self.assertAlmostEqual(
+            float(config["route"]["zigzag_alignment_tail"]), 0.0720
+        )
+        self.assertAlmostEqual(
+            float(config["rejoin"]["handoff_max_x"]), 0.2980
         )
         self.assertAlmostEqual(
             float(config["control"]["entry_curve_end_heading_tolerance_deg"]),
             4.0,
+        )
+        self.assertAlmostEqual(
+            float(config["control"]["entry_handoff_maximum_path_error"]),
+            0.015,
+        )
+        self.assertAlmostEqual(
+            float(
+                config["control"][
+                    "entry_handoff_maximum_heading_error_deg"
+                ]
+            ),
+            8.0,
+        )
+        # The production Gazebo profile deliberately keeps gentle launch
+        # acceleration while using the verified diff-drive braking headroom.
+        # Lock this value so a generic 0.03/0.03 cleanup cannot silently
+        # restore the long low-speed tail on PARK_IN and BACK_OUT.
+        self.assertAlmostEqual(
+            float(config["control"]["linear_acceleration"]), 0.03
+        )
+        self.assertAlmostEqual(
+            float(config["control"]["linear_deceleration"]), 0.13
+        )
+        self.assertAlmostEqual(
+            float(config["control"]["cruise_velocity"]), 0.20
         )
         self.assertAlmostEqual(
             float(config["paint"]["parking_opening_right_edge"]), 0.3831
@@ -539,12 +701,154 @@ class ParkingControllerTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             float(config["rejoin"]["complete_heading_tolerance_deg"]),
-            6.0,
+            7.0,
         )
+
+    def test_arm_applies_common_cruise_cap_without_taking_cmd_vel(self):
+        controller = self.make_controller()
+        speed_limits = self.publishers[
+            controller.speed_limit_topic
+        ].messages
+        speed_limits.clear()
+        commands = self.publishers[controller.cmd_vel_topic].messages
+        self.events.clear()
+        self.lane_service.calls.clear()
+
+        controller.arm_callback(
+            Header(seq=17, stamp=self.now(), frame_id="parking")
+        )
+
+        self.assertEqual(controller.state, controller.WAIT_GATE)
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(self.lane_service.calls, [])
+        self.assertEqual(commands, [])
+        self.assertEqual(len(speed_limits), 1)
+        self.assertAlmostEqual(
+            speed_limits[-1].data, controller.cruise_velocity, places=12
+        )
+
+    def test_run16_arm_cap_keeps_processing_pose_inside_ready_window(self):
+        self.param_overrides.update(
+            {
+                "~parking/registration/entry_lead_maximum": -0.125,
+                "~parking/control/entry_handoff_minimum_clearance": 0.003,
+                "~parking/safety/localization_margin": 0.001,
+                "~parking/safety/tracking_margin": 0.001,
+            }
+        )
+        controller = self.make_controller()
+        transform = RigidTransform2D(
+            0.0090,
+            -0.0008,
+            math.radians(0.24),
+            "parking_local",
+            "odom",
+        )
+        arm = Header(seq=16, stamp=self.now(), frame_id="parking")
+        controller.arm_callback(arm)
+        controller.local_to_odom = transform
+        controller.registration_source_stamp = self.now()
+        source_local = (
+            controller.registration_template.entry_plane.point[0] + 0.1605,
+            1.7532,
+            controller.approach_heading + math.radians(0.15),
+        )
+        processing_delay = 0.134
+        capped_local = (
+            source_local[0] - controller.cruise_velocity * processing_delay,
+            source_local[1],
+            source_local[2],
+        )
+        capped_odom_pose = transform.apply_pose(Pose2D(*capped_local))
+        capped_odom = (
+            capped_odom_pose.x,
+            capped_odom_pose.y,
+            capped_odom_pose.yaw,
+        )
+        self.update_poses(controller, capped_local, capped_odom)
+
+        source_progress = entry_plane_progress(
+            controller.registration_template.entry_plane,
+            transform.apply_pose(Pose2D(*source_local)),
+            transform,
+        )
+        current_progress = entry_plane_progress(
+            controller.registration_template.entry_plane,
+            capped_odom,
+            transform,
+        )
+        self.assertLessEqual(
+            source_progress.longitudinal, controller.entry_lead_maximum
+        )
+        self.assertLessEqual(
+            current_progress.longitudinal, controller.entry_lead_maximum
+        )
+        self.assertAlmostEqual(current_progress.longitudinal, -0.1337, places=6)
+        self.assertTrue(
+            controller._try_publish_ready(self.now()),
+            controller.entry_preparation_error,
+        )
+        self.assertEqual(controller.ready_published_seq, arm.seq)
+        self.assertGreater(controller.entry_connector_path.length, 0.13)
+        self.assertGreater(controller.entry_connector_path.line_clearance, 0.0)
+
+    def test_current_pose_beyond_late_edge_cannot_open_parking_ready(self):
+        self.param_overrides[
+            "~parking/registration/entry_lead_maximum"
+        ] = -0.125
+        controller = self.make_controller()
+        transform = self.rigid_local_to_odom()
+        arm = Header(seq=18, stamp=self.now(), frame_id="parking")
+        controller.arm_callback(arm)
+        controller.local_to_odom = transform
+        controller.registration_source_stamp = self.now()
+        late_local = (
+            controller.registration_template.entry_plane.point[0] + 0.124,
+            controller.entry_y,
+            controller.approach_heading,
+        )
+        self.update_poses(controller, late_local, late_local)
+
+        self.assertFalse(controller._try_publish_ready(self.now()))
+        self.assertIsNone(controller.ready_published_seq)
+        self.assertIsNone(controller.entry_connector_path)
+
+    def test_entry_and_zigzag_turns_use_one_identical_quarter_curve(self):
+        controller = self.make_controller()
+        entry = controller._entry_curve_route_poses()
+        zigzag = controller._zigzag_exit_route_poses()[
+            : controller.turn_curve_samples
+        ]
+
+        def local_curve(poses):
+            values = np.asarray(poses, dtype=np.float64)
+            start_x, start_y, start_yaw = values[0]
+            delta = values[:, :2] - np.asarray([start_x, start_y])
+            cosine = math.cos(start_yaw)
+            sine = math.sin(start_yaw)
+            local_xy = np.column_stack(
+                (
+                    cosine * delta[:, 0] + sine * delta[:, 1],
+                    -sine * delta[:, 0] + cosine * delta[:, 1],
+                )
+            )
+            local_yaw = np.asarray(
+                [normalize_angle(yaw - start_yaw) for yaw in values[:, 2]]
+            )
+            return np.column_stack((local_xy, local_yaw))
+
+        np.testing.assert_allclose(
+            local_curve(entry), local_curve(zigzag), atol=1e-12, rtol=0.0
+        )
+        turn_end = controller._zigzag_turn_end_pose()
+        exit_goal = controller._zigzag_exit_goal_pose()
+        self.assert_pose_almost_equal(turn_end, (0.298, 1.750, math.pi))
+        self.assert_pose_almost_equal(exit_goal, (0.226, 1.750, math.pi))
+        self.assertAlmostEqual(controller.handoff_max_x, turn_end[0], places=12)
 
     def test_run10_entry_terminal_continues_into_the_g2_turn(self):
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         controller.odom_pose = (0.95, 1.75, math.pi)
         controller.observed_lane_linear = controller.approach_speed
 
@@ -588,11 +892,11 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = RIGHT
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
 
-        # Frozen-route pose reconstructed from official-start run 11. The old
-        # infinite-corner approximation reported -0.752 mm even though the
-        # native solid paint remained 8.57 mm outside the fully expanded body.
+        # Frozen-route pose reconstructed from official-start run 11. The
+        # shared quarter-turn placement retains positive approach clearance
+        # for this measured return bias without adding a corrective stop.
         start = (
             0.49203417869850774,
             0.6938828136475323,
@@ -602,8 +906,8 @@ class ParkingControllerTest(unittest.TestCase):
 
         self.assertTrue(controller._begin_leave_aisle())
         self.assertEqual(controller.state, controller.LEAVE_AISLE)
-        self.assertGreater(controller.active_path.line_clearance, 0.008)
-        self.assertAlmostEqual(controller.goal_map[0], 0.4960, places=12)
+        self.assertGreater(controller.active_path.line_clearance, 0.006)
+        self.assertAlmostEqual(controller.goal_map[0], 0.4930, places=12)
         self.assertAlmostEqual(
             controller.zigzag_exit_curve_map[-1, 0], 0.2260, places=12
         )
@@ -618,7 +922,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = RIGHT
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         unsafe_start = (
             0.4700,
             0.6938828136475323,
@@ -631,7 +935,7 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_lane_handoff_consumes_common_path_diagnostics(self):
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         handoff_pose = (
             0.5 * (controller.handoff_min_x + controller.handoff_max_x),
             0.5 * (controller.handoff_min_y + controller.handoff_max_y),
@@ -748,18 +1052,18 @@ class ParkingControllerTest(unittest.TestCase):
             }
         )
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         curve_start = (
-            controller.aisle_x + controller.entry_curve_offset,
+            controller.aisle_x + controller.turn_curve_offset,
             controller.entry_y,
             controller.approach_heading,
         )
         poses = quintic_turn_path(
             curve_start,
             controller.aisle_heading,
-            controller.entry_curve_offset,
-            controller.entry_curve_tangent,
-            controller.entry_curve_samples,
+            controller.turn_curve_offset,
+            controller.turn_curve_tangent,
+            controller.turn_curve_samples,
         )
         path = controller._common_path_from_poses(
             poses,
@@ -847,20 +1151,20 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_common_path_contains_frozen_fixed_sign_obstacles(self):
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform(
+        controller.local_to_odom = self.rigid_local_to_odom(
             0.31, -0.27, math.radians(2.0)
         )
         curve_start = (
-            controller.aisle_x + controller.entry_curve_offset,
+            controller.aisle_x + controller.turn_curve_offset,
             controller.entry_y,
             controller.approach_heading,
         )
         route_poses = quintic_turn_path(
             curve_start,
             controller.aisle_heading,
-            controller.entry_curve_offset,
-            controller.entry_curve_tangent,
-            controller.entry_curve_samples,
+            controller.turn_curve_offset,
+            controller.turn_curve_tangent,
+            controller.turn_curve_samples,
         )
         odom_poses = np.asarray(
             [controller._route_pose_to_odom(pose) for pose in route_poses]
@@ -879,7 +1183,7 @@ class ParkingControllerTest(unittest.TestCase):
 
         self.assertIsNotNone(path)
         self.assertGreater(path.safety.fixed_obstacles.shape[0], 400)
-        expected = controller.route_transform.inverse().apply_point(
+        expected = controller.local_to_odom.apply_point(
             controller.fixed_obstacle_points_route[0]
         )
         np.testing.assert_allclose(
@@ -890,7 +1194,7 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_common_validator_rejects_a_path_through_fixed_sign(self):
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         path = controller._common_path_from_poses(
             ((0.40, 1.90, 0.0), (0.60, 1.90, 0.0)),
             1,
@@ -911,12 +1215,15 @@ class ParkingControllerTest(unittest.TestCase):
         controller.scan_median_window = 1
         controller.state = controller.SELECT_SPACE
         controller.state_started = self.now()
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "parking_local", "odom"
+        )
         decision_pose = (
             controller.aisle_x,
             controller.decision_y,
             controller.aisle_heading,
         )
-        controller.map_pose_callback(self.pose_message(decision_pose))
+        controller.odom_callback(self.odom_message(decision_pose))
 
         left_points = [
             (0.66, 0.74),
@@ -958,6 +1265,9 @@ class ParkingControllerTest(unittest.TestCase):
     def test_select_space_retries_latest_scan_after_main_lock_collision(self):
         controller = self.make_controller()
         controller.scan_median_window = 1
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "parking_local", "odom"
+        )
         decision_pose = (
             controller.aisle_x,
             controller.decision_y,
@@ -975,6 +1285,7 @@ class ParkingControllerTest(unittest.TestCase):
         # may be retained for safety, but must not count as bay evidence.
         with controller.lock:
             self.advance(0.05)
+            controller._record_odom_pose(self.now(), decision_pose)
             old_scan = self.scan_message_for_map_points(
                 decision_pose, controller, left_points
             )
@@ -995,6 +1306,7 @@ class ParkingControllerTest(unittest.TestCase):
         # the distinct latest scan rather than losing it.
         with controller.lock:
             self.advance(0.05)
+            controller._record_odom_pose(self.now(), decision_pose)
             new_scan = self.scan_message_for_map_points(
                 decision_pose, controller, left_points
             )
@@ -1063,6 +1375,46 @@ class ParkingControllerTest(unittest.TestCase):
             0.09 + controller.lidar_x + 0.40,
             places=8,
         )
+
+    def test_bay_scan_waits_for_its_bracketing_odom_before_selection(self):
+        controller = self.make_controller()
+        controller.scan_median_window = 1
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "parking_local", "odom"
+        )
+        controller.state = controller.SELECT_SPACE
+        controller.state_started = self.now()
+        decision_pose = (
+            controller.aisle_x,
+            controller.decision_y,
+            controller.aisle_heading,
+        )
+
+        first = self.odom_message(decision_pose)
+        first.header.stamp = controller_module.rospy.Time.from_sec(10.00)
+        controller.odom_callback(first)
+        self.seconds = 10.01
+        scan = self.scan_message_for_map_points(
+            decision_pose,
+            controller,
+            ((0.66, 0.74), (0.69, 0.78), (0.73, 0.84), (0.79, 0.88)),
+        )
+        scan.header.stamp = controller_module.rospy.Time.from_sec(10.01)
+        controller.scan_callback(scan)
+
+        self.assertEqual(controller.scan_generation, 0)
+        self.assertIsNone(controller.pending_selection_scan)
+        self.assertEqual(len(controller.pending_safety_scans), 1)
+
+        self.seconds = 10.02
+        second = self.odom_message(decision_pose)
+        second.header.stamp = controller_module.rospy.Time.from_sec(10.02)
+        controller.odom_callback(second)
+
+        self.assertEqual(controller.scan_generation, 1)
+        self.assertEqual(controller.left_points, 4)
+        self.assertEqual(controller.right_points, 0)
+        self.assertEqual(len(controller.pending_safety_scans), 0)
 
     def test_pending_safety_scans_are_bounded_and_discard_invalid_timing(self):
         controller = self.make_controller()
@@ -1142,110 +1494,57 @@ class ParkingControllerTest(unittest.TestCase):
         message.ranges = ranges.tolist()
         return message
 
-    def test_start_requires_fresh_amcl_but_prepare_keeps_lane_control(self):
+    def test_start_requires_local_ready_not_amcl_and_keeps_lane_control(self):
         controller = self.make_controller()
         controller.gate_callback(Bool(data=True))
-
         controller.control_callback(None)
         self.assertEqual(controller.state, controller.WAIT_GATE)
         self.assertEqual(self.lane_service.calls, [])
+        self.assertEqual(self.publishers[controller.cmd_vel_topic].messages, [])
 
-        delayed_map = self.pose_message((0.90, 1.75, math.pi))
-        delayed_map.header.stamp = controller_module.rospy.Time.from_sec(
-            self.seconds - controller.pose_timeout - 0.01
-        )
-        controller.map_pose_callback(delayed_map)
-        controller.odom_callback(self.odom_message((0.90, 1.75, math.pi)))
-        controller.control_callback(None)
-        self.assertEqual(controller.state, controller.WAIT_GATE)
-        self.assertEqual(self.lane_service.calls, [])
-
-        self.update_poses(controller, (0.90, 1.75, math.pi))
-        self.events.clear()
-        controller.control_callback(None)
-
-        self.assertEqual(controller.state, controller.PREPARE_APPROACH)
-        self.assertEqual(self.lane_service.calls, [])
-        self.assertIsNone(controller.route_transform)
-        self.assertIsNone(controller.goal_odom)
-        self.assertEqual(
-            self.publishers[controller.cmd_vel_topic].messages, []
-        )
-
-        # Parking remains silent even after settling until a fresh, capped lane
-        # command newer than the gate has been observed.
-        self.advance(controller.prepare_settle_time + 0.01)
-        controller.control_callback(None)
-        self.assertEqual(controller.state, controller.PREPARE_APPROACH)
-        self.assertIsNone(controller.route_transform)
-        self.assertEqual(self.lane_service.calls, [])
-        self.assertEqual(
-            self.publishers[controller.cmd_vel_topic].messages, []
-        )
-
-        self.lane_command(controller, 0.076, 0.015)
-        controller.odom_callback(self.odom_message((0.90, 1.75, math.pi)))
-        controller.control_callback(None)
+        controller = self.start_controller(controller)
         self.assertEqual(controller.state, controller.APPROACH)
-        self.assertIsNotNone(controller.route_transform)
+        self.assertIsNotNone(controller.local_to_odom)
         self.assertIsNotNone(controller.goal_odom)
         self.assertEqual(self.lane_service.calls, [False])
-        service_index = next(
-            index
-            for index, event in enumerate(self.events)
-            if event[0] == "service" and event[1] is False
-        )
-        command_index = next(
-            index
-            for index, event in enumerate(self.events)
-            if event[0] == "publish" and event[1] == "/cmd_vel"
-        )
-        self.assertLess(service_index, command_index)
 
-    def test_amcl_snapshot_aligns_entry_with_observed_odom_offset(self):
-        self.param_overrides.update(
-            {
-                "~parking/route/odom_aligned": False,
-                "~parking/control/arc_angular_scale": 1.10,
-                "~parking/control/linear_acceleration": 0.03,
-                "~parking/control/angular_acceleration": 0.55,
-            }
-        )
+    def test_local_fixture_transform_aligns_entry_with_odom_offset(self):
         controller = self.make_controller()
-        map_pose = (
-            1.0082,
-            1.7617,
-            math.pi,
+        transform = RigidTransform2D(
+            0.31,
+            -0.27,
+            math.radians(8.0),
+            "parking_local",
+            "odom",
         )
-        odom_pose = (1.0300, 1.7400, math.radians(179.5))
-
-        controller.gate_callback(Bool(data=True))
-        self.update_poses(controller, map_pose, odom_pose)
-        self.lane_command(controller)
-        controller.control_callback(None)
-        self.assertEqual(controller.state, controller.PREPARE_APPROACH)
-        self.advance(controller.prepare_settle_time + 0.01)
-        controller.odom_callback(self.odom_message(odom_pose))
-        controller.control_callback(None)
+        local_pose = (0.90, 1.75, math.pi)
+        self.start_controller_at(controller, local_pose, transform)
 
         expected_join = (
-            controller.aisle_x + controller.entry_curve_offset,
+            controller.aisle_x + controller.turn_curve_offset,
             controller.entry_y,
             controller.approach_heading,
         )
-        anchored_join = self.route_pose_to_odom(
-            expected_join, controller.route_transform
+        transformed_join = transform.apply_pose(Pose2D(*expected_join))
+        anchored_join = (
+            transformed_join.x,
+            transformed_join.y,
+            transformed_join.yaw,
         )
         self.assertEqual(controller.state, controller.APPROACH)
-        self.assert_pose_almost_equal(controller.entry_connector_odom[0], odom_pose)
+        transformed_start = transform.apply_pose(Pose2D(*local_pose))
+        self.assert_pose_almost_equal(
+            controller.entry_connector_odom[0],
+            (transformed_start.x, transformed_start.y, transformed_start.yaw),
+        )
         self.assert_pose_almost_equal(
             controller.entry_connector_odom[-1], anchored_join
         )
         self.assert_pose_almost_equal(controller.goal_odom, anchored_join)
         self.assertGreater(
             math.hypot(
-                anchored_join[0] - expected_join[0],
-                anchored_join[1] - expected_join[1],
+                transform.target_from_source_x,
+                transform.target_from_source_y,
             ),
             0.01,
         )
@@ -1258,13 +1557,7 @@ class ParkingControllerTest(unittest.TestCase):
             controller.entry_connector_speed, controller.approach_speed
         )
 
-    def test_north_amcl_outlier_is_corrected_without_an_entry_stop(self):
-        self.param_overrides.update(
-            {
-                "~parking/route/odom_aligned": False,
-                "~parking/control/entry_handoff_minimum_clearance": 0.003,
-            }
-        )
+    def test_amcl_outlier_cannot_move_registered_entry_or_add_a_stop(self):
         controller = self.make_controller()
         validations = []
         original_validate = controller.path_validator.validate_path
@@ -1277,35 +1570,14 @@ class ParkingControllerTest(unittest.TestCase):
         controller.path_validator.validate_path = mock.Mock(
             side_effect=record_validation
         )
-        # Reproduce the synchronized AMCL/odom pair and latest moving odom
-        # pose from official-start run 4DEAyD.  The uncorrected AMCL y made
-        # the connector fail at line=-8.2 mm before parking took control.
-        map_pose = (
-            0.9764983254,
-            1.7769530084,
-            math.radians(-177.1324063),
+        self.start_controller(controller)
+        frozen = controller.local_to_odom
+        controller.map_pose_callback(
+            self.pose_message((50.0, -40.0, math.radians(73.0)))
         )
-        synchronized_odom = (
-            1.0051117724,
-            1.7613431530,
-            math.radians(-177.5382103),
-        )
-        latest_odom = (0.9983, 1.7611, math.radians(-177.6))
-
-        controller.gate_callback(Bool(data=True))
-        self.update_poses(controller, map_pose, synchronized_odom)
-        self.lane_command(controller)
-        controller.control_callback(None)
-        self.advance(controller.prepare_settle_time + 0.01)
-        controller.odom_callback(self.odom_message(latest_odom))
-        controller.control_callback(None)
 
         self.assertEqual(controller.state, controller.APPROACH)
-        self.assertAlmostEqual(
-            controller.route_anchor_map_pose[1],
-            controller.entry_anchor_max_y,
-        )
-        self.assertLess(controller.route_anchor_lateral_correction, -0.018)
+        self.assertEqual(controller.local_to_odom, frozen)
         self.assertTrue(validations)
         self.assertTrue(all(result.safe for result in validations))
         self.assertGreater(controller.entry_connector_path.line_clearance, 0.0)
@@ -1323,23 +1595,18 @@ class ParkingControllerTest(unittest.TestCase):
     def test_common_validator_accepts_a_safe_low_margin_handoff(self):
         self.param_overrides.update(
             {
-                "~parking/route/odom_aligned": False,
                 "~parking/control/entry_handoff_minimum_clearance": 0.003,
             }
         )
         controller = self.make_controller()
-        map_pose = (0.9650, 1.7428, math.radians(176.1))
         odom_pose = (0.9573, 1.7446, math.radians(175.9))
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "parking_local", "odom"
+        )
+        controller.odom_pose = odom_pose
+        controller.observed_lane_linear = 0.06
+        self.assertTrue(controller._build_adaptive_entry())
 
-        controller.gate_callback(Bool(data=True))
-        self.update_poses(controller, map_pose, odom_pose)
-        self.lane_command(controller)
-        controller.control_callback(None)
-        self.advance(controller.prepare_settle_time + 0.01)
-        controller.odom_callback(self.odom_message(odom_pose))
-        controller.control_callback(None)
-
-        self.assertEqual(controller.state, controller.APPROACH)
         validated_clearance = (
             controller.entry_connector_path.line_clearance
             + controller.entry_handoff_minimum_clearance
@@ -1354,7 +1621,7 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_common_validator_stops_an_unsafe_live_entry_pose(self):
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         controller.odom_pose = (0.95, 1.75, math.pi)
         controller.observed_lane_linear = 0.06
 
@@ -1402,10 +1669,9 @@ class ParkingControllerTest(unittest.TestCase):
         self.assertEqual(command.angular.z, 0.0)
         self.assertEqual(controller.state, controller.APPROACH)
 
-    def test_adaptive_entry_scales_a_shorter_amcl_aligned_connector(self):
+    def test_adaptive_entry_scales_a_shorter_locally_aligned_connector(self):
         self.param_overrides.update(
             {
-                "~parking/route/odom_aligned": False,
                 "~parking/control/entry_handoff_minimum_clearance": 0.003,
                 "~parking/control/arc_angular_scale": 1.10,
                 "~parking/control/linear_acceleration": 0.03,
@@ -1413,19 +1679,14 @@ class ParkingControllerTest(unittest.TestCase):
             }
         )
         controller = self.make_controller()
-        map_pose = (0.9631, 1.7500, math.pi)
-        odom_pose = (0.981398, 1.761707, math.radians(179.2))
-
-        controller.gate_callback(Bool(data=True))
-        self.update_poses(controller, map_pose, odom_pose)
-        self.lane_command(controller)
-        controller.control_callback(None)
-        self.advance(controller.prepare_settle_time + 0.01)
-        controller.odom_callback(self.odom_message(odom_pose))
-        controller.control_callback(None)
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "parking_local", "odom"
+        )
+        controller.odom_pose = (0.82, 1.75, math.pi)
+        controller.observed_lane_linear = 0.06
+        self.assertTrue(controller._build_adaptive_entry())
 
         connector_length = controller.entry_connector_path.length
-        self.assertEqual(controller.state, controller.APPROACH)
         self.assertLess(connector_length, 0.30)
         self.assertGreaterEqual(
             controller.entry_connector_path.line_clearance
@@ -1436,6 +1697,375 @@ class ParkingControllerTest(unittest.TestCase):
             controller.entry_connector_speed, controller.approach_speed
         )
 
+    def test_rejected_run12_short_suffix_preserves_prepared_entry_atomically(self):
+        self.param_overrides.update(
+            {
+                "~parking/control/entry_handoff_minimum_clearance": 0.003,
+                "~parking/control/arc_angular_scale": 1.10,
+            }
+        )
+        controller = self.make_controller()
+        controller.local_to_odom = RigidTransform2D(
+            -0.009505,
+            0.004289,
+            math.radians(-0.28962),
+            "parking_local",
+            "odom",
+        )
+        controller.odom_pose = (
+            0.897212,
+            1.755863,
+            math.radians(-179.98396),
+        )
+        controller.observed_lane_linear = 0.28
+
+        self.assertTrue(controller._build_adaptive_entry(preflight=True))
+        prepared_connector = controller.entry_connector_path
+        prepared_turn = controller.entry_curve_path
+        prepared_connector_odom = controller.entry_connector_odom.copy()
+        prepared_curve_odom = controller.entry_curve_odom.copy()
+        prepared_goal_map = controller.goal_map
+        prepared_goal_odom = controller.goal_odom
+
+        # First capped pose reconstructed from official-start run 12.  A new
+        # 59 mm quintic cuts the upper solid line and must be rejected without
+        # mutating the already advertised 203 mm route.
+        controller.odom_pose = (
+            0.753379,
+            1.757045,
+            math.radians(179.31854),
+        )
+        controller.observed_lane_linear = controller.approach_speed
+        self.assertFalse(controller._build_adaptive_entry(preflight=True))
+
+        self.assertIs(controller.entry_connector_path, prepared_connector)
+        self.assertIs(controller.entry_curve_path, prepared_turn)
+        np.testing.assert_array_equal(
+            controller.entry_connector_odom, prepared_connector_odom
+        )
+        np.testing.assert_array_equal(
+            controller.entry_curve_odom, prepared_curve_odom
+        )
+        self.assertEqual(controller.goal_map, prepared_goal_map)
+        self.assertEqual(controller.goal_odom, prepared_goal_odom)
+        self.assertIn("swept validation", controller.entry_preparation_error)
+
+    def test_run12_handoff_projects_onto_immutable_path_after_capped_command(self):
+        self.param_overrides.update(
+            {
+                "~parking/control/entry_handoff_minimum_clearance": 0.003,
+                "~parking/control/entry_handoff_maximum_path_error": 0.015,
+                "~parking/control/entry_handoff_maximum_heading_error_deg": 8.0,
+                "~parking/control/arc_angular_scale": 1.10,
+                "~parking/control/lane_entry_speed_limit": 0.09,
+                "~parking/safety/require_live_scan": True,
+            }
+        )
+        controller = self.make_controller()
+        controller.local_to_odom = RigidTransform2D(
+            -0.009505,
+            0.004289,
+            math.radians(-0.28962),
+            "parking_local",
+            "odom",
+        )
+        ready_pose = (
+            0.897212,
+            1.755863,
+            math.radians(-179.98396),
+        )
+        controller.odom_callback(self.odom_message(ready_pose, linear_x=0.28))
+        self.lane_command(controller, linear=0.28)
+        self.assertTrue(controller._build_adaptive_entry(preflight=True))
+        prepared_connector = controller.entry_connector_path
+        prepared_turn = controller.entry_curve_path
+        prepared_poses = controller.entry_connector_odom.copy()
+        controller._build_adaptive_entry = mock.Mock(
+            side_effect=AssertionError(
+                "handoff must not regenerate a prepared entry"
+            )
+        )
+        original_motion_safety = controller.path_validator.motion_safety
+        controller.path_validator.motion_safety = mock.Mock(
+            side_effect=original_motion_safety
+        )
+        controller.arm_seq = 1
+        controller.arm_stamp = self.now()
+        controller.ready_published_seq = 1
+        controller.ready_source_stamp = self.now()
+
+        controller.gate_callback(Bool(data=True))
+        controller.control_callback(None)
+        self.assertEqual(controller.state, controller.PREPARE_APPROACH)
+        self.assertEqual(self.lane_service.calls, [])
+
+        self.advance(controller.prepare_settle_time + 0.01)
+        capped_pose = (
+            0.753379,
+            1.757045,
+            math.radians(179.31854),
+        )
+        controller.odom_callback(
+            self.odom_message(capped_pose, linear_x=controller.approach_speed)
+        )
+        self.lane_command(controller, linear=controller.approach_speed)
+        controller.safety_scan_stamp = self.now()
+        controller.safety_scan_received = self.now()
+        controller.live_obstacle_points_odom = np.empty((0, 2))
+
+        # The first odometry sample is not newer than the command which first
+        # proved the cap. Lane control must remain the sole publisher.
+        controller.control_callback(None)
+        self.assertEqual(controller.state, controller.PREPARE_APPROACH)
+        self.assertEqual(self.lane_service.calls, [])
+        self.assertEqual(
+            self.publishers[controller.cmd_vel_topic].messages, []
+        )
+
+        self.advance(0.02)
+        controller.odom_callback(
+            self.odom_message(capped_pose, linear_x=controller.approach_speed)
+        )
+        controller.safety_scan_stamp = self.now()
+        controller.safety_scan_received = self.now()
+        projection, issue = controller._prepared_entry_projection()
+        self.assertEqual(issue, "")
+        self.assertGreater(projection.station, 0.12)
+        self.assertGreater(projection.distance, 0.010)
+        self.assertLessEqual(
+            projection.distance, controller.entry_handoff_maximum_path_error
+        )
+        self.assertGreater(
+            controller.odom_generation,
+            controller.bounded_lane_command_odom_generation,
+        )
+
+        controller.control_callback(None)
+
+        self.assertEqual(controller.state, controller.APPROACH)
+        self.assertEqual(self.lane_service.calls, [False])
+        self.assertTrue(controller.mission_has_control)
+        self.assertEqual(controller._build_adaptive_entry.call_count, 0)
+        # One current-pose sweep before the ownership service and one after
+        # it. The post-service result is reused by the first command.
+        self.assertEqual(
+            controller.path_validator.motion_safety.call_count, 2
+        )
+        final_safety_call = (
+            controller.path_validator.motion_safety.call_args_list[-1]
+        )
+        self.assertIs(final_safety_call.args[0], prepared_connector)
+        self.assertAlmostEqual(final_safety_call.args[1].x, capped_pose[0])
+        self.assertAlmostEqual(final_safety_call.args[1].y, capped_pose[1])
+        self.assertAlmostEqual(
+            final_safety_call.kwargs["tracking"].station,
+            projection.station,
+            places=9,
+        )
+        self.assertEqual(
+            final_safety_call.kwargs["live_obstacles"].shape, (0, 2)
+        )
+        self.assertIs(controller.active_path, prepared_connector)
+        self.assertIs(controller.entry_connector_path, prepared_connector)
+        self.assertIs(controller.entry_curve_path, prepared_turn)
+        np.testing.assert_array_equal(
+            controller.entry_connector_odom, prepared_poses
+        )
+        self.assertAlmostEqual(
+            controller.path_follower.path_station,
+            projection.station,
+            places=9,
+        )
+        commands = self.publishers[controller.cmd_vel_topic].messages
+        self.assertEqual(len(commands), 1)
+        self.assertAlmostEqual(
+            commands[-1].linear.x, controller.approach_speed
+        )
+        self.assertFalse(
+            abs(commands[-1].linear.x) <= 1e-9
+            and abs(commands[-1].angular.z) <= 1e-9
+        )
+
+    def test_entry_handoff_keeps_lane_control_for_stale_or_unsafe_live_sweep(self):
+        self.param_overrides.update(
+            {
+                "~parking/control/entry_handoff_minimum_clearance": 0.003,
+                "~parking/control/lane_entry_speed_limit": 0.09,
+                "~parking/safety/require_live_scan": True,
+            }
+        )
+        controller = self.make_controller()
+        controller.local_to_odom = self.rigid_local_to_odom()
+        prepared_pose = (0.90, 1.75, math.pi)
+        controller.odom_callback(self.odom_message(prepared_pose, linear_x=0.09))
+        self.lane_command(controller, linear=0.09)
+        self.assertTrue(controller._build_adaptive_entry(preflight=True))
+        prepared_path = controller.entry_connector_path
+        controller.arm_seq = 1
+        controller.arm_stamp = self.now()
+        controller.ready_published_seq = 1
+        controller.ready_source_stamp = self.now()
+        controller.gate_callback(Bool(data=True))
+        controller.control_callback(None)
+
+        self.advance(controller.prepare_settle_time + 0.01)
+        controller.odom_callback(self.odom_message(prepared_pose, linear_x=0.09))
+        self.lane_command(controller, linear=0.09)
+        self.advance(0.01)
+        controller.odom_callback(self.odom_message(prepared_pose, linear_x=0.09))
+
+        # No synchronized scan: do not acquire control or publish a mission
+        # command, and do not replace the prepared path.
+        controller.control_callback(None)
+        self.assertEqual(controller.state, controller.PREPARE_APPROACH)
+        self.assertEqual(self.lane_service.calls, [])
+        self.assertIs(controller.entry_connector_path, prepared_path)
+        self.assertEqual(
+            self.publishers[controller.cmd_vel_topic].messages, []
+        )
+
+        # A fresh obstacle inside the actual footprint makes the common
+        # complete-stop sweep unsafe. The same ownership guarantees apply.
+        controller.safety_scan_stamp = self.now()
+        controller.safety_scan_received = self.now()
+        controller.live_obstacle_points_odom = np.asarray(
+            [[prepared_pose[0], prepared_pose[1]]], dtype=np.float64
+        )
+        controller.control_callback(None)
+        self.assertEqual(controller.state, controller.PREPARE_APPROACH)
+        self.assertEqual(self.lane_service.calls, [])
+        self.assertIs(controller.entry_connector_path, prepared_path)
+        self.assertEqual(
+            self.publishers[controller.cmd_vel_topic].messages, []
+        )
+
+    def test_entry_handoff_projection_gates_keep_lane_as_sole_owner(self):
+        self.param_overrides.update(
+            {
+                "~parking/control/entry_handoff_minimum_clearance": 0.003,
+                "~parking/control/entry_handoff_maximum_path_error": 0.015,
+                "~parking/control/entry_handoff_maximum_heading_error_deg": 8.0,
+                "~parking/control/lane_entry_speed_limit": 0.09,
+            }
+        )
+        cases = ("path", "heading")
+        for case in cases:
+            with self.subTest(case=case):
+                controller = self.make_controller()
+                controller.local_to_odom = self.rigid_local_to_odom()
+                prepared_pose = (0.90, 1.75, math.pi)
+                controller.odom_callback(
+                    self.odom_message(prepared_pose, linear_x=0.09)
+                )
+                self.lane_command(controller, linear=0.09)
+                self.assertTrue(
+                    controller._build_adaptive_entry(preflight=True)
+                )
+                prepared_path = controller.entry_connector_path
+                start_x = float(prepared_path.x[0])
+                start_y = float(prepared_path.y[0])
+                start_heading = float(prepared_path.heading[0])
+                if case == "path":
+                    target_pose = (
+                        start_x - 0.016 * math.sin(start_heading),
+                        start_y + 0.016 * math.cos(start_heading),
+                        start_heading,
+                    )
+                else:
+                    target_pose = (
+                        start_x,
+                        start_y,
+                        normalize_angle(start_heading + math.radians(9.0)),
+                    )
+                controller.arm_seq = 1
+                controller.arm_stamp = self.now()
+                controller.ready_published_seq = 1
+                controller.ready_source_stamp = self.now()
+                controller.gate_callback(Bool(data=True))
+                controller.control_callback(None)
+                self.advance(controller.prepare_settle_time + 0.01)
+                controller.odom_callback(
+                    self.odom_message(target_pose, linear_x=0.09)
+                )
+                self.lane_command(controller, linear=0.09)
+                self.advance(0.01)
+                controller.odom_callback(
+                    self.odom_message(target_pose, linear_x=0.09)
+                )
+
+                controller.control_callback(None)
+
+                self.assertEqual(
+                    controller.state, controller.PREPARE_APPROACH
+                )
+                self.assertEqual(self.lane_service.calls, [])
+                self.assertIs(
+                    controller.entry_connector_path, prepared_path
+                )
+                self.assertEqual(
+                    self.publishers[controller.cmd_vel_topic].messages, []
+                )
+
+    def test_service_race_rechecks_pose_before_first_parking_command(self):
+        self.param_overrides.update(
+            {
+                "~parking/control/entry_handoff_minimum_clearance": 0.003,
+                "~parking/control/entry_handoff_maximum_path_error": 0.015,
+                "~parking/control/lane_entry_speed_limit": 0.09,
+            }
+        )
+        controller = self.make_controller()
+        controller.local_to_odom = self.rigid_local_to_odom()
+        prepared_pose = (0.90, 1.75, math.pi)
+        controller.odom_callback(
+            self.odom_message(prepared_pose, linear_x=0.09)
+        )
+        self.lane_command(controller, linear=0.09)
+        self.assertTrue(controller._build_adaptive_entry(preflight=True))
+        prepared_path = controller.entry_connector_path
+        controller.arm_seq = 1
+        controller.arm_stamp = self.now()
+        controller.ready_published_seq = 1
+        controller.ready_source_stamp = self.now()
+        controller.gate_callback(Bool(data=True))
+        controller.control_callback(None)
+        self.advance(controller.prepare_settle_time + 0.01)
+        controller.odom_callback(
+            self.odom_message(prepared_pose, linear_x=0.09)
+        )
+        self.lane_command(controller, linear=0.09)
+        self.advance(0.01)
+        controller.odom_callback(
+            self.odom_message(prepared_pose, linear_x=0.09)
+        )
+
+        service_calls = []
+
+        def disable_lane_with_new_pose(enabled):
+            service_calls.append(bool(enabled))
+            if not enabled:
+                # Emulate odometry arriving during the ownership service. The
+                # post-service projection must see this 30 mm lateral jump.
+                controller.odom_callback(
+                    self.odom_message(
+                        (prepared_pose[0], prepared_pose[1] + 0.030, math.pi),
+                        linear_x=0.09,
+                    )
+                )
+            return SimpleNamespace(success=True, message="ok")
+
+        controller.lane_service = disable_lane_with_new_pose
+        controller.control_callback(None)
+
+        self.assertEqual(service_calls, [False])
+        self.assertEqual(controller.state, controller.FAILED)
+        self.assertTrue(controller.mission_has_control)
+        self.assertIs(controller.entry_connector_path, prepared_path)
+        commands = self.publishers[controller.cmd_vel_topic].messages
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0].linear.x, 0.0)
+        self.assertEqual(commands[0].angular.z, 0.0)
+
 
 
 
@@ -1444,13 +2074,13 @@ class ParkingControllerTest(unittest.TestCase):
             {
                 "~parking/control/arc_angular_scale": 1.10,
                 "~parking/control/linear_acceleration": 0.03,
-                "~parking/control/linear_deceleration": 0.03,
+                "~parking/control/linear_deceleration": 0.13,
                 "~parking/control/angular_acceleration": 0.55,
             }
         )
 
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         controller.odom_pose = controller._zigzag_turn_start_pose()
         self.assertTrue(controller._build_zigzag_exit_curve())
         path = controller.zigzag_exit_curve_path
@@ -1473,6 +2103,10 @@ class ParkingControllerTest(unittest.TestCase):
         self.assertAlmostEqual(
             path.speed[-1], controller.profile_exit_velocity, places=12
         )
+        self.assertGreaterEqual(
+            float(np.min(path.speed)), controller.minimum_velocity - 1e-12
+        )
+        self.assertLess(path.expected_time, 6.0)
         self.assertLess(path.speed[-1], path.speed[0])
 
 
@@ -1507,7 +2141,7 @@ class ParkingControllerTest(unittest.TestCase):
         self.param_overrides["~parking/control/linear_deceleration"] = 0.03
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (controller.aisle_x, 1.50, controller.aisle_heading)
         pose = (controller.aisle_x, 1.25, controller.aisle_heading)
         goal = (
@@ -1577,7 +2211,7 @@ class ParkingControllerTest(unittest.TestCase):
         self.param_overrides["~parking/safety/require_live_scan"] = True
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (controller.aisle_x, 1.50, controller.aisle_heading)
         pose0 = (controller.aisle_x, 1.30, controller.aisle_heading)
         pose1 = (controller.aisle_x, 1.25, controller.aisle_heading)
@@ -1638,7 +2272,7 @@ class ParkingControllerTest(unittest.TestCase):
         self.param_overrides["~parking/safety/require_live_scan"] = True
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (controller.aisle_x, 1.50, controller.aisle_heading)
         goal = (
             controller.aisle_x,
@@ -1666,7 +2300,7 @@ class ParkingControllerTest(unittest.TestCase):
         self.param_overrides["~parking/safety/require_live_scan"] = True
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (controller.aisle_x, 1.50, controller.aisle_heading)
         pose = (controller.aisle_x, 1.25, controller.aisle_heading)
         goal = (
@@ -1716,7 +2350,7 @@ class ParkingControllerTest(unittest.TestCase):
     def test_stale_odom_response_holds_exact_zero(self):
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (controller.aisle_x, 1.50, controller.aisle_heading)
         pose = (controller.aisle_x, 1.25, controller.aisle_heading)
         goal = (
@@ -1754,7 +2388,7 @@ class ParkingControllerTest(unittest.TestCase):
         self.param_overrides["~parking/safety/require_live_scan"] = True
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (controller.aisle_x, 1.50, controller.aisle_heading)
         goal = (
             controller.aisle_x,
@@ -1785,7 +2419,7 @@ class ParkingControllerTest(unittest.TestCase):
         self.param_overrides["~parking/safety/require_live_scan"] = True
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (controller.aisle_x, 1.50, controller.aisle_heading)
         goal = (
             controller.aisle_x,
@@ -1839,18 +2473,18 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_turn_in_safety_benchmark_stays_below_control_period(self):
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         curve_start = (
-            controller.aisle_x + controller.entry_curve_offset,
+            controller.aisle_x + controller.turn_curve_offset,
             controller.entry_y,
             controller.approach_heading,
         )
         poses = quintic_turn_path(
             curve_start,
             controller.aisle_heading,
-            controller.entry_curve_offset,
-            controller.entry_curve_tangent,
-            controller.entry_curve_samples,
+            controller.turn_curve_offset,
+            controller.turn_curve_tangent,
+            controller.turn_curve_samples,
         )
         path = controller._common_path_from_poses(
             poses,
@@ -1908,7 +2542,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.scan_median_window = 1
         controller.require_live_safety_scan = False
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         old_cloud = np.asarray([[-9.0, -9.0]], dtype=np.float64)
         controller.live_obstacle_points_odom = old_cloud
         controller.safety_scan_stamp = self.now()
@@ -2060,6 +2694,7 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_gate_drains_preexisting_odom_before_recording_its_edge(self):
         controller = self.make_controller()
+        self.mark_local_ready(controller)
         with controller.lock:
             message = self.odom_message((0.90, 1.75, math.pi))
             worker = threading.Thread(
@@ -2080,6 +2715,7 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_gate_counts_odom_staged_before_inflight_scan_projection(self):
         controller = self.make_controller()
+        self.mark_local_ready(controller)
         controller.scan_median_window = 1
 
         first = self.odom_message((0.0, 0.0, 0.0))
@@ -2137,7 +2773,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = LEFT
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         turn = (
             controller.aisle_x,
             controller.decision_y,
@@ -2192,7 +2828,7 @@ class ParkingControllerTest(unittest.TestCase):
                 controller = self.make_controller()
                 controller.mission_has_control = True
                 controller.selected_space = selected_space
-                controller.route_transform = self.rigid_route_transform()
+                controller.local_to_odom = self.rigid_local_to_odom()
                 turn = (
                     controller.aisle_x,
                     controller.decision_y,
@@ -2241,7 +2877,7 @@ class ParkingControllerTest(unittest.TestCase):
     def test_confirmed_motion_segment_slews_to_zero_before_transition(self):
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (controller.aisle_x, controller.entry_y, controller.aisle_heading)
         goal = (
             controller.aisle_x,
@@ -2305,7 +2941,7 @@ class ParkingControllerTest(unittest.TestCase):
     def test_motion_timeout_at_goal_still_confirms_and_stops_before_transition(self):
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (
             controller.aisle_x,
             controller.entry_y,
@@ -2366,7 +3002,7 @@ class ParkingControllerTest(unittest.TestCase):
     def test_motion_timeout_outside_goal_tolerance_still_fails(self):
         controller = self.make_controller()
         controller.mission_has_control = True
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         start = (
             controller.aisle_x,
             controller.entry_y,
@@ -2404,7 +3040,7 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_amcl_correction_does_not_reproject_an_active_odom_goal(self):
         controller = self.start_controller(self.make_controller())
-        frozen_transform = controller.route_transform
+        frozen_transform = controller.local_to_odom
         frozen_goal = controller.goal_odom
 
         self.advance(0.05)
@@ -2415,17 +3051,17 @@ class ParkingControllerTest(unittest.TestCase):
         controller.control_callback(None)
 
         self.assertEqual(controller.state, controller.APPROACH)
-        self.assertEqual(controller.route_transform, frozen_transform)
+        self.assertEqual(controller.local_to_odom, frozen_transform)
         self.assertEqual(controller.goal_odom, frozen_goal)
 
     def test_entry_curve_and_aisle_goal_use_route_anchor_after_amcl_jump(self):
         controller = self.start_controller(self.make_controller())
-        frozen_route = controller.route_transform
+        frozen_route = controller.local_to_odom
         self.confirm_current_goal(controller)
         self.assertEqual(controller.state, controller.TURN_IN)
         expected_turn = (
             controller.aisle_x,
-            controller.entry_y - controller.entry_curve_offset,
+            controller.entry_y - controller.turn_curve_offset,
             controller.aisle_heading,
         )
         self.assert_pose_almost_equal(controller.goal_map, expected_turn)
@@ -2438,7 +3074,7 @@ class ParkingControllerTest(unittest.TestCase):
             float(np.max(controller.active_path.speed)),
             controller.entry_turn_speed,
         )
-        self.assertEqual(len(controller.entry_curve_odom), controller.entry_curve_samples)
+        self.assertEqual(len(controller.entry_curve_odom), controller.turn_curve_samples)
         self.assert_pose_almost_equal(
             controller.entry_curve_odom[-1], controller.goal_odom
         )
@@ -2460,7 +3096,7 @@ class ParkingControllerTest(unittest.TestCase):
             controller.goal_odom,
             self.route_pose_to_odom(expected_aisle, frozen_route),
         )
-        self.assertEqual(controller.route_transform, frozen_route)
+        self.assertEqual(controller.local_to_odom, frozen_route)
 
     def test_entry_curve_joins_both_straights_without_zero_command(self):
         controller = self.start_controller(self.make_controller())
@@ -2517,65 +3153,21 @@ class ParkingControllerTest(unittest.TestCase):
     def test_lane_handoff_continues_into_adaptive_entry_without_stop(self):
         self.param_overrides.update(
             {
-                "~parking/route/odom_aligned": False,
                 "~parking/control/arc_angular_scale": 1.10,
                 "~parking/control/linear_acceleration": 0.03,
                 "~parking/control/angular_acceleration": 0.55,
             }
         )
         controller = self.make_controller()
-        pre_gate_command = self.lane_command(controller, 0.076, 0.015)
-        map_pose = (0.9817, 1.7557, math.radians(-179.7))
-        odom_pose = (1.0033, 1.7608, math.radians(-179.5))
-
-        controller.gate_callback(Bool(data=True))
-        self.update_poses(controller, map_pose, odom_pose)
-        self.events.clear()
-        self.lane_service.calls.clear()
-        controller.control_callback(None)
-
+        self.start_controller(controller)
         commands = self.publishers[controller.cmd_vel_topic].messages
-        self.assertEqual(controller.state, controller.PREPARE_APPROACH)
-        self.assertEqual(self.lane_service.calls, [])
-        self.assertEqual(commands, [])
-        self.assertFalse(controller.mission_has_control)
-
-        # A pre-gate command and a post-gate command above the requested cap
-        # must not be used for handoff; lane control remains the sole owner.
-        self.advance(controller.prepare_settle_time + 0.01)
-        latest_odom = (0.9945, 1.7608, math.radians(-179.5))
-        controller.odom_callback(self.odom_message(latest_odom))
-        self.lane_command(controller, 0.081, 0.015)
-        controller.control_callback(None)
-        self.assertEqual(controller.state, controller.PREPARE_APPROACH)
-        self.assertEqual(self.lane_service.calls, [])
-        self.assertEqual(commands, [])
-
-        lane_command = self.lane_command(controller, 0.076, 0.015)
-        self.events.clear()
-        controller.control_callback(None)
-
         self.assertEqual(controller.state, controller.APPROACH)
         self.assertEqual(self.lane_service.calls, [False])
-
         self.assertTrue(controller.mission_has_control)
         self.assert_pose_almost_equal(
-            controller.entry_connector_odom[0], latest_odom
+            controller.entry_connector_odom[0], (0.90, 1.75, math.pi)
         )
-        self.assertEqual(len(commands), 1)
-        self.assertAlmostEqual(commands[0].linear.x, lane_command.linear.x)
-        self.assertAlmostEqual(commands[0].angular.z, lane_command.angular.z)
-        service_index = next(
-            index
-            for index, event in enumerate(self.events)
-            if event[0] == "service" and event[1] is False
-        )
-        command_index = next(
-            index
-            for index, event in enumerate(self.events)
-            if event[0] == "publish" and event[1] == "/cmd_vel"
-        )
-        self.assertLess(service_index, command_index)
+        self.assertTrue(commands)
         self.assertFalse(
             any(
                 abs(command.linear.x) <= 1e-9
@@ -2583,10 +3175,6 @@ class ParkingControllerTest(unittest.TestCase):
                 for command in commands
             )
         )
-
-        generation = controller.lane_command_generation
-        controller.command_observer_callback(pre_gate_command)
-        self.assertEqual(controller.lane_command_generation, generation)
 
         previous_linear = controller.last_linear
         previous_angular = controller.last_angular
@@ -2602,57 +3190,41 @@ class ParkingControllerTest(unittest.TestCase):
             controller.angular_acceleration * 0.05 + 1e-8,
         )
 
-    def test_route_transform_uses_odom_at_amcl_source_stamp(self):
+    def test_local_registration_is_the_only_frozen_transform(self):
         controller = self.make_controller()
-        controller.map_pose = (1.0, 1.75, 0.10)
-        controller.map_pose_stamp = controller_module.rospy.Time.from_sec(10.0)
-        controller.odom_pose = (0.20, 0.0, 0.0)
-        controller.odom_pose_history = deque(
-            (
-                (9.98, (0.10, 0.0, 0.0)),
-                (10.02, (0.14, 0.0, 0.0)),
-            )
+        controller.local_to_odom = RigidTransform2D(
+            0.31,
+            -0.22,
+            math.radians(11.0),
+            "parking_local",
+            "odom",
         )
 
-        self.assertTrue(controller._latch_route_transform())
-        synchronized = controller.route_transform.apply_pose(
-            Pose2D(0.12, 0.0, 0.0)
+        frozen = controller.local_to_odom
+        controller.map_pose_callback(
+            self.pose_message((100.0, -50.0, math.radians(-90.0)))
         )
-        self.assertAlmostEqual(synchronized.x, controller.map_pose[0])
-        self.assertAlmostEqual(synchronized.y, controller.map_pose[1])
-        self.assertAlmostEqual(synchronized.yaw, controller.map_pose[2])
-
-        # Using the newest odom pose here would shift a moving 3 mm-clearance
-        # route by 8 cm in this exaggerated regression fixture.
-        newest = controller.route_transform.apply_pose(
-            Pose2D(*controller.odom_pose)
+        self.assertEqual(controller.local_to_odom, frozen)
+        local = (0.8, 1.7, math.pi)
+        self.assert_pose_almost_equal(
+            controller._odom_pose_to_route(
+                controller._route_pose_to_odom(local)
+            ),
+            local,
         )
-        self.assertGreater(math.hypot(newest.x - 1.0, newest.y - 1.75), 0.07)
 
     def test_safe_entry_is_not_blocked_by_the_removed_fixed_amcl_start_box(self):
         self.param_overrides.update(
             {
-                "~parking/route/odom_aligned": False,
                 "~parking/control/arc_angular_scale": 1.10,
                 "~parking/control/linear_acceleration": 0.03,
                 "~parking/control/angular_acceleration": 0.55,
             }
         )
         controller = self.make_controller()
-        # x=1.04 was outside the deleted fixed max_x=1.03 condition. The
-        # frozen map pose is safe and the raw odom offset is handled only by
-        # the latched rigid transform, so the footprint check decides.
-        map_pose = (1.04, 1.755, math.pi)
-        odom_pose = (1.00, 1.755, math.pi)
-
-        controller.gate_callback(Bool(data=True))
-        self.update_poses(controller, map_pose, odom_pose)
-        self.lane_command(controller)
-        controller.control_callback(None)
-        self.advance(controller.prepare_settle_time + 0.01)
-        self.update_poses(controller, map_pose, odom_pose)
-        self.lane_command(controller)
-        controller.control_callback(None)
+        # The local lead window and swept footprint, not a global start box,
+        # decide whether this longer connecting straight can hand over.
+        self.start_controller_at(controller, (1.00, 1.755, math.pi))
 
         self.assertEqual(controller.state, controller.APPROACH)
         self.assertEqual(self.lane_service.calls, [False])
@@ -2668,7 +3240,7 @@ class ParkingControllerTest(unittest.TestCase):
             with self.subTest(selected_space=selected_space):
                 controller = self.make_controller()
                 controller.mission_has_control = True
-                controller.route_transform = self.rigid_route_transform()
+                controller.local_to_odom = self.rigid_local_to_odom()
                 controller.state = controller.SELECT_SPACE
                 controller.state_started = self.now()
                 decision = (
@@ -2704,7 +3276,7 @@ class ParkingControllerTest(unittest.TestCase):
                 controller = self.make_controller()
                 controller.mission_has_control = True
                 controller.selected_space = selected_space
-                controller.route_transform = self.rigid_route_transform()
+                controller.local_to_odom = self.rigid_local_to_odom()
                 start = (
                     controller.aisle_x,
                     controller.decision_y,
@@ -2789,7 +3361,7 @@ class ParkingControllerTest(unittest.TestCase):
                 controller = self.make_controller()
                 controller.mission_has_control = True
                 controller.selected_space = selected_space
-                controller.route_transform = self.rigid_route_transform()
+                controller.local_to_odom = self.rigid_local_to_odom()
                 turn = (
                     controller.aisle_x,
                     controller.decision_y,
@@ -2843,7 +3415,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = RIGHT
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         centre = (
             controller.aisle_x,
             controller.decision_y,
@@ -2908,6 +3480,40 @@ class ParkingControllerTest(unittest.TestCase):
             ordinary.margins.line + ordinary.margins.uncertainty,
         )
 
+    def test_registration_covariance_is_not_reapplied_to_registered_geometry(self):
+        controller = self.make_controller()
+        base = controller._path_safety("parking").margins.localization
+        controller.registration_covariance = (
+            (0.0001, 0.0, 0.0),
+            (0.0, 0.000025, 0.0),
+            (0.0, 0.0, 0.0),
+        )
+
+        safety = controller._path_safety("parking")
+
+        self.assertAlmostEqual(safety.margins.localization, base)
+
+    def test_registered_entry_stays_valid_with_diagnostic_covariance(self):
+        controller = self.make_controller()
+        controller.local_to_odom = RigidTransform2D(
+            -0.0090,
+            0.0015,
+            math.radians(-0.38),
+            "parking_local",
+            "odom",
+        )
+        controller.registration_covariance = (
+            (0.0001, 0.0, 0.0),
+            (0.0, 0.0001, 0.0),
+            (0.0, 0.0, math.radians(10.0) ** 2),
+        )
+        controller.odom_pose = (0.9573, 1.7446, math.radians(175.9))
+        controller.observed_lane_linear = 0.06
+
+        self.assertTrue(controller._build_adaptive_entry(preflight=True))
+        self.assertIsNotNone(controller.entry_connector_path)
+        self.assertTrue(controller.entry_connector_path.line_clearance > 0.0)
+
     def test_rotation_wrap_uses_the_shortest_direction_both_ways(self):
         cases = (
             (math.radians(179.0), math.radians(-179.0), 1.0),
@@ -2920,7 +3526,7 @@ class ParkingControllerTest(unittest.TestCase):
                 controller = self.make_controller()
                 controller.mission_has_control = True
                 controller.selected_space = LEFT
-                controller.route_transform = self.rigid_route_transform()
+                controller.local_to_odom = self.rigid_local_to_odom()
                 centre = (
                     controller.aisle_x,
                     controller.decision_y,
@@ -2956,7 +3562,7 @@ class ParkingControllerTest(unittest.TestCase):
                 controller = self.make_controller()
                 controller.mission_has_control = True
                 controller.selected_space = selected_space
-                controller.route_transform = self.rigid_route_transform()
+                controller.local_to_odom = self.rigid_local_to_odom()
                 centre = (
                     controller.aisle_x,
                     controller.decision_y,
@@ -2992,7 +3598,7 @@ class ParkingControllerTest(unittest.TestCase):
                 controller = self.make_controller()
                 controller.mission_has_control = True
                 controller.selected_space = selected_space
-                controller.route_transform = self.rigid_route_transform()
+                controller.local_to_odom = self.rigid_local_to_odom()
                 centre = (
                     controller.aisle_x,
                     controller.decision_y,
@@ -3031,7 +3637,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = LEFT
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         centre = (
             controller.aisle_x,
             controller.decision_y,
@@ -3053,7 +3659,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = RIGHT
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         centre = (
             controller.aisle_x,
             controller.decision_y,
@@ -3074,7 +3680,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = LEFT
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         centre = (
             controller.aisle_x,
             controller.decision_y,
@@ -3119,7 +3725,7 @@ class ParkingControllerTest(unittest.TestCase):
                 controller = self.make_controller()
                 controller.mission_has_control = True
                 controller.selected_space = selected_space
-                controller.route_transform = self.rigid_route_transform()
+                controller.local_to_odom = self.rigid_local_to_odom()
                 turn = (
                     controller.aisle_x,
                     controller.decision_y,
@@ -3258,7 +3864,7 @@ class ParkingControllerTest(unittest.TestCase):
                     controller.zigzag_heading,
                 )
                 completion_odom = self.route_pose_to_odom(
-                    completion_map, controller.route_transform
+                    completion_map, controller.local_to_odom
                 )
                 for _ in range(controller.rejoin_confirm_frames):
                     self.advance(0.05)
@@ -3290,7 +3896,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = LEFT
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         curve_start = controller._zigzag_turn_start_pose()
         self.update_poses(controller, curve_start, curve_start)
         self.assertTrue(controller._build_zigzag_exit_curve())
@@ -3358,7 +3964,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = LEFT
-        controller.route_transform = self.rigid_route_transform(
+        controller.local_to_odom = self.rigid_local_to_odom(
             0.12, -0.08, math.radians(3.0)
         )
         controller.state = controller.VERIFY_ZIGZAG_LANE
@@ -3370,7 +3976,7 @@ class ParkingControllerTest(unittest.TestCase):
             controller.zigzag_heading,
         )
         handoff_odom = self.route_pose_to_odom(
-            handoff_map, controller.route_transform
+            handoff_map, controller.local_to_odom
         )
         jumped_map = (
             handoff_map[0] + 0.21,
@@ -3401,7 +4007,7 @@ class ParkingControllerTest(unittest.TestCase):
             controller.zigzag_heading,
         )
         completion_odom = self.route_pose_to_odom(
-            completion_map, controller.route_transform
+            completion_map, controller.local_to_odom
         )
         for _ in range(controller.rejoin_confirm_frames):
             self.advance(0.05)
@@ -3415,7 +4021,7 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_zigzag_completion_survives_one_observed_camera_fit_gap(self):
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         controller.state = controller.JOIN_ZIGZAG
         controller.state_started = self.now()
 
@@ -3454,21 +4060,23 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_zigzag_completion_accepts_verified_preview_heading(self):
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         controller.state = controller.JOIN_ZIGZAG
         controller.state_started = self.now()
-        controller.rejoin_heading_tolerance = math.radians(6.0)
+        controller.rejoin_heading_tolerance = math.radians(7.0)
 
-        # Official LEFT run 17 reached this straight window with positive
-        # swept-line clearance while the speed-adaptive camera lookahead had
-        # already begun the next bend. Its 5.7-degree preview heading remains
-        # strictly inside Zigzag's separate 7-degree acquisition envelope.
-        pose = (
-            0.17,
-            controller.zigzag_straight_y,
-            controller.zigzag_heading + math.radians(5.7),
-        )
-        for _ in range(controller.rejoin_confirm_frames):
+        # The official-start shared-turn run crossed the completion window
+        # while camera preview steering grew from 5.8 to about 6.2 degrees.
+        # Those poses remain inside Zigzag's separate 7-degree acquisition
+        # envelope and must finish the rolling ownership transfer.
+        for index in range(controller.rejoin_confirm_frames):
+            fraction = index / float(controller.rejoin_confirm_frames - 1)
+            pose = (
+                0.189 - 0.003 * index,
+                controller.zigzag_straight_y - 0.0022 * fraction,
+                controller.zigzag_heading
+                + math.radians(5.8 + 0.4 * fraction),
+            )
             self.advance(0.04)
             self.update_poses(controller, pose, pose)
             controller.lane_path_diagnostics_callback(
@@ -3480,14 +4088,14 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_zigzag_completion_rejects_heading_outside_preview_envelope(self):
         controller = self.make_controller()
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         controller.state = controller.JOIN_ZIGZAG
         controller.state_started = self.now()
-        controller.rejoin_heading_tolerance = math.radians(6.0)
+        controller.rejoin_heading_tolerance = math.radians(7.0)
         pose = (
             0.17,
             controller.zigzag_straight_y,
-            controller.zigzag_heading + math.radians(6.1),
+            controller.zigzag_heading + math.radians(7.1),
         )
 
         for _ in range(controller.rejoin_confirm_frames):
@@ -3504,7 +4112,7 @@ class ParkingControllerTest(unittest.TestCase):
         controller = self.make_controller()
         controller.mission_has_control = True
         controller.selected_space = LEFT
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         controller.state = controller.VERIFY_ZIGZAG_LANE
         controller.state_started = self.now()
         handoff_pose = (
@@ -3534,6 +4142,15 @@ class ParkingControllerTest(unittest.TestCase):
 
     def test_handoff_failures_never_publish_complete(self):
         controller = self.make_controller()
+        arm = Header(seq=1, stamp=self.now(), frame_id="parking")
+        controller.arm_callback(arm)
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "parking_local", "odom"
+        )
+        self.update_poses(controller, (0.90, 1.75, math.pi))
+        self.lane_command(controller)
+        controller.control_callback(None)
+        self.assertEqual(controller.ready_published_seq, 1)
         self.lane_service.success = False
         controller.gate_callback(Bool(data=True))
         self.update_poses(controller, (0.90, 1.75, math.pi))
@@ -3629,7 +4246,7 @@ class ParkingControllerTest(unittest.TestCase):
             controller.decision_y,
             controller.aisle_heading,
         )
-        controller.route_transform = self.rigid_route_transform()
+        controller.local_to_odom = self.rigid_local_to_odom()
         self.update_poses(controller, corrected_pose, stopped_odom_pose)
         self.assertGreater(
             math.hypot(
@@ -3654,6 +4271,9 @@ class ParkingControllerTest(unittest.TestCase):
     def test_selection_rejects_scan_when_amcl_heading_is_outside_aisle(self):
         controller = self.make_controller()
         controller.mission_has_control = True
+        controller.local_to_odom = RigidTransform2D(
+            0.0, 0.0, 0.0, "parking_local", "odom"
+        )
         controller.state = controller.SELECT_SPACE
         controller.state_started = self.now()
         wrong_heading_pose = (
@@ -3673,7 +4293,7 @@ class ParkingControllerTest(unittest.TestCase):
         issue = controller._selection_input_issue(self.now())
         controller.control_callback(None)
 
-        self.assertIn("AMCL aisle heading error", issue)
+        self.assertIn("local aisle heading error", issue)
         self.assertEqual(controller.state, controller.SELECT_SPACE)
         self.assertIsNone(controller.selected_space)
 

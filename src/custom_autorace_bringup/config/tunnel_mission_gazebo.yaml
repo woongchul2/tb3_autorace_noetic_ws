@@ -1,5 +1,6 @@
-# Gazebo-only tunnel navigation. Hardware needs a separately surveyed wall map,
-# entrance/exit poses, Mid-360 transform and footprint margins.
+# Gazebo tunnel template. Hardware needs the same mission-local wall survey,
+# Mid-360 transform and footprint margins; absolute course placement is not
+# part of this file.
 tunnel:
   frames:
     map: map
@@ -10,6 +11,8 @@ tunnel:
     odometry: /odometry/filtered
     map_pose: /mission/map_pose
     zone_gate: /mission/enable/tunnel
+    arm: /mission/arm/tunnel
+    ready: /mission/ready/tunnel
     lane_path_diagnostics: /control/lane_path_diagnostics
     signs: /detect/signs
     manual_stop: /control/manual_stop
@@ -19,8 +22,10 @@ tunnel:
     lane_stop_service: /control/lane_following
 
   map:
-    # Crop the full AMCL map to the fixed tunnel walls plus both portals. The
-    # three cylinders are deliberately absent from the static map.
+    # This old-map crop is the immutable mission-local tunnel template. The
+    # live portal registration moves the complete template as one rigid body;
+    # AMCL map pose is diagnostic only. The three cylinders are deliberately
+    # absent from this static layer.
     planning_bounds: [-2.02, -2.02, 0.30, 0.55]
     static_occupied_threshold: 65
     unknown_is_occupied: true
@@ -47,12 +52,51 @@ tunnel:
 
   scan:
     maximum_planning_range: 3.0
-    # Freeze map <- odom at the entrance, then project each scan through the
-    # acquisition-time odom <- message.header.frame_id transform. This keeps
-    # unmapped obstacles from pulling the AMCL reference during the mission.
+    # Project every scan with the acquisition-time odom <- sensor transform.
+    # The portal-derived mission-template <- odom transform is frozen before
+    # the gate, so unmapped obstacles cannot pull the reference in the tunnel.
     transform_timeout: 0.05
     maximum_age: 0.25
     maximum_future_stamp: 0.06
+
+  registration:
+    # One longitudinal wall plus the perpendicular entrance wall and their
+    # two visible endpoints make SE(2) observable. A lone parallel wall never
+    # publishes readiness. Registration runs while lane control keeps driving.
+    # This is the calibrated pose of the detector's endpoint midpoint, not the
+    # entry clearance plane below. Keeping those two landmarks separate avoids
+    # translating the complete tunnel template by the physical corner stagger.
+    # Run18/19 ground-truth replay: center std=(1.5, 2.8) mm; the fused-axis
+    # heading removes the independent line-fit biases before this pose is used.
+    reference_pose: [-1.757968, -0.041389, -89.4336]
+    confirmation_samples: 3
+    maximum_sample_gap: 0.20
+    maximum_position_delta: 0.04
+    maximum_heading_delta_deg: 4.0
+    # Freeze farther out, but publish ready only in this handoff window after
+    # the current source-stamped entry path has passed the static footprint
+    # sweep. Lane cruise remains the sole owner until ready opens the gate.
+    ready_minimum_entry_lead: 0.20
+    ready_maximum_entry_lead: 0.50
+    ready_maximum_heading_error_deg: 30.0
+    minimum_forward_distance: 0.10
+    maximum_forward_distance: 1.20
+    minimum_absolute_lateral: 0.04
+    maximum_absolute_lateral: 0.65
+    maximum_adjacent_beam_gap: 3
+    maximum_point_gap: 0.12
+    minimum_wall_points: 6
+    minimum_wall_length: 0.18
+    maximum_wall_residual: 0.018
+    maximum_heading_deviation_deg: 30.0
+    maximum_orthogonal_angle_deg: 10.0
+    expected_portal_width: 0.316
+    portal_width_tolerance: 0.06
+    # A 360-beam scan sees the longitudinal face only after the tangent ray
+    # has passed its physical corner.  Run17 measured up to 95 mm of this
+    # endpoint visibility bias while the independently fitted portal width
+    # and wall axes remained valid.
+    maximum_corner_skew: 0.10
 
   footprint:
     # The exit is too narrow for circumscribed-radius inflation. Hybrid A*
@@ -63,9 +107,9 @@ tunnel:
     padding: 0.010
 
   goal:
-    # Hybrid A* stops inside the east portal. The controller then aligns yaw
-    # while the complete footprint is still protected by the tunnel walls and
-    # follows the surveyed straight exit separately.
+    # Hybrid A* ends inside the east portal. Its route is accepted only after
+    # a prevalidated zero-end-curvature connector reaches the outside pose, so
+    # controller never schedules an interior exit stop or yaw-alignment phase.
     x: -0.180
     y: -1.748373
     yaw_deg: 0.0
@@ -131,7 +175,10 @@ tunnel:
     cruise_velocity: 0.075
     minimum_velocity: 0.035
     entry_velocity: 0.035
-    exit_velocity: 0.040
+    # Keep the Hybrid A* endpoint at cruise speed.  A validated moving exit
+    # connector continues from it, so pre-braking for an interior stop is not
+    # needed during the normal path.
+    exit_velocity: 0.075
     maximum_angular_velocity: 0.55
     maximum_lateral_acceleration: 0.030
     linear_acceleration: 0.15
@@ -165,27 +212,20 @@ tunnel:
     handoff_remaining_distance: 0.035
     position_tolerance: 0.060
     heading_tolerance_deg: 10.0
-    staging_remaining_tolerance: 0.025
-    staging_position_tolerance: 0.025
-    staging_heading_tolerance_deg: 10.0
-    # Hybrid A* targets the centre but may legally end within its 35 mm goal
-    # radius. Preserve that actual y during the straight exit; 45 mm rejects
-    # tracking excursions that would consume the complete physical margin.
-    staging_lateral_tolerance: 0.045
     outside_pose: [0.200, -1.748373, 0.0]
     portal_plane_x: 0.003697
     clearance_margin: 0.010
-    straight_velocity: 0.040
-    # Before following the straight exit, holding yaw within one degree at
-    # the worst legal 35 mm lateral goal error keeps the padded footprint
-    # inside the 295.6 mm aperture.  Once the rear has cleared the portal,
-    # handoff safety comes from the rolling path's full-footprint clearance.
-    alignment_tolerance_deg: 1.0
-    alignment_gain: 2.0
-    alignment_max_angular_velocity: 0.30
-    alignment_min_angular_velocity: 0.08
+    # A plan is committed only after this strictly forward connector from the
+    # Hybrid A* endpoint through the portal has passed a full footprint sweep.
+    # The controller keeps cruise speed across the seam and starts validating
+    # the camera lane path while it is still driving out of the tunnel.
+    connector_tangent_ratio: 0.20
+    minimum_tangent_length: 0.008
+    maximum_tangent_length: 0.055
+    connector_sample_step: 0.010
     # Confirm the already-generated, swept-footprint-safe camera rolling path.
-    # 6 frames at 30 Hz preserves the former 2-frame/10 Hz confirmation.
+    # Once the rear clears the portal, control transfers directly without a
+    # zero command or a stopped verification state.
     confirmation_frames: 6
     confirmation_max_gap: 0.20
     lane_path_timeout: 0.35
@@ -194,6 +234,7 @@ tunnel:
     join_confirmation_frames: 6
 
   timeouts:
+    # map_pose is retained only for the AMCL-vs-local diagnostic delta.
     map_pose: 0.40
     pose_stamp_skew: 0.05
     odometry: 0.35
@@ -204,8 +245,6 @@ tunnel:
     planning: 15.0
     plan_retry_period: 0.50
     mission: 120.0
-    exit_alignment: 3.0
     exit_straight: 12.0
-    exit_confirmation: 3.0
     lane_join: 2.0
     handoff: 0.30

@@ -15,11 +15,13 @@ from custom_autorace_bringup.obstacle_planner import (
     RectanglePathChecker,
     rectangle_surface_points,
 )
+from custom_autorace_bringup.parking_geometry import curvature_matched_quintic
 from custom_autorace_bringup.path_following import (
     CommonPath,
     PathFollower,
     Pose2D,
     TrackingConfig,
+    normalize_angle,
 )
 
 
@@ -58,7 +60,6 @@ class ObstaclePlannerTest(unittest.TestCase):
         lateral_scale = template.get("lateral_scale")
         if lateral_scale is None:
             lateral_scale = template.get("lateral_scales", [1.0])[0]
-        registration = template.get("registration", {})
         spline = CourseSplinePlanner(
             collision_checker=self.checker,
             validation_footprint=validation,
@@ -81,6 +82,9 @@ class ObstaclePlannerTest(unittest.TestCase):
                 "minimum_nominal_clearance"
             ],
             live_validation_distance=template["live_validation_distance"],
+            barrier_association_distance=template[
+                "barrier_association_distance"
+            ],
             cruise_velocity=template["cruise_velocity"],
             minimum_velocity=template["minimum_velocity"],
             maximum_angular_velocity=config["control"][
@@ -89,25 +93,6 @@ class ObstaclePlannerTest(unittest.TestCase):
             linear_acceleration=config["control"]["linear_acceleration"],
             linear_deceleration=config["control"]["linear_deceleration"],
             angular_acceleration=config["control"]["angular_acceleration"],
-            registration_longitudinal_search=registration.get(
-                "longitudinal_search", 0.18
-            ),
-            registration_lateral_search=registration.get(
-                "lateral_search", 0.14
-            ),
-            registration_coarse_step=registration.get("coarse_step", 0.02),
-            registration_fine_window=registration.get("fine_window", 0.012),
-            registration_fine_step=registration.get("fine_step", 0.002),
-            registration_inlier_distance=registration.get(
-                "inlier_distance", 0.025
-            ),
-            registration_minimum_inliers=registration.get(
-                "minimum_inliers", 15
-            ),
-            registration_maximum_rms=registration.get("maximum_rms", 0.015),
-            registration_line_exclusion=registration.get(
-                "line_exclusion", 0.025
-            ),
         )
         obstacles = np.vstack(
             [
@@ -277,6 +262,169 @@ class ObstaclePlannerTest(unittest.TestCase):
         map_y = 0.0200 + float(template.x[-1])
         self.assertAlmostEqual(map_x, 1.4883, places=3)
         self.assertAlmostEqual(map_y, 1.7550, places=3)
+
+    def test_live_entry_connector_is_g2_and_keeps_the_early_sweep_safe(self):
+        spline, obstacles = self.production_spline()
+        self.assertTrue(
+            spline.prepare(obstacles, self.right_line, self.left_line)
+        )
+
+        # Official-start replay just before the former late handoff.  Values
+        # are in the registered course frame; the lane controller was still
+        # following the approach at this sample.
+        progress = 0.3782
+        course_lateral = -0.1186
+        lateral_offset = -course_lateral
+        suffix = spline.plan(
+            progress,
+            lateral_offset,
+            np.empty((0, 2), dtype=np.float64),
+            self.right_line + lateral_offset,
+            self.left_line + lateral_offset,
+        )
+        self.assertIsNotNone(suffix)
+        start_heading = math.radians(-24.4)
+        start_curvature = 3.17
+
+        path = spline.connect_entry(
+            suffix,
+            start_heading,
+            start_curvature=start_curvature,
+        )
+
+        self.assertIsNotNone(path)
+        self.assertAlmostEqual(float(path.x[0]), 0.0, places=12)
+        self.assertAlmostEqual(float(path.y[0]), 0.0, places=12)
+        self.assertAlmostEqual(float(path.heading[0]), start_heading, places=12)
+        self.assertAlmostEqual(
+            float(path.curvature[0]), start_curvature, places=12
+        )
+        self.assertTrue(self.checker.validator.validate_path(path).safe)
+        self.assertGreater(path.line_clearance, 0.0)
+        self.assertGreater(path.obstacle_clearance, 0.0)
+
+        # The first exact suffix sample is the quintic seam.  Both heading and
+        # curvature must come from the same surveyed sample, not from a
+        # two-point interpolation that is subsequently discarded.
+        seam = None
+        for connected_index in range(1, path.size):
+            matches = np.flatnonzero(
+                np.isclose(
+                    suffix.x,
+                    path.x[connected_index],
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+                & np.isclose(
+                    suffix.y,
+                    path.y[connected_index],
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+            )
+            if matches.size:
+                seam = connected_index, int(matches[0])
+                break
+        self.assertIsNotNone(seam)
+        connected_index, suffix_index = seam
+        self.assertAlmostEqual(
+            normalize_angle(
+                float(path.heading[connected_index])
+                - float(suffix.heading[suffix_index])
+            ),
+            0.0,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            float(path.curvature[connected_index]),
+            float(suffix.curvature[suffix_index]),
+            places=12,
+        )
+
+    def test_late_intruding_replay_has_no_unsafe_connector_fallback(self):
+        spline, obstacles = self.production_spline()
+        self.assertTrue(
+            spline.prepare(obstacles, self.right_line, self.left_line)
+        )
+        progress = 0.543867
+        course_lateral = -0.145573
+        lateral_offset = -course_lateral
+        suffix = spline.plan(
+            progress,
+            lateral_offset,
+            np.empty((0, 2), dtype=np.float64),
+            self.right_line + lateral_offset,
+            self.left_line + lateral_offset,
+        )
+        self.assertIsNotNone(suffix)
+
+        self.assertIsNone(
+            spline.connect_entry(suffix, math.radians(-1.678))
+        )
+
+    def test_entry_search_bounds_exact_sweeps_before_final_route_validation(self):
+        spline, obstacles = self.production_spline()
+        self.assertTrue(
+            spline.prepare(obstacles, self.right_line, self.left_line)
+        )
+        original_validate = self.checker.validator.validate_path
+        self.checker.validator.validate_path = mock.Mock(
+            wraps=original_validate
+        )
+
+        early_offset = 0.1186
+        early = spline.plan(
+            0.3782,
+            early_offset,
+            np.empty((0, 2), dtype=np.float64),
+            self.right_line + early_offset,
+            self.left_line + early_offset,
+        )
+        self.checker.validator.validate_path.reset_mock()
+        self.assertIsNotNone(
+            spline.connect_entry(
+                early, math.radians(-24.4), start_curvature=3.17
+            )
+        )
+        # The first ranked connector is exact-swept once.  The controller then
+        # performs the sole full connector-plus-suffix sweep after freezing.
+        self.assertEqual(self.checker.validator.validate_path.call_count, 1)
+
+        late_offset = 0.145573
+        late = spline.plan(
+            0.543867,
+            late_offset,
+            np.empty((0, 2), dtype=np.float64),
+            self.right_line + late_offset,
+            self.left_line + late_offset,
+        )
+        self.checker.validator.validate_path.reset_mock()
+        self.assertIsNone(
+            spline.connect_entry(late, math.radians(-1.678))
+        )
+        # All late candidates already fail the cheap full-margin boundary
+        # necessity check; none consume an exact obstacle sweep.
+        self.assertEqual(self.checker.validator.validate_path.call_count, 0)
+
+    def test_curvature_matched_quintic_matches_both_end_conditions(self):
+        start = (0.0, 0.0, math.radians(-8.0))
+        end = (0.24, 0.06, math.radians(31.0))
+        points, heading, curvature = curvature_matched_quintic(
+            start,
+            end,
+            -0.8,
+            2.4,
+            0.035,
+            0.045,
+            0.004,
+        )
+
+        np.testing.assert_allclose(points[0], start[:2], atol=1e-12)
+        np.testing.assert_allclose(points[-1], end[:2], atol=1e-12)
+        self.assertAlmostEqual(float(heading[0]), start[2], places=12)
+        self.assertAlmostEqual(float(heading[-1]), end[2], places=12)
+        self.assertAlmostEqual(float(curvature[0]), -0.8, places=12)
+        self.assertAlmostEqual(float(curvature[-1]), 2.4, places=12)
 
     def test_template_and_live_path_each_run_one_swept_validation(self):
         spline, obstacles = self.production_spline()
@@ -497,98 +645,9 @@ class ObstaclePlannerTest(unittest.TestCase):
             abs(exit_curvature - float(path.curvature[join])), 1e-8
         )
 
-    def test_registration_fine_window_can_be_smaller_than_coarse_step(self):
-        spline, _ = self.production_spline()
-        self.assertAlmostEqual(spline.registration_coarse_step, 0.020)
-        self.assertAlmostEqual(spline.registration_fine_step, 0.002)
-        self.assertAlmostEqual(spline.registration_fine_window, 0.012)
-
-    def test_lidar_registration_refines_amcl_seed_for_odom_latch(self):
-        spline, obstacles = self.production_spline()
-        spline.prepare(obstacles, self.right_line, self.left_line)
-        true_progress = 0.405
-        true_lateral = -0.122
-        live = obstacles - np.asarray([true_progress, true_lateral])
-        visible = (
-            (live[:, 0] >= -0.18)
-            & (live[:, 0] <= 1.35)
-            & (np.abs(live[:, 1]) <= 0.43)
-        )
-        live = live[visible][::3]
-        generator = np.random.RandomState(7)
-        live += generator.normal(0.0, 0.0015, size=live.shape)
-        outlier_x = np.linspace(-0.10, 1.20, 30)
-        live = np.vstack(
-            (
-                live,
-                np.column_stack(
-                    (
-                        outlier_x,
-                        np.full_like(outlier_x, 0.2475 - true_lateral),
-                    )
-                ),
-            )
-        )
-        alignment = spline.align_pose(
-            true_progress + 0.090,
-            true_lateral + 0.065,
-            live,
-        )
-        self.assertIsNotNone(alignment)
-        self.assertLess(abs(alignment.progress - true_progress), 0.006)
-        self.assertLess(abs(alignment.lateral - true_lateral), 0.006)
-        self.assertGreaterEqual(alignment.inliers, 15)
-        self.assertLess(alignment.rms, 0.006)
-
-    def test_lidar_registration_does_not_match_front_face_to_hidden_back(self):
-        spline, obstacles = self.production_spline()
-        spline.prepare(obstacles, self.right_line, self.left_line)
-        minimum_x, maximum_x, minimum_y, maximum_y = (
-            spline._registration_boxes[0]
-        )
-        self.assertAlmostEqual(maximum_x - minimum_x, 0.10, places=6)
-
-        true_origin = np.asarray([0.30, -0.12])
-        visible_front = np.column_stack(
-            (
-                np.full(25, minimum_x),
-                np.linspace(minimum_y + 0.04, maximum_y - 0.04, 25),
-            )
-        )
-        live_points = visible_front - true_origin
-        correct_absolute = live_points + true_origin
-        correct_distance, _ = spline._rectangle_surface_matches(
-            correct_absolute, true_origin
-        )
-        self.assertLess(float(np.max(correct_distance)), 1e-12)
-
-        wrong_origin = true_origin + np.asarray([0.10, 0.0])
-        wrong_absolute = live_points + wrong_origin
-        unfiltered_distance, _ = spline._rectangle_surface_matches(
-            wrong_absolute
-        )
-        self.assertLess(float(np.max(unfiltered_distance)), 1e-12)
-        visible_distance, _ = spline._rectangle_surface_matches(
-            wrong_absolute, wrong_origin
-        )
-        self.assertGreater(
-            float(np.min(visible_distance)),
-            spline.registration_inlier_distance,
-        )
-
-    def test_lidar_registration_rejects_single_axis_match(self):
-        spline, obstacles = self.production_spline()
-        spline.prepare(obstacles, self.right_line, self.left_line)
-        first_face = obstacles[
-            (np.abs(obstacles[:, 0] - 0.47) < 1e-6)
-            & (obstacles[:, 1] >= 0.03)
-            & (obstacles[:, 1] <= 0.26)
-        ]
-        live = first_face - np.asarray([0.40, -0.12])
-        self.assertIsNone(spline.align_pose(0.48, -0.06, live))
-
     def test_known_barrier_faces_are_robustly_stabilized(self):
         spline, obstacles = self.production_spline()
+        self.assertAlmostEqual(spline.barrier_association_distance, 0.025)
         self.assertTrue(
             spline.prepare(obstacles, self.right_line, self.left_line)
         )
@@ -614,10 +673,38 @@ class ObstaclePlannerTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             float(stabilized_absolute[0, 1]),
-            0.0225,
+            float(np.median(measured_y)),
             places=12,
         )
         np.testing.assert_allclose(stabilized_absolute[-1], unrelated[0])
+
+    def test_stabilized_face_preserves_coherent_normal_displacement(self):
+        spline, obstacles = self.production_spline()
+        self.assertTrue(
+            spline.prepare(obstacles, self.right_line, self.left_line)
+        )
+        progress = 0.40
+        lateral = -0.11
+        nominal_y = 0.0225
+        measured_y = nominal_y + 0.018
+        absolute = np.column_stack(
+            (
+                np.linspace(0.48, 0.56, 12),
+                np.full(12, measured_y),
+            )
+        )
+        relative = absolute - np.asarray([progress, lateral])
+
+        stabilized = spline.stabilize_known_barrier_returns(
+            relative, progress, lateral
+        )
+        stabilized_absolute = stabilized + np.asarray([progress, lateral])
+
+        np.testing.assert_allclose(
+            stabilized_absolute[:, 1],
+            np.full(12, measured_y),
+            atol=1e-12,
+        )
 
     def test_stabilized_face_preserves_geometry_outside_association_gate(self):
         spline, obstacles = self.production_spline()

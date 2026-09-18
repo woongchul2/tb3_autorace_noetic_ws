@@ -20,7 +20,7 @@ source devel/setup.bash
 roslaunch custom_autorace_description description.launch use_gui:=true
 ```
 
-역할: 미션 제어기 없이 기본 AutoRace 코스와 Gazebo 센서만 실행합니다.
+역할: 미션 제어기 없이 기본 AutoRace 코스와 Gazebo 센서를 실행하고 터널 원통 배치를 실행마다 A/B/C 순환 변경합니다.
 
 ```bash
 roslaunch custom_autorace_description gazebo_autorace.launch
@@ -31,6 +31,13 @@ roslaunch custom_autorace_description gazebo_autorace.launch
 ```bash
 roslaunch custom_autorace_description gazebo_autorace.launch \
   course_texture:=/workspace/maps/changed_course.png
+```
+
+역할: 터널 원통을 재현 가능한 B 배치로 실행합니다.
+
+```bash
+roslaunch custom_autorace_description gazebo_autorace.launch \
+  tunnel_obstacle_layout:=layout_b
 ```
 
 역할: Gazebo 실제 위치 기반 world odometry를 사용합니다.
@@ -47,7 +54,7 @@ roslaunch custom_autorace_description gazebo_autorace.launch fuse_imu:=false
 
 ## 통합 자동주행
 
-역할: 공식 시작 자세에서 전체 미션, 센서, AMCL, EKF와 RViz를 실행합니다.
+역할: 공식 시작 자세에서 전체 미션, 센서, AMCL, EKF와 RViz를 실행하고 터널 원통 배치를 실행마다 A/B/C 순환 변경합니다.
 
 ```bash
 roslaunch custom_autorace_bringup gazebo.launch
@@ -202,7 +209,7 @@ roslaunch custom_autorace_bringup gazebo.launch \
 
 ```bash
 roslaunch custom_autorace_bringup gazebo.launch \
-  gui:=false rviz:=false x_pos:=-1.40 y_pos:=1.25 yaw_pos:=0.0 \
+  gui:=false rviz:=false x_pos:=-1.60 y_pos:=1.25 yaw_pos:=0.0 \
   odometry_source:=world wait_for_green:=false detect_signs:=false \
   mission_models_initial_state:=6 \
   intersection_mission:=false obstacle_mission:=false \
@@ -220,6 +227,31 @@ roslaunch custom_autorace_bringup gazebo.launch \
   odometry_source:=world wait_for_green:=false mission_models:=false \
   intersection_mission:=false obstacle_mission:=false parking_mission:=false \
   zigzag_mission:=false level_crossing_mission:=false tunnel_mission:=true \
+  tunnel_obstacle_layout:=layout_a \
+  mission_zone_config:=$(rospack find custom_autorace_bringup)/config/mission_zones_tunnel_test_gazebo.yaml
+```
+
+역할: 터널 직전에서 90도 회전한 B 기둥 배치와 Hybrid A* 경로를 실행합니다.
+
+```bash
+roslaunch custom_autorace_bringup gazebo.launch \
+  gui:=false rviz:=true x_pos:=-1.75 y_pos:=0.18 yaw_pos:=-1.57079632679 \
+  odometry_source:=world wait_for_green:=false mission_models:=false \
+  intersection_mission:=false obstacle_mission:=false parking_mission:=false \
+  zigzag_mission:=false level_crossing_mission:=false tunnel_mission:=true \
+  tunnel_obstacle_layout:=layout_b \
+  mission_zone_config:=$(rospack find custom_autorace_bringup)/config/mission_zones_tunnel_test_gazebo.yaml
+```
+
+역할: 터널 직전에서 180도 회전한 C 기둥 배치와 Hybrid A* 경로를 실행합니다.
+
+```bash
+roslaunch custom_autorace_bringup gazebo.launch \
+  gui:=false rviz:=true x_pos:=-1.75 y_pos:=0.18 yaw_pos:=-1.57079632679 \
+  odometry_source:=world wait_for_green:=false mission_models:=false \
+  intersection_mission:=false obstacle_mission:=false parking_mission:=false \
+  zigzag_mission:=false level_crossing_mission:=false tunnel_mission:=true \
+  tunnel_obstacle_layout:=layout_c \
   mission_zone_config:=$(rospack find custom_autorace_bringup)/config/mission_zones_tunnel_test_gazebo.yaml
 ```
 
@@ -268,19 +300,18 @@ rostopic echo -n 1 /mission/sequence_index
 
 ## 교차로 상태 확인
 
-역할: AMCL 자세, gate, 표지판, 경로와 차선 복귀 상태를 확인합니다.
+역할: 교차로 arm, 센서 등록 ready, gate, 표지판, 경로와 차선 복귀를 확인합니다.
 
 ```bash
-rostopic echo /amcl_pose
-rostopic echo /mission/map_pose
 rostopic echo /mission/current
+rostopic echo -n 1 /mission/arm/intersection
+rostopic echo -n 1 /mission/ready/intersection
 rostopic echo /mission/enable/intersection
-rostopic echo /mission/inside/intersection
-rostopic echo /mission/inside/intersection_direction_observation
 rostopic echo /detect/signs
 rostopic echo /intersection/direction
 rostopic echo /intersection/state
 rostopic echo -n 1 /intersection/generated_path
+rostopic echo -n 1 /control/lane_path
 rostopic echo /intersection/diagnostics
 rostopic echo /detect/lane_boundaries
 rqt_image_view /detect/image_signs
@@ -288,12 +319,12 @@ rqt_image_view /detect/image_signs
 
 ## 장애물 상태 확인
 
-역할: 장애물 gate, 경로, 상태와 안전 여유를 확인합니다.
+역할: 장애물 arm, LiDAR 등록 ready, gate, 경로, 상태와 안전 여유를 확인합니다.
 
 ```bash
+rostopic echo -n 1 /mission/arm/obstacle
+rostopic echo -n 1 /mission/ready/obstacle
 rostopic echo /mission/enable/obstacle
-rostopic echo /mission/inside/obstacle
-rostopic echo /mission/clear/obstacle
 rostopic echo /obstacle/state
 rostopic echo /obstacle/planner_status
 rostopic echo -n 1 /obstacle/local_path
@@ -302,15 +333,18 @@ rostopic echo /obstacle/diagnostics
 
 ## 주차 상태 확인
 
-역할: 주차공간 선택, 경로, 진단과 `/cmd_vel` 제어권을 확인합니다.
+역할: 주차 arm, LiDAR 등록 ready, 공간 선택, 경로, 진단과 `/cmd_vel` 제어권을 확인합니다.
 
 ```bash
+rostopic echo -n 1 /mission/arm/parking
+rostopic echo -n 1 /mission/ready/parking
 rostopic echo /mission/enable/parking
-rostopic echo /mission/map_pose
 rostopic echo /odom
 rostopic echo /parking/occupancy_points
 rostopic echo /parking/selected_space
 rostopic echo /parking/state
+rostopic echo -n 1 /parking/planned_path/left
+rostopic echo -n 1 /parking/planned_path/right
 rostopic echo /parking/diagnostics
 rostopic echo /control/lane_path_diagnostics
 rostopic echo /control/max_vel
@@ -321,16 +355,16 @@ rosservice info /control/lane_mission_handoff
 
 ## 지그재그 상태 확인
 
-역할: 지그재그 경로, 도색 여유, 정지거리와 제어권을 확인합니다.
+역할: 지그재그 arm, 카메라 곡선 등록 ready, 경로, 도색 여유와 제어권을 확인합니다.
 
 ```bash
+rostopic echo -n 1 /mission/arm/zigzag
+rostopic echo -n 1 /mission/ready/zigzag
 rostopic echo /mission/enable/zigzag
-rostopic echo /mission/inside/zigzag
-rostopic echo /mission/clear/zigzag
-rostopic echo /mission/map_pose
 rostopic echo /odom
 rostopic echo /zigzag/state
 rostopic echo -n 1 /zigzag/path
+rostopic echo -n 1 /control/lane_path
 rostopic echo /zigzag/diagnostics
 rostopic echo /detect/lane_boundaries
 rostopic echo /control/max_vel
@@ -341,12 +375,13 @@ rosservice info /control/lane_mission_handoff
 
 ## 차단봉 상태 확인
 
-역할: 차단봉 LiDAR 판정, 주행 상태와 제어권을 확인합니다.
+역할: 차단봉 arm, 고정 landmark 등록 ready, LiDAR 판정과 제어권을 확인합니다.
 
 ```bash
+rostopic echo -n 1 /mission/arm/level_crossing
+rostopic echo -n 1 /mission/ready/level_crossing
 rostopic echo /mission/enable/level_crossing
-rostopic echo /mission/inside/level_crossing
-rostopic echo /mission/clear/level_crossing
+rostopic echo /level_crossing/landmark_pose
 rostopic echo /level_crossing/state
 rostopic echo /level_crossing/barrier_down
 rostopic echo /level_crossing/diagnostics
@@ -358,13 +393,12 @@ rosservice info /control/lane_mission_handoff
 
 ## 터널 상태 확인
 
-역할: 터널 costmap, Hybrid A* 경로, 진단과 제어권을 확인합니다.
+역할: 터널 arm, portal 등록 ready, costmap, Hybrid A* 경로와 제어권을 확인합니다.
 
 ```bash
+rostopic echo -n 1 /mission/arm/tunnel
+rostopic echo -n 1 /mission/ready/tunnel
 rostopic echo /mission/enable/tunnel
-rostopic echo /mission/inside/tunnel
-rostopic echo /mission/clear/tunnel
-rostopic echo /mission/map_pose
 rostopic echo /tunnel/state
 rostopic echo -n 1 /tunnel/path
 rostopic echo -n 1 /tunnel/costmap
@@ -424,13 +458,13 @@ rosnode list
 rostopic list
 ```
 
-역할: Gazebo 실제 위치와 EKF 궤적 비교를 켜서 통합 자동주행을 실행합니다.
+역할: 기본 통합 bringup을 실행하고 RViz에서 계획 경로, Gazebo 실제 위치와 EKF 궤적을 실시간 표시합니다.
 
 ```bash
-roslaunch custom_autorace_bringup gazebo.launch publish_trajectories:=true
+roslaunch custom_autorace_bringup gazebo.launch
 ```
 
-역할: 위 선택 진단을 켠 실행에서 RViz 주행 궤적을 초기화합니다.
+역할: 기본 통합 bringup의 RViz 주행 궤적을 초기화합니다.
 
 ```bash
 rosservice call /trajectory/reset

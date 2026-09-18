@@ -156,6 +156,7 @@ class SafeLaneControllerTest(unittest.TestCase):
         controller.cmd_vel_pub = RecordingPublisher()
         controller.manual_stop_pub = RecordingPublisher()
         controller.diagnostics_pub = RecordingPublisher()
+        controller.path_pub = RecordingPublisher()
         return controller
 
     def make_centerline(self, center_values=None):
@@ -351,6 +352,27 @@ class SafeLaneControllerTest(unittest.TestCase):
         self.assertLess(float(np.max(np.abs(rolling.path.curvature))), 1e-6)
         self.assertLessEqual(float(np.max(rolling.path.speed)), 0.28 + 1e-12)
 
+    def test_callback_publishes_the_existing_rolling_path_with_source_stamp(self):
+        controller = self.make_controller()
+        self.append_odom(controller)
+        message = self.make_centerline()
+
+        controller.lane_centerline_callback(message)
+
+        self.assertEqual(len(controller.path_pub.messages), 1)
+        published = controller.path_pub.messages[0]
+        self.assertEqual(published.header.frame_id, "odom")
+        self.assertEqual(published.header.stamp, message.header.stamp)
+        self.assertEqual(len(published.poses), len(controller.rolling_path.x))
+        self.assertAlmostEqual(
+            published.poses[-1].pose.position.x,
+            controller.rolling_path.x[-1],
+        )
+        self.assertAlmostEqual(
+            published.poses[-1].pose.position.y,
+            controller.rolling_path.y[-1],
+        )
+
     def test_straight_two_boundary_candidates_fuse_at_lane_center(self):
         controller = self.make_controller()
         message = self.make_boundary_centerline(
@@ -501,10 +523,15 @@ class SafeLaneControllerTest(unittest.TestCase):
             horizon=1.0,
             observed_start_station=0.0,
         )
+        selection = controller_module.RollingLanePathSelection(
+            observation=rolling,
+            executable=rolling,
+            rejection_reason="",
+        )
         with mock.patch.object(
             controller_module,
-            "build_rolling_lane_path",
-            return_value=rolling,
+            "build_rolling_lane_path_selection",
+            return_value=selection,
         ), mock.patch.object(
             controller.path_validator,
             "motion_safety",
@@ -518,6 +545,197 @@ class SafeLaneControllerTest(unittest.TestCase):
         self.assertEqual(len(controller.diagnostics_pub.messages), 1)
         diagnostics = list(controller.diagnostics_pub.messages[0].data)
         self.assertLessEqual(diagnostics[8], 0.0)
+
+    def test_nonexecutable_camera_path_is_published_only_for_alignment(self):
+        controller = self.make_controller()
+        self.append_odom(controller)
+        path = path_from_xy(
+            [[0.0, 0.0], [0.2, 0.05], [0.35, 0.20]],
+            "odom",
+            target_speed=0.03,
+            label="camera_lane",
+        )
+        observation = controller_module.RollingLanePath(
+            path=path,
+            valid_samples=5,
+            mean_confidence=1.0,
+            horizon=0.35,
+            observed_start_station=0.0,
+        )
+        selection = controller_module.RollingLanePathSelection(
+            observation=observation,
+            executable=None,
+            rejection_reason=(
+                "lane path physical curvature requires sub-controllable speed"
+            ),
+        )
+
+        with mock.patch.object(
+            controller_module,
+            "build_rolling_lane_path_selection",
+            return_value=selection,
+        ):
+            controller.lane_centerline_callback(self.make_centerline())
+
+        self.assertEqual(len(controller.path_pub.messages), 1)
+        self.assertEqual(
+            len(controller.path_pub.messages[0].poses), path.size
+        )
+        self.assertIsNone(controller.rolling_path)
+        self.assertIsNone(controller.last_valid_lane_time)
+        self.assertEqual(controller.cmd_vel_pub.messages, [])
+        self.assertEqual(controller.diagnostics_pub.messages, [])
+
+    def test_run14_subcontrollable_frame_remains_a_geometry_observation(self):
+        controller = self.make_controller()
+        # Exact first sustained zigzag rejection from official-start run14 at
+        # camera stamp 269.455. The single yellow boundary is geometrically
+        # coherent, but its complete C1 ego connector needs 0.03919 m/s, below
+        # the independently configured 0.040 m/s controllable crawl speed.
+        message = SimpleNamespace(
+            image_width=1000,
+            image_height=600,
+            sample_rows=[552.0, 480.0, 400.0, 320.0],
+            center_x=[
+                615.260009765625,
+                812.7999877929688,
+                1055.5,
+                1284.5,
+            ],
+            yellow_x=[
+                295.260009765625,
+                492.79998779296875,
+                735.5,
+                964.5,
+            ],
+            white_x=[math.nan] * 4,
+            confidence=[
+                0.2719711661338806,
+                0.2775000035762787,
+                0.20569230616092682,
+                0.28459614515304565,
+            ],
+            yellow_valid=[True] * 4,
+            white_valid=[False] * 4,
+        )
+
+        selection = controller_module.build_rolling_lane_path_selection(
+            message,
+            controller_module.Pose2D(0.0, 0.0, 0.0),
+            "odom",
+            controller.path_calibration,
+            controller.speed_profile,
+        )
+
+        self.assertIsNone(selection.executable)
+        self.assertIn("physical curvature", selection.rejection_reason)
+        observation = selection.observation
+        self.assertEqual(observation.valid_samples, 4)
+        self.assertEqual(observation.path.frame_id, "odom")
+        self.assertEqual(observation.path.size, 28)
+        self.assertAlmostEqual(observation.path.length, 0.4129535183, places=8)
+        self.assertAlmostEqual(
+            float(np.min(observation.path.speed)), 0.0391944938, places=8
+        )
+        self.assertAlmostEqual(
+            float(np.max(np.abs(observation.path.curvature))),
+            38.9722944696,
+            places=7,
+        )
+        with self.assertRaisesRegex(ValueError, "physical curvature"):
+            controller_module.build_rolling_lane_path(
+                message,
+                controller_module.Pose2D(0.0, 0.0, 0.0),
+                "odom",
+                controller.path_calibration,
+                controller.speed_profile,
+            )
+
+    def test_nonexecutable_observation_preserves_active_path_until_watchdog(self):
+        controller = self.make_controller()
+        self.append_odom(controller, speed=0.10, angular=0.05)
+        controller.lane_centerline_callback(self.make_centerline())
+
+        active_path = controller.rolling_path
+        active_follower_path = controller.path_follower.path
+        active_valid_time = controller.last_valid_lane_time
+        active_command_time = controller.last_command_time
+        active_path_index = controller.path_follower.path_index
+        active_path_station = controller.path_follower.path_station
+        active_last_linear = controller.path_follower.last_linear
+        active_last_angular = controller.path_follower.last_angular
+        active_diagnostics = np.asarray(
+            controller.path_follower.diagnostics.as_array(), dtype=np.float64
+        )
+        command_count = len(controller.cmd_vel_pub.messages)
+
+        self.advance(0.10)
+        self.append_odom(
+            controller,
+            speed=active_last_linear,
+            angular=active_last_angular,
+        )
+        observed_path = path_from_xy(
+            [[0.0, 0.0], [0.2, 0.05], [0.35, 0.20]],
+            "odom",
+            target_speed=0.03,
+            label="camera_lane",
+        )
+        selection = controller_module.RollingLanePathSelection(
+            observation=controller_module.RollingLanePath(
+                path=observed_path,
+                valid_samples=5,
+                mean_confidence=1.0,
+                horizon=0.35,
+                observed_start_station=0.0,
+            ),
+            executable=None,
+            rejection_reason=(
+                "lane path physical curvature requires sub-controllable speed"
+            ),
+        )
+
+        with mock.patch.object(
+            controller_module,
+            "build_rolling_lane_path_selection",
+            return_value=selection,
+        ), mock.patch.object(
+            controller.path_follower,
+            "reset",
+            wraps=controller.path_follower.reset,
+        ) as reset, mock.patch.object(
+            controller.path_validator,
+            "motion_safety",
+            wraps=controller.path_validator.motion_safety,
+        ) as motion_safety:
+            controller.lane_centerline_callback(self.make_centerline())
+
+        reset.assert_not_called()
+        motion_safety.assert_not_called()
+        self.assertEqual(len(controller.path_pub.messages), 2)
+        self.assertIs(controller.rolling_path, active_path)
+        self.assertIs(controller.path_follower.path, active_follower_path)
+        self.assertIs(active_path, active_follower_path)
+        self.assertEqual(controller.last_valid_lane_time, active_valid_time)
+        self.assertEqual(controller.last_command_time, active_command_time)
+        self.assertEqual(controller.path_follower.path_index, active_path_index)
+        self.assertEqual(controller.path_follower.path_station, active_path_station)
+        self.assertEqual(controller.path_follower.last_linear, active_last_linear)
+        self.assertEqual(controller.path_follower.last_angular, active_last_angular)
+        np.testing.assert_allclose(
+            controller.path_follower.diagnostics.as_array(),
+            active_diagnostics,
+            equal_nan=True,
+        )
+        self.assertEqual(len(controller.cmd_vel_pub.messages), command_count)
+
+        self.advance(controller.lane_timeout + 0.01)
+        controller.watchdog_callback(None)
+
+        self.assertEqual(len(controller.cmd_vel_pub.messages), command_count + 1)
+        stopped = controller.cmd_vel_pub.messages[-1]
+        self.assertEqual(stopped.linear.x, 0.0)
+        self.assertEqual(stopped.angular.z, 0.0)
 
     def test_curved_single_boundary_produces_curved_center_path(self):
         controller = self.make_controller()
@@ -1150,13 +1368,16 @@ class SafeLaneControllerTest(unittest.TestCase):
             white_valid=[False, False, False, True, True, True, True],
         )
 
-        rolling = controller_module.build_rolling_lane_path(
+        selection = controller_module.build_rolling_lane_path_selection(
             message,
             controller_module.Pose2D(0.0, 0.0, 0.0),
             "odom",
             controller.path_calibration,
             controller.speed_profile,
         )
+        self.assertIs(selection.observation, selection.executable)
+        self.assertEqual(selection.rejection_reason, "")
+        rolling = selection.executable
 
         physical_limit = min(
             controller.speed_profile.maximum_angular_velocity
@@ -1276,6 +1497,16 @@ class SafeLaneControllerTest(unittest.TestCase):
         yellow_removed = SimpleNamespace(
             **dict(vars(message), yellow_valid=[False] * 8)
         )
+        selection = controller_module.build_rolling_lane_path_selection(
+            yellow_removed,
+            controller_module.Pose2D(0.0, 0.0, 0.0),
+            "odom",
+            controller.path_calibration,
+            controller.speed_profile,
+        )
+        self.assertIsNone(selection.executable)
+        self.assertIsNotNone(selection.observation)
+        self.assertIn("physical curvature", selection.rejection_reason)
         with self.assertRaisesRegex(ValueError, "physical curvature"):
             controller_module.build_rolling_lane_path(
                 yellow_removed,

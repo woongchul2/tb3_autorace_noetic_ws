@@ -1,15 +1,158 @@
 # Gazebo 검증 이력
 
-이 문서는 현재 운용 설명에서 분리한 과거 A/B와 중간 회귀 기록입니다. 아래 결과는 각
-당시 코드와 설정에만 해당하며 현재 구현의 완료 근거로 사용하지 않습니다. 현재 기준은
-상위 [`README.md`](../README.md)와 [`PATH_FOLLOWING.md`](../PATH_FOLLOWING.md)의
-`run23` 결과입니다.
+이 문서는 현재 운용 설명에서 분리한 검증 기록입니다. 맨 위에는 2026-09-18
+mission-local adaptive registration의 현재 검증 범위를 기록하고, 그 아래
+2026-09-17 및 이전 결과는 각 당시 코드와 설정에만 해당하는 과거 기준선으로
+보존합니다. 결승선까지의 완료 판정은 상위 [`README.md`](../README.md)에 구분해
+기록합니다.
 
 원시 bag과 임시 분석 결과는 저장소에 포함하지 않습니다. 숫자는 당시 기록 문서에서
 옮긴 자체 완결 요약이며, 서로 다른 방향·주차 분기나 다른 시작 조건의 시간은 엄밀한
 A/B로 비교하지 않습니다.
 
-## 현재 기준 이전의 공통화 기록
+## 2026-09-18 Mission-local adaptive registration
+
+현재 코드는 순차 AMCL polygon gate를 `arm → sensor-relative registration → ready →
+enable` 계약으로 교체했습니다. Intersection은 source stamp의 AMCL 방향과 방향
+표지 높이·베어링, Obstacle은 서로 독립인 LiDAR 장벽 면, Parking은 고정 표지의 비평행 면,
+Zigzag는 rolling 카메라 곡선으로 각각 mission-local 경로를 odom에 고정합니다.
+Level Crossing은 고정 landmark 통과 평면, Tunnel은 직교하는 입구·종방향 벽과 끝점을
+같은 ordered readiness에 사용합니다. 선택적 AMCL polygon은 진단일 뿐 활성화 조건이
+아닙니다.
+
+ROS Noetic 컨테이너의 `CMakeLists.txt`에 등록된 Python test 29개 파일을 최종
+aggregate 대상으로 사용했습니다. 아래 범위를 모두 포함하며 시험 파일을 제외하지
+않았습니다.
+
+| 검증 범위 | 결과 |
+|---|---|
+| 공통 local SE(2), 퇴화·outlier·시간 연속성, rolling 곡선 station | 포함 |
+| 공통 경로 투영, 전진·후진 추종, 곡률 속도 제한, 비대칭 직사각형 sweep | 포함 |
+| 6개 미션 arm/ready/enable 세대·source stamp와 launch/config 배선 | 포함 |
+| Intersection 양방향, Obstacle 장벽 등록, Parking 좌·우·후진, Zigzag 곡선 등록 | 포함 |
+| Level Crossing 통과 평면과 Tunnel portal 등록·costmap·Hybrid A* | 포함 |
+| 최종 aggregate·build·diff | bringup `669/669`, description `7/7`, 합계 `676/676 PASS`; fail 0, error 0; 두 패키지 build와 `git diff --check` PASS |
+
+### 공식 시작점 통합 `run20`
+
+새 Gazebo와 공식 통합 launch를 시작하고 공식 자세 `(0.800, -1.747, 0°)`에서 카메라
+신호로 출발했습니다. 순간이동, 수동 gate, 미션 비활성화와 사람 개입 없이
+Intersection LEFT, Parking LEFT, Tunnel layout B를 선택해 모든 미션과 결승선을
+통과했습니다.
+
+| 구간 | ACTIVE→COMPLETE |
+|---|---:|
+| Intersection | `25.972 s` |
+| Obstacle | `35.125 s` |
+| Parking | `57.886 s` |
+| Zigzag | `16.222 s` |
+| Level Crossing | `14.386 s` |
+| Tunnel | `75.283 s` |
+| 출발→결승 footprint | `283.053 s` |
+
+결승 base pose는 `(1.033509, -1.745858, 0.03248°)`였고 비대칭 footprint 전체가
+허용 y 구간 `[-1.86, -1.64] m` 안에 있었습니다. 6개 미션은 모두 `COMPLETE`,
+`FAILED`와 manual stop은 0건이었습니다. Parking 후진은 `6.303 s`, 음수 명령 127개,
+최저 `-0.103447 m/s`였습니다. `/cmd_vel` 발행자는 기대한 순서로만 바뀌었고 발행자
+교차는 없었으며 14개 인계 공백은 `3.582–121.699 ms`였습니다. 공통 경로 오차와
+최소 여유는 [`PATH_FOLLOWING.md`](../PATH_FOLLOWING.md)에 기록합니다.
+
+bag 분석은 `19/22`였습니다. 실패한 세 항목은 recorder를 `/use_sim_time=true`보다
+먼저 시작해 생긴 첫 pose `2.411 s` 지연과 record-time callback burst,
+`/detect/lane_centerline` 녹화 누락입니다. 연속 pose의 실제 최대 이동은 `0.283 mm`,
+최대 yaw 변화는 `0.054°`여서 순간이동 증거는 없었습니다. 물리 contact/bumper 토픽은
+기록하지 않았으므로 충돌 자체를 독립 판정하지 않고 mission 상태와 clearance를
+근거로 사용했습니다.
+
+### Tunnel 등록 보정과 반복 주행
+
+앞선 `run19`의 Tunnel 실패는 동적 원통이 아니라 등록 landmark midpoint를 입구 plane에
+직접 맞추면서 생긴 약 `65 mm` 종방향 편향이 출구 고정벽을 장애물로 오투영한 것이
+원인이었습니다. 검출 landmark용 `registration.reference_pose`와 실제 clearance용
+`entry_portal_plane_y`를 분리했습니다. `run19` bag 재투영에서 출구 ghost는 사라지고
+실제 원통 3개는 유지됐으며, `2.498 m` 전체 경로의 비대칭 footprint sweep가
+통과했습니다.
+
+최종 코드의 `run20` Tunnel은 계획 2회·재계획 1회로 layout B를 완료했습니다. 별도
+공식 시작 반복 `run21`도 Intersection RIGHT, Parking RIGHT, Tunnel layout C에서 6개
+미션을 모두 완료했고 Tunnel은 계획 2회·재계획 1회, `69.660 s`였습니다. Tunnel 완료
+`3.539 s` 뒤 결승 footprint를 통과했습니다. 미션별 ACTIVE→COMPLETE는
+`24.955 / 34.657 / 56.321 / 16.184 / 14.756 / 69.660 s`였습니다. `run21` bag은
+출발 뒤 녹화를 시작했으므로 공식 시작 시간 비교 자료로 사용하지 않습니다.
+
+`run21`의 `/detect/lane_centerline` 전체 발행은 header stamp 기준 8,278건/281.537초,
+`29.399 Hz`였고 interval median/p95/max는 `33/35/70 ms`였습니다. 정상 크기의 배열에서
+하나 이상의 실제 경계가 유효한 메시지는 7,712건, `27.389 Hz`였고 명시적 empty 관측은
+566건이었습니다. header와 bag receipt time 모두 중복·역행 stamp는 0건이었습니다.
+이 bag은 정상 종료 index가 없는 `.bag.active`의 마지막 완전 chunk까지만 임시 복사본을
+색인해 분석했으며 원본은 수정하지 않았습니다.
+
+Gazebo 공식 시작점 통합 검증은 완료했지만 실제 D405·Mid-360·OpenCR 검증은 남아
+있습니다. 현재 `hardware.launch`는 센서와 인지만 시작하며 실물 통합 미션 launch와
+`/level_crossing/landmark_pose` 고정 landmark producer는 아직 없습니다. 따라서
+실물 주행 완료로 판정하지 않습니다.
+
+## 2026-09-17 Level Crossing 거리 기반 정지·재확인
+
+차단봉 군집을 `0.60 m`부터 3회 연속 확인해 접근 상태로 전환하고, 측정 거리가
+`0.45 m` 이하일 때만 제어권을 받아 정지하도록 검출 거리와 정지 거리를 분리했습니다.
+정지 명령 뒤에는 새 odometry 2개로 실제 선속도 `0.03 m/s`, 각속도 `0.10 rad/s`
+이하를 확인하고, 그 정지 자세에서 내려온 차단봉을 다시 확인해야 합니다. 이후 정상
+LiDAR scan에서 차단봉 없음이 5회 연속 확인된 경우에만 차선 제어권을 돌려줍니다.
+정지 뒤 움직임이나 odometry 단절은 이 확인을 초기화합니다.
+
+새 Gazebo·ROS에서 `x=-1.60 m` 차단봉 단독 회귀를 당시 최종 코드로 3회 반복했습니다.
+
+| 회차 | 최초 닫힘 확인 | 정지 명령 거리 | 최종 정지 자세 재확인 | 결과 |
+|---:|---:|---:|---:|---|
+| 1 | `0.544 m` | `0.432 m` | `0.423 m` | `PASSING→COMPLETE` |
+| 2 | `0.532 m` | `0.438 m` | `0.428 m` | `PASSING→COMPLETE` |
+| 3 | `0.532 m` | `0.425 m` | `0.408 m` | `PASSING→COMPLETE` |
+
+2·3회차에는 정지 직후 잔류 움직임으로 첫 확인이 취소됐고, 실제로 다시 정지한 뒤
+차단봉을 재관측해 통과했습니다. 세 회 모두 차단봉 상승 전에는 0 속도를 유지했고,
+상승 뒤 차선 제어권 복귀와 zone 이탈 완료까지 사람의 개입이 없었습니다.
+
+같은 당시 코드의 공식 시작 자세 통합 주행에서는 카메라 `RIGHT`, Parking `LEFT`로
+Intersection, Obstacle, Parking, Zigzag, Level Crossing, Tunnel을 순서대로 모두
+완료했습니다. Level Crossing은 `0.489 m`에서 최초 확인, `0.439 m`에서 정지 명령,
+실제 정지 자세 `0.423 m`에서 재확인했고 `PASSING→COMPLETE` 뒤 차선 제어권을
+반환했습니다. 순간이동, 수동 gate, 미션 비활성화와 사람 개입은 사용하지 않았습니다.
+
+bringup 자동 회귀 `520 tests`는 오류·실패·건너뜀 0으로 통과했습니다. 이 결과는
+Gazebo의 2D LiDAR proxy 기준이며 실제 Mid-360 반복시험을 대신하지 않습니다. 당시에는
+LiDAR 단독 판정을 유지하고, 실물 정지 자세의 point cloud에서 반복 누락이나 오검출이
+확인될 때 카메라 교차 확인을 추가합니다.
+
+## 2026-09-17 Intersection 단일 polygon 통합
+
+별도 `intersection_direction_observation` region과 토픽을 제거하고, Intersection
+mission polygon의 동쪽 경계를 `x=1.65→1.72 m`로 확장했습니다. 이제 하나의 순차
+AMCL gate 안에서만 표지판을 판독하며, 실제 `/cmd_vel` 인수는 기존의 별도 측량
+진입면에서 결정합니다. 탈출은 polygon이 아니라 선택한 반원 끝에 대한 AMCL map-pose
+투영으로 계속 판단합니다.
+
+새 Gazebo·ROS의 기본 통합 launch, 공식 시작 자세, `forced_direction=0`, GUI·RViz를
+사용해 카메라 LEFT와 RIGHT를 각각 1회 검증했습니다. 순간이동, 수동 gate, 강제 방향,
+사람 개입은 사용하지 않았습니다.
+
+| 실제 카메라 방향 | gate 개방 | 방향 확정 | 방향 확정 지연 | `COMPLETE` | 완료 뒤 일반 차선 첫 명령 |
+|---|---:|---:|---:|---:|---:|
+| LEFT | `15.509 s` | `16.988 s` | `1.479 s` | `51.722 s` | `0.002 s` |
+| RIGHT | `13.877 s` | `14.475 s` | `0.598 s` | `46.619 s` | `0.026 s` |
+
+두 주행 모두
+`WAIT_INTERSECTION → SEARCH_DIRECTION → WAIT_ENTRY_HANDOFF → PREPARE_ENTRY_PATH →
+FOLLOW_ENTRY_PATH → FOLLOW_ARC_LANE → PREPARE_EXIT_PATH → FOLLOW_EXIT_PATH →
+VERIFY_FINAL_LANE → COMPLETE` 순서를 지켰습니다. 움직이는 `/cmd_vel` 발행자도
+`lane → intersection → lane → intersection → lane` 순서였고, `FAILED`, 완료 후
+Intersection 제어기의 잔여 주행 명령, 제거한 보조 관찰 토픽은 없었습니다. 공통 경로
+최대 위치 오차는 LEFT `6.803 mm`, RIGHT `6.591 mm`였습니다. 자동 회귀는 bringup
+`507 tests`, 오류·실패·건너뜀 0으로 통과했습니다. 이 단독 검증 직후에는 전체 코스를
+다시 주행하지 않았고, 이후 위 Level Crossing 절의 공식 통합에서 전체 미션 순서를
+재검증했습니다.
+
+## Adaptive registration 이전의 공통화 기록
 
 | 검증 | 도달 상태 | 당시 판정 |
 |---|---|---|
@@ -44,7 +187,7 @@ route sweep과 stopping sweep을 구분할 수는 없습니다.
 
 ### Rolling CommonPath 속도 단계
 
-현재 C1 카메라 경로 생성기를 고정하고 새 Gazebo에서 측정했던 결과입니다. 침범과 여유는
+당시 C1 카메라 경로 생성기를 고정하고 새 Gazebo에서 측정했던 결과입니다. 침범과 여유는
 허용 주행면 기준 signed 값입니다.
 
 | 조향 목표/직선 속도 | gate 시간 | 최대 안쪽 침범 | 최소 바깥 여유 | 경로 오차 p95 | 판정 |
@@ -65,8 +208,8 @@ adaptive `0.20→0.26 m/s`는 `12.522→11.475 s`, `1.047 s(8.4%)` 단축됐습�
 `0.1599 m/s²`까지 올라 미채택했습니다. 최대 lookahead `0.18 m` 후보도
 `12.218 s`로 느려 미채택했습니다.
 
-경로 접합 방식까지 달랐던 더 오래된 close-target 기록은 `10.836 s`였으므로 현재
-adaptive 구현이 모든 과거 구현보다 빠르다고 해석하지 않습니다.
+경로 접합 방식까지 달랐던 더 오래된 close-target 기록은 `10.836 s`였으므로 해당
+adaptive 구현이 그보다 오래된 모든 구현보다 빠르다고 해석하지 않습니다.
 
 ### 2026-09-07 이전 카메라 PD 비교
 
@@ -82,7 +225,7 @@ rolling `CommonPath` 전환 전 카메라 PD와 고정 측량 경로를 매번 �
 
 당시 측량 경로 중앙값은 `0.20 m/s` PD보다 `17.6%`, 같은 최고속도 PD보다 `14.2%`
 짧았습니다. PD의 속도만 `0.20→0.22 m/s`로 높인 효과는 `3.9%`였습니다. 이 결과는
-현재 rolling 경로 성능과 직접 비교하지 않습니다.
+후속 rolling 경로 성능과 직접 비교하지 않습니다.
 
 ## Intersection 변경 이력
 
@@ -149,7 +292,7 @@ zero 명령, timeout, `FAILED`는 없었습니다. 이 단계 역시 결승선�
 이전 `POSITION_FOR_PARKING` 구현은 좌·우 전용 주차 회귀에서 `94.600/96.004 s`에
 완료했습니다. `PARKED→BACK_OUT` 간격은 각 `0.001 s`였고 실패나 충돌은 없었습니다.
 출구 tangent를 완만하게 하자 `LEAVE_AISLE`이 `21.747/21.752 s`로 직전
-`30.501/32.563 s`보다 `8.754/10.811 s` 짧아졌습니다. 현재 구현은 이 상태를
+`30.501/32.563 s`보다 `8.754/10.811 s` 짧아졌습니다. 그 뒤 구현은 이 상태를
 사용하지 않습니다.
 
 ### 원호 기반 구현과 속도 조정
@@ -193,6 +336,28 @@ LEFT의 해당 구간은 기존 `35.419 s`보다 `12.242 s(34.6%)` 짧아졌습�
 Tunnel 뒤 전체 미션 완료까지 도달했지만 당시 기록은 별도 contact sensor 없이 상태와
 rosout으로만 충돌을 확인했습니다.
 
+### 진입과 출구 좌회전 형상 공통화
+
+주차 진입과 Parking→Zigzag 좌회전은 `offset=0.195 m`, `tangent=0.078 m`, 101개
+표본의 같은 zero-end-curvature quarter-turn 생성기를 사용합니다. 출구 곡선 시작은
+`x=0.493 m`, 곡선 끝은 `x=0.298 m`, 정렬 tail 끝은 `x=0.226 m`입니다. 두 곡선을
+각자의 시작 좌표계로 옮긴 회귀에서 최대 차이는 `1.1e-15`였습니다.
+
+새 Gazebo를 각각 시작하고 공식 시작 자세에서 카메라 교차로, 장애물, Parking,
+Zigzag를 순서대로 수행한 결과입니다. 장애물 `x=0.23/0.73 m`로 빈 공간 LEFT와
+RIGHT를 각각 만들었고 두 실행 모두 Parking과 Zigzag가 `COMPLETE`였습니다.
+
+| 빈 공간 | Parking | `LEAVE_AISLE→COMPLETE` | 공통 출구 좌회전 | Zigzag | 출구 좌회전 line/obstacle 여유 |
+|---|---:|---:|---:|---:|---:|
+| LEFT | `56.214 s` | `15.302 s` | `5.778 s` | `16.511 s` | `18.2/15.7 mm` |
+| RIGHT | `54.565 s` | `15.252 s` | `5.786 s` | `16.620 s` | `18.2/3.2 mm` |
+
+첫 LEFT 실행은 완료 구간의 카메라 선행조향이 `5.80→6.25°`가 되면서 이전 6° 확인
+조건을 벗어나 원인을 드러냈습니다. Zigzag의 독립 진입 한도와 같은 7°로 맞춘 뒤
+위 양쪽 공식 주행을 새로 수행했습니다. 실행 중 `FAILED`, `ERROR`, 충돌 관련 rosout은
+없었습니다. 이 기록은 Zigzag 종료 뒤 차선 복귀까지의 완료 근거이며 결승선까지의
+전체 완료 근거는 아닙니다.
+
 ## Level Crossing 변경 이력
 
 Gazebo 차단봉의 최대 검출 거리를 `0.60→0.45 m`로 줄여 world의 개방 timer가 시작되는
@@ -203,7 +368,7 @@ Gazebo 차단봉의 최대 검출 거리를 `0.60→0.45 m`로 줄여 world의 �
 
 직전 자세 보조 회귀 2회도 완료했지만, `y=1.17 m, yaw=+10°`와
 `y=1.33 m, yaw=-10°`의 강제 사선 시작에서는 ROI에 군집 폭이나 두께가 잘리며 실제
-개방 전 `PASSING`이 재현됐습니다. 정상 공식 접근에서는 재현되지 않았으며 현재 주
+개방 전 `PASSING`이 재현됐습니다. 정상 공식 접근에서는 재현되지 않았으며 당시 주
 경로의 LiDAR 단독 판정은 유지했습니다.
 
 ## Tunnel 변경 이력
@@ -213,8 +378,8 @@ rolling lane path 진단으로 인계를 확인하도록 바꾼 `run15`는 Tunne
 2회와 재계획 1회로 완료하고 결승선을 통과했습니다. 같은 조건의 이전 네 미션 시간과
 차이는 모두 `0.5 s` 이내였고, Parking 회전 직후 non-finite 진단은 `2→0`개가 됐습니다.
 
-현재 기준 `run23` Tunnel은 `73.117 s`였고 완료 시 일반 차선 제어기가 `/cmd_vel`을
-소유했습니다. 이 최신 결과의 전체 판정은 상위 현재 문서에만 기록합니다.
+당시 전체 코스 기준 `run23` Tunnel은 `73.117 s`였고 완료 시 일반 차선 제어기가
+`/cmd_vel`을 소유했습니다. 이 결과의 전체 판정은 상위 README에 기록했습니다.
 
 ## 해석 원칙
 

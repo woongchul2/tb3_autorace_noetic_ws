@@ -3,21 +3,42 @@
 level_crossing:
   topics:
     scan: /scan_mid360_raw
+    odometry: /odometry/filtered
+    arm: /mission/arm/level_crossing
+    ready: /mission/ready/level_crossing
     zone_gate: /mission/enable/level_crossing
-    zone_clearance: /mission/clear/level_crossing
+    landmark_pose: /level_crossing/landmark_pose
     manual_stop: /control/manual_stop
     cmd_vel: /cmd_vel
     lane_control_service: /control/lane_mission_handoff
     lane_stop_service: /control/lane_following
 
+  registration:
+    base_frame: base_footprint
+    scan_frame: base_scan
+    # base_footprint -> base_scan from the measured AutoRace robot model.
+    scan_sensor_pose: [-0.033073, 0.0, 0.0]
+    # The current Gazebo course contains only the moving bar; it has no fixed
+    # crossing posts or marker geometry. Hardware must keep this false and
+    # publish a source-stamped fixed-landmark PoseStamped instead.
+    allow_barrier_anchor_fallback: true
+    confirmation_samples: 3
+    maximum_sample_gap: 0.25
+    maximum_position_delta: 0.05
+    maximum_heading_delta_deg: 6.0
+    minimum_forward_distance: 0.05
+    maximum_forward_distance: 1.20
+    maximum_pose_stamp_skew: 0.06
+    maximum_future_stamp: 0.06
+
   detection:
     # base_scan coordinates: +x forward and +y left. A closed barrier spans
     # most of the lane; the 0.12 m stop sign is intentionally too narrow.
     minimum_forward_distance: 0.10
-    # Delay the LiDAR stop until the official Gazebo approach carries the robot
-    # inside the simulator's x > -1.45 barrier-open timer zone. Scan noise and
-    # heading make this a calibrated operating value, not a position guarantee.
-    maximum_forward_distance: 0.45
+    # Confirm the lowered bar early, then keep approaching to the independent
+    # stop trigger. This separates object recognition from stopping distance.
+    maximum_forward_distance: 0.60
+    stop_forward_distance: 0.45
     corridor_half_width: 0.24
     maximum_adjacent_beam_gap: 2
     maximum_point_gap: 0.08
@@ -28,13 +49,35 @@ level_crossing:
 
   confirmation:
     closed_scans: 3
+    # Do not stop early for one isolated cluster dropout after confirmation.
+    approach_lost_scans: 3
+    # After the zero command, require two new stopped odometry samples and one
+    # new closed-bar scan before clear scans may mean that the bar opened.
+    stopped_odom_samples: 2
+    stopped_linear_velocity: 0.03
+    stopped_angular_velocity: 0.10
+    post_stop_closed_scans: 1
     open_scans: 5
+    # A fixed landmark can register the crossing even when the bar is already
+    # raised. Confirm clear scans while its local plane is still ahead, then
+    # continue under lane control without a stop/handoff cycle.
+    open_at_arrival_scans: 5
     maximum_scan_gap: 0.25
+
+  completion:
+    # Complete only after the rear-most point of the real asymmetric rectangle
+    # passes the locally latched crossing plane plus this margin.
+    footprint_front: 0.067645
+    footprint_rear: 0.118073
+    footprint_half_width: 0.0903
+    footprint_padding: 0.010
+    clearance_margin: 0.15
 
   control:
     period: 0.05
 
   timeouts:
     scan: 0.40
+    odometry: 0.40
     handoff: 0.30
     lane_stop: 0.30

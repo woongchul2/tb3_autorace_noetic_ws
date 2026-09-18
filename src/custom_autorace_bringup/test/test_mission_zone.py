@@ -55,7 +55,7 @@ class PolygonTest(unittest.TestCase):
         self.assertFalse(is_inside_with_margin(-0.01, 0.0))
         self.assertTrue(is_inside_with_margin(0.0, -1.0))
 
-    def test_zigzag_gate_contains_both_recorded_parking_handoffs(self):
+    def test_zigzag_diagnostic_polygon_contains_recorded_handoffs(self):
         config_path = (
             Path(__file__).resolve().parents[1]
             / "config"
@@ -71,7 +71,7 @@ class PolygonTest(unittest.TestCase):
             distance = signed_polygon_distance(pose, polygon)
             self.assertTrue(is_inside_with_margin(distance, margin))
 
-    def test_intersection_gate_and_upstream_direction_window_are_separate(self):
+    def test_intersection_diagnostic_polygon_keeps_measured_boundary(self):
         config_path = (
             Path(__file__).resolve().parents[1]
             / "config"
@@ -82,27 +82,19 @@ class PolygonTest(unittest.TestCase):
         mission = config["missions"]["intersection"]
         polygon = mission["polygon"]
         margin = config["zone"]["enter_margin"]
-        observation = config["regions"]["intersection_direction_observation"]
-        observation_polygon = observation["polygon"]
-        observation_margin = observation["inside_margin"]
+        self.assertEqual(config.get("regions", {}), {})
+        self.assertAlmostEqual(max(point[0] for point in polygon), 1.72)
 
-        # While travelling west, the independent direction window opens first.
-        # The mission gate and the controller's map-entry plane remain later.
+        # Polygon depth remains available for map diagnostics, but it no
+        # longer opens the mission enable gate.
+        self.assertFalse(
+            is_inside_with_margin(
+                signed_polygon_distance((1.70, -0.72), polygon), margin
+            )
+        )
         self.assertTrue(
             is_inside_with_margin(
-                signed_polygon_distance((1.68, -0.72), observation_polygon),
-                observation_margin,
-            )
-        )
-        self.assertFalse(
-            is_inside_with_margin(
                 signed_polygon_distance((1.68, -0.72), polygon), margin
-            )
-        )
-        self.assertFalse(
-            is_inside_with_margin(
-                signed_polygon_distance((1.70, -0.72), observation_polygon),
-                observation_margin,
             )
         )
         self.assertTrue(
@@ -110,9 +102,8 @@ class PolygonTest(unittest.TestCase):
                 signed_polygon_distance((1.60, -0.72), polygon), margin
             )
         )
-        self.assertNotEqual(mission["inside_topic"], observation["inside_topic"])
 
-    def test_obstacle_gate_delays_speed_cap_until_recorded_turn_approach(self):
+    def test_obstacle_diagnostic_polygon_covers_recorded_turn_approach(self):
         config_path = (
             Path(__file__).resolve().parents[1]
             / "config"
@@ -123,22 +114,20 @@ class PolygonTest(unittest.TestCase):
         polygon = config["missions"]["obstacle"]["polygon"]
         margin = config["zone"]["enter_margin"]
 
-        # The previous west edge enabled the 0.09 m/s acquisition cap around
-        # this straight pose.  Keep normal lane speed here.
+        # The diagnostic boundary excludes the upstream straight pose.
         self.assertFalse(
             is_inside_with_margin(
                 signed_polygon_distance((1.20, 0.246), polygon), margin
             )
         )
-        # The official-start bag first turned near x=1.36.  Arm about 50 mm
-        # beforehand so the existing lane controller decelerates for the bend.
+        # The official-start bag first turned near x=1.36.
         self.assertTrue(
             is_inside_with_margin(
                 signed_polygon_distance((1.32, 0.247), polygon), margin
             )
         )
 
-    def test_level_crossing_gate_covers_bar_trigger_not_static_stop_sign(self):
+    def test_level_crossing_diagnostic_polygon_covers_bar_not_stop_sign(self):
         config_path = (
             Path(__file__).resolve().parents[1]
             / "config"
@@ -158,10 +147,10 @@ class PolygonTest(unittest.TestCase):
                 signed_polygon_distance((-1.40, 1.25), polygon), margin
             )
         )
-        # Its permanent warning sign must not open the physical-zone gate.
+        # Its permanent warning sign lies outside this diagnostic polygon.
         self.assertFalse(point_in_polygon((-1.35, 1.04), polygon))
 
-    def test_tunnel_gate_is_only_at_the_surveyed_north_west_portal(self):
+    def test_tunnel_diagnostic_polygon_is_at_north_west_portal(self):
         config_path = (
             Path(__file__).resolve().parents[1]
             / "config"
@@ -182,6 +171,21 @@ class PolygonTest(unittest.TestCase):
             )
         )
 
+    def test_polygon_activation_is_explicitly_diagnostic_only(self):
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "mission_zones_gazebo.yaml"
+        )
+        with config_path.open(encoding="utf-8") as stream:
+            config = yaml.safe_load(stream)
+        self.assertEqual(config["activation"]["mode"], "ready")
+        self.assertTrue(config["diagnostics"]["polygons_enabled"])
+        for name in config["sequence"]:
+            mission = config["missions"][name]
+            self.assertEqual(mission["arm_topic"], "/mission/arm/" + name)
+            self.assertEqual(mission["ready_topic"], "/mission/ready/" + name)
+
 class SequenceTest(unittest.TestCase):
     def setUp(self):
         self.sequence = MissionZoneSequence(
@@ -193,33 +197,103 @@ class SequenceTest(unittest.TestCase):
                     "name": "obstacle",
                 },
             ],
-            enter_margin=0.1,
+            armed_at=10.0,
+            initial_generation=41,
         )
 
-    def test_order_gate_and_external_completion(self):
-        self.sequence.update_signed_distance(-1.0)
-        self.assertEqual(self.sequence.state, MissionZoneSequence.SEEKING)
-        self.sequence.update_signed_distance(0.5)
+    def _ready_and_activate(self, stamp=10.1, received=10.2):
+        self.assertTrue(
+            self.sequence.mark_ready(
+                self.sequence.current_name,
+                self.sequence.generation,
+                stamp,
+                received,
+                maximum_age=0.5,
+                future_tolerance=0.05,
+            )
+        )
+        self.assertEqual(self.sequence.state, MissionZoneSequence.READY)
+        self.assertTrue(self.sequence.activate_current(received))
         self.assertEqual(self.sequence.state, MissionZoneSequence.ACTIVE)
-        self.assertFalse(self.sequence.complete_current("obstacle"))
-        self.assertTrue(self.sequence.complete_current("intersection"))
-        self.assertEqual(self.sequence.current_name, "obstacle")
 
-    def test_precomputed_signed_distance_uses_same_sequence_path(self):
-        self.sequence.update_signed_distance(0.5)
-        self.assertEqual(self.sequence.state, MissionZoneSequence.ACTIVE)
+    def test_first_mission_is_armed_without_any_pose_update(self):
+        self.assertEqual(self.sequence.state, MissionZoneSequence.ARMED)
         self.assertEqual(self.sequence.current_name, "intersection")
+        self.assertEqual(self.sequence.generation, 41)
+        self.assertAlmostEqual(self.sequence.armed_at, 10.0)
+
+    def test_only_ready_can_open_active_state(self):
+        self.assertFalse(self.sequence.activate_current(10.1))
+        self.assertEqual(self.sequence.state, MissionZoneSequence.ARMED)
+        self._ready_and_activate()
+
+    def test_out_of_order_readiness_is_rejected(self):
+        self.assertIsNotNone(
+            self.sequence.readiness_problem(
+                "obstacle", 41, 10.1, 10.2, maximum_age=0.5
+            )
+        )
+        self.assertFalse(
+            self.sequence.mark_ready(
+                "obstacle", 41, 10.1, 10.2, maximum_age=0.5
+            )
+        )
+        self.assertEqual(self.sequence.state, MissionZoneSequence.ARMED)
+
+    def test_wrong_generation_and_pre_arm_readiness_are_rejected(self):
+        self.assertFalse(
+            self.sequence.mark_ready(
+                "intersection", 40, 10.1, 10.2, maximum_age=0.5
+            )
+        )
+        self.assertFalse(
+            self.sequence.mark_ready(
+                "intersection", 41, 9.99, 10.0, maximum_age=0.5
+            )
+        )
+        self.assertEqual(self.sequence.state, MissionZoneSequence.ARMED)
+
+    def test_stale_and_future_readiness_are_rejected(self):
+        self.assertFalse(
+            self.sequence.mark_ready(
+                "intersection", 41, 10.1, 10.7, maximum_age=0.5
+            )
+        )
+        self.assertFalse(
+            self.sequence.mark_ready(
+                "intersection",
+                41,
+                10.3,
+                10.2,
+                maximum_age=0.5,
+                future_tolerance=0.05,
+            )
+        )
+        self.assertEqual(self.sequence.state, MissionZoneSequence.ARMED)
+
+    def test_external_completion_arms_next_immediately(self):
+        self._ready_and_activate()
+        self.assertFalse(self.sequence.complete_current("obstacle", 10.3))
+        self.assertTrue(self.sequence.complete_current("intersection", 11.0))
+        self.assertEqual(self.sequence.current_name, "obstacle")
+        self.assertEqual(self.sequence.state, MissionZoneSequence.ARMED)
+        self.assertAlmostEqual(self.sequence.armed_at, 11.0)
+        self.assertEqual(self.sequence.generation, 42)
+        # The previous generation cannot activate the newly armed mission.
+        self.assertFalse(
+            self.sequence.mark_ready(
+                "obstacle", 41, 11.1, 11.2, maximum_age=0.5
+            )
+        )
 
     def test_every_mission_requires_its_controller_completion(self):
-        self.sequence.update_signed_distance(0.5)
-        self.sequence.complete_current("intersection")
-        self.sequence.update_signed_distance(0.5)
-        self.assertEqual(self.sequence.state, MissionZoneSequence.ACTIVE)
-        self.assertEqual(self.sequence.current_name, "obstacle")
-        self.sequence.update_signed_distance(-1.0)
-        self.assertEqual(self.sequence.state, MissionZoneSequence.ACTIVE)
-        self.sequence.complete_current("obstacle")
+        self._ready_and_activate()
+        self.assertTrue(self.sequence.complete_current("intersection", 11.0))
+        self.assertFalse(self.sequence.complete_current("obstacle", 11.1))
+        self._ready_and_activate(stamp=11.1, received=11.2)
+        self.assertTrue(self.sequence.complete_current("obstacle", 12.0))
         self.assertEqual(self.sequence.state, MissionZoneSequence.COMPLETE)
+        self.assertEqual(self.sequence.completed, ["intersection", "obstacle"])
 
 
 if __name__ == "__main__":

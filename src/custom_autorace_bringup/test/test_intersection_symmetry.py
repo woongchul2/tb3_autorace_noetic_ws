@@ -20,9 +20,27 @@ class IntersectionRouteSelectionTest(unittest.TestCase):
         self.mission = load_yaml("intersection_mission.yaml")["mission"]
         self.zones = load_yaml("mission_zones_gazebo.yaml")
 
-    def test_production_config_has_only_absolute_map_routes(self):
-        self.assertEqual(self.mission["map_frame"], "map")
+    def test_production_config_has_only_mission_local_routes(self):
+        self.assertEqual(
+            self.mission["registration"]["local_frame"],
+            "intersection_local",
+        )
+        self.assertEqual(self.mission["diagnostic_map_frame"], "map")
         for obsolete_key in (
+            "map_frame",
+            "map_transform_lookup_timeout",
+            "map_transform_max_age",
+            "map_entry_start",
+            "map_entry_start_yaw_deg",
+            "map_left_entry_goal",
+            "map_right_entry_goal",
+            "map_left_arc_entry_yaw_deg",
+            "map_right_arc_entry_yaw_deg",
+            "map_left_exit_control_points",
+            "map_right_exit_control_points",
+            "map_exit_control_points",
+            "map_snap_max_distance",
+            "exit_map_snap_max_distance",
             "use_zone_gate",
             "path_planner",
             "intersection_confirm_frames",
@@ -87,40 +105,42 @@ class IntersectionRouteSelectionTest(unittest.TestCase):
         )
         self.assertGreater(float(self.mission["entry_max_total_turn_deg"]), 0.0)
         self.assertLess(float(self.mission["entry_max_total_turn_deg"]), 180.0)
+        self.assertLessEqual(
+            float(self.mission["registration"]["entry_lead_min"]), -0.14
+        )
 
     def test_camera_selector_has_two_independently_measured_entry_goals(self):
-        start = self.mission["map_entry_start"]
-        left = self.mission["map_left_entry_goal"]
-        right = self.mission["map_right_entry_goal"]
+        start = self.mission["local_entry_start"]
+        left = self.mission["local_left_entry_goal"]
+        right = self.mission["local_right_entry_goal"]
 
         self.assertEqual(len(start), 2)
-        self.assertLess(left[1], start[1])
-        self.assertGreater(right[1], start[1])
+        self.assertGreater(left[1], start[1])
+        self.assertLess(right[1], start[1])
         self.assertAlmostEqual(
-            float(self.mission["map_entry_start_yaw_deg"]), 180.0
+            float(self.mission["local_entry_start_yaw_deg"]), 0.0
         )
         self.assertAlmostEqual(
-            float(self.mission["map_left_arc_entry_yaw_deg"]), -90.0
+            float(self.mission["local_left_arc_entry_yaw_deg"]), 90.0
         )
         self.assertAlmostEqual(
-            float(self.mission["map_right_arc_entry_yaw_deg"]), 90.0
+            float(self.mission["local_right_arc_entry_yaw_deg"]), -90.0
         )
-        self.assertGreaterEqual(int(self.mission["map_entry_samples"]), 20)
+        self.assertGreaterEqual(int(self.mission["entry_samples"]), 20)
         self.assertNotEqual(left, right)
 
-    def test_exit_takeover_uses_direct_map_pose_without_exit_regions(self):
-        self.assertEqual(
-            set(self.zones.get("regions", {})),
-            {"intersection_direction_observation"},
-        )
+    def test_ordered_arm_ready_topics_and_direct_exit_takeover(self):
+        self.assertEqual(self.zones.get("regions", {}), {})
         self.assertAlmostEqual(self.zones["zone"]["signal_period"], 0.10)
-        self.assertEqual(self.mission["mission_map_pose_topic"], "/mission/map_pose")
+        configured = self.zones["missions"]["intersection"]
+        self.assertEqual(self.mission["arm_topic"], configured["arm_topic"])
+        self.assertEqual(self.mission["ready_topic"], configured["ready_topic"])
         self.assertEqual(
-            self.mission["direction_observation_topic"],
-            self.zones["regions"]["intersection_direction_observation"][
-                "inside_topic"
-            ],
+            self.mission["zone_gate_topic"],
+            configured["gate_topic"],
         )
+        self.assertEqual(int(self.mission["direction_confirm_frames"]), 9)
+        self.assertNotIn("direction_observation_topic", self.mission)
         self.assertGreater(float(self.mission["exit_takeover_max_distance"]), 0.0)
         self.assertNotIn("zone_left_arc_end_topic", self.mission)
         self.assertNotIn("zone_right_arc_end_topic", self.mission)
@@ -128,7 +148,7 @@ class IntersectionRouteSelectionTest(unittest.TestCase):
         self.assertNotIn("arc_end_confirmation_min_interval", self.mission)
 
     def test_exit_control_polygon_has_the_configured_end_tangents(self):
-        points = self.mission["map_exit_control_points"]
+        points = self.mission["local_exit_control_points"]
         self.assertGreaterEqual(len(points), 4)
         start_yaw = math.atan2(
             float(points[1][1]) - float(points[0][1]),
@@ -138,10 +158,10 @@ class IntersectionRouteSelectionTest(unittest.TestCase):
             float(points[-1][1]) - float(points[-2][1]),
             float(points[-1][0]) - float(points[-2][0]),
         )
-        self.assertAlmostEqual(abs(start_yaw), math.pi, places=6)
+        self.assertAlmostEqual(start_yaw, 0.0, places=6)
         self.assertAlmostEqual(
             end_yaw,
-            math.radians(float(self.mission["exit_goal_yaw_deg"])),
+            math.radians(float(self.mission["local_exit_goal_yaw_deg"])),
             places=6,
         )
 

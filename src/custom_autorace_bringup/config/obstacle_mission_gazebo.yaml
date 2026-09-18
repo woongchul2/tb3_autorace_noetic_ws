@@ -5,10 +5,9 @@ obstacle:
     scan: /scan_mid360_raw
     lane_boundaries: /detect/lane_boundaries
     odometry: /odometry/filtered
-    map_pose: /mission/map_pose
+    arm: /mission/arm/obstacle
+    ready: /mission/ready/obstacle
     zone_gate: /mission/enable/obstacle
-    zone_inside: /mission/inside/obstacle
-    zone_clearance: /mission/clear/obstacle
     manual_stop: /control/manual_stop
     cmd_vel: /cmd_vel
     lane_speed_limit: /control/max_vel
@@ -16,9 +15,6 @@ obstacle:
     lane_stop_service: /control/lane_following
 
   course:
-    # The construction straight runs in map +y. AMCL opens the polygon and
-    # seeds LiDAR registration; the resulting course frame is then held in odom.
-    heading_deg: 90.0
     lane_width: 0.495
     # Three-point Gazebo calibration at x=1.6275/1.6375/1.6475 m and y=0.05 m
     # measured about 1850 px/m.  This virtual lane-frame reference removes the
@@ -27,6 +23,10 @@ obstacle:
     boundary_image_center: 383.0
     boundary_pixels_per_meter: 1850.0
     boundary_sample_forward: 0.14
+    # /detect/lane_boundaries samples a 10 px bird-eye band.  With the
+    # calibrated 0.44 m / 599 px forward scale, that observation supports only
+    # about +/-3.7 mm along the course; never extend it through the slalom.
+    boundary_support_half_length: 0.004
     minimum_boundary_gap_px: 380.0
     maximum_boundary_gap_px: 850.0
     scale_filter_alpha: 0.20
@@ -67,28 +67,32 @@ obstacle:
     runtime_tracking_margin: 0.0
 
   safety:
-    # Physical extent of the 4 m Gazebo course texture in map coordinates.
-    # It is frozen into odom with the same AMCL snapshot as the committed path
-    # and reported separately from painted-line clearance.
-    map_bounds: [-2.0, 2.0, -2.0, 2.0]
+    # Mission-local allowed extent; the same LiDAR SE(2) that freezes the path
+    # freezes this bound in odom.
+    local_bounds: [-2.0, 2.0, -2.0, 2.0]
 
   planner:
     tracking_position_tolerance: 0.055
     tracking_heading_tolerance_deg: 28.0
     collision_check_step: 0.008
     collision_check_angle_deg: 3.0
+    # The live body pose is the first point of the executable CommonPath.
+    # Search a short G2 quintic into the measured spline; no two-point lateral
+    # jump is accepted or discarded after validation.
+    entry_connector_minimum_join_distance: 0.12
+    entry_connector_maximum_join_distance: 0.32
+    entry_connector_join_step: 0.02
+    entry_connector_tangent_ratios: [0.12, 0.14, 0.16, 0.18, 0.20, 0.22, 0.10, 0.24, 0.28]
 
   template:
-    # Gazebo-only surveyed map template. Local +x is course-forward (+map y)
-    # and local +y is course-left (-map x). AMCL is only the registration seed;
-    # every path is checked against live LiDAR with the oriented rectangle.
-    map_anchor_x: 1.6375
-    map_anchor_y: 0.0200
+    # Mission-local template. Local +x is course-forward and local +y is
+    # course-left. LiDAR barrier faces determine the complete local->odom SE(2).
     barriers:
       - [0.5200, 0.1475, 0.1000, 0.2500]
       - [0.9800, -0.1025, 0.1000, 0.2500]
       - [1.4440, 0.1475, 0.1000, 0.2500]
     barrier_surface_spacing: 0.004
+    barrier_association_distance: 0.025
     # The slalom is a clamped cubic spline. A single quintic continuation then
     # follows the measured 90-degree left turn to the normal camera lane.
     start_slope: 0.0
@@ -138,19 +142,62 @@ obstacle:
     # checks the next 0.45 m on every scan, leaving over five seconds to stop
     # for an unexpected object without rejecting distant noisy surfaces.
     live_validation_distance: 0.45
-    # AMCL opens the mission and seeds this bounded search. Two obstacle-face
-    # directions in one LiDAR scan then fix the surveyed course frame in odom;
-    # collision checking continues to use every point, not just match inliers.
+    # Registration is confirmed while the lane controller still owns cmd_vel.
+    # The transform may be stored early, but readiness is emitted only near the
+    # entry plane after the executable suffix passes its full rectangle sweep.
     registration:
-      longitudinal_search: 0.18
-      lateral_search: 0.14
-      coarse_step: 0.02
-      fine_window: 0.012
-      fine_step: 0.002
       inlier_distance: 0.025
-      minimum_inliers: 15
-      maximum_rms: 0.015
-      line_exclusion: 0.025
+      heading_inlier_deg: 6.0
+      minimum_faces: 2
+      minimum_template_coverage: 0.60
+      face_minimum_length: 0.055
+      face_maximum_length: 0.320
+      face_maximum_rms: 0.012
+      # The official approach crosses the course sideways. Extract all line
+      # headings, then accept only the unique, parallel outer-face baseline.
+      acquisition_face_heading_tolerance_deg: 180.0
+      outer_face_minimum_length: 0.180
+      outer_baseline_tolerance: 0.035
+      outer_parallel_heading_tolerance_deg: 6.0
+      finite_endpoint_tolerance: 0.006
+      side_minimum_length: 0.055
+      side_heading_tolerance_deg: 12.0
+      side_association_tolerance: 0.025
+      # Independently measured front/side axes must agree before the long
+      # midpoint baseline may set yaw. Unequal front clipping must not become
+      # a lateral course shift hidden behind a low fit RMS.
+      # Mid-360 finite-face fits vary by several degrees at long range. Use the
+      # median of both front axes and the side axis for the lateral check, keep
+      # a strict 15 mm base allowance, and cap explained spread at 40 mm. The
+      # Mid-360 line fits can differ by almost 9 degrees; run 11 confirms with
+      # 3.3 mm/0.35 deg transform spread at the bounded 9 degree limit.
+      # Exact axes still reject the 20 mm asymmetric-clipping regression.
+      outer_baseline_lateral_tolerance: 0.015
+      outer_baseline_lateral_maximum: 0.040
+      axis_consistency_tolerance_deg: 9.0
+      # Distinct local-frame hypotheses beyond the swept-path reserve are
+      # ambiguous; wait for the next source-stamped scan instead of choosing
+      # whichever face happened to be extracted first.
+      ambiguity_position: 0.004
+      ambiguity_heading_deg: 0.25
+      acquisition_minimum_progress: -1.10
+      acquisition_maximum_progress: 0.20
+      acquisition_maximum_lateral: 0.80
+      acquisition_maximum_heading_deg: 105.0
+      # These stricter limits apply only to path preparation and handoff.
+      entry_maximum_lateral: 0.20
+      entry_maximum_heading_deg: 15.0
+      confirmation_samples: 3
+      # Good three-face views are sparse between occluded 10 Hz scans. Only
+      # accepted hypotheses count, and three mutually consistent observations
+      # must still arrive before the entry turn.
+      confirmation_maximum_gap: 1.10
+      confirmation_position_delta: 0.025
+      confirmation_heading_delta_deg: 3.0
+      ready_lead_minimum_progress: -0.22
+      # Three 10 Hz confirmations can finish just after the first-barrier
+      # centre.  Keep the handoff window open through that measured interval.
+      ready_lead_maximum_progress: 0.12
     cruise_velocity: 0.070
     minimum_velocity: 0.035
     entry_velocity: 0.070
@@ -176,7 +223,17 @@ obstacle:
 
   control:
     period: 0.05
+    # Apply this cap as soon as pre-gate path planning starts, then republish
+    # it at the gate edge.  The lane controller decelerates during the full
+    # sweep so the fresh G2 refresh remains inside its measured join window.
     entry_velocity_cap: 0.09
+    entry_handoff_velocity_tolerance: 0.005
+    # The refreshed connector may acquire control only while its live pose is
+    # still joined. Ownership then emits exact zero, waits for a newer odom
+    # source stamp, and lets the common follower enforce both acceleration
+    # limits; the old lane command is not compared with future path curvature.
+    entry_projection_position_tolerance: 0.015
+    entry_projection_heading_tolerance_deg: 8.0
     lane_resume_max_velocity: 0.30
     maximum_angular_velocity: 0.85
     maximum_lateral_acceleration: 0.035
@@ -199,10 +256,3 @@ obstacle:
   timeouts:
     scan: 0.35
     odometry: 0.35
-    # AMCL pose source time and callback receipt must both stay fresh. The
-    # future tolerance only absorbs normal ROS timestamp scheduling jitter.
-    map_pose: 0.35
-    map_pose_future_tolerance: 0.05
-    # A map pose is combined only with exact or bracketed odometry at its
-    # source time; both bracket endpoints must lie within this interval.
-    map_pose_odom_skew: 0.075

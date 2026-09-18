@@ -1,11 +1,17 @@
-# Gazebo-only zigzag route measured from the 4 m course texture. Hardware must
-# use a separately surveyed path, boundaries, footprint and odometry profile.
+# Gazebo-only zigzag template measured from the 4 m course texture. Hardware
+# uses its own mission-local template and registers it from rolling camera
+# curvature; connecting-straight length is not part of this geometry.
 zigzag:
   topics:
     odometry: /odom
     scan: /scan_mid360_raw
-    map_pose: /mission/map_pose
     zone_gate: /mission/enable/zigzag
+    mission_arm: /mission/arm/zigzag
+    mission_ready: /mission/ready/zigzag
+    # Registration consumes the one camera CommonPath before the normal-lane
+    # controller's drive-authority check. The surveyed suffix still receives
+    # its own complete common swept validation before control transfer.
+    lane_path: /control/lane_path
     lane_boundaries: /detect/lane_boundaries
     manual_stop: /control/manual_stop
     cmd_vel: /cmd_vel
@@ -13,12 +19,15 @@ zigzag:
     lane_control_service: /control/lane_mission_handoff
     lane_stop_service: /control/lane_following
 
-  # Gazebo /odom is the world frame used to survey the texture path. AMCL still
-  # owns ordered mission gating, but a localization correction must not shift
-  # this millimetre-clearance route. Hardware profiles normally set this false.
+  # The knots are surveyed in the static map/world coordinates. Gazebo's raw
+  # /odom numeric pose is aligned with those coordinates, so control may freeze
+  # the route with an identity transform. The TF named odom is owned by the EKF
+  # and has a different origin, therefore RViz must retain the source map frame.
+  # Hardware profiles set odom_aligned false so confirmed rolling-path shape
+  # supplies the one frozen mission-local -> odom transform.
   route:
     odom_aligned: true
-    frame_id: odom
+    frame_id: map
 
   # The ordered gate may open anywhere along the straight lead-in. Acquisition
   # projects the current pose onto the remaining path instead of requiring a
@@ -27,6 +36,33 @@ zigzag:
     maximum_path_error: 0.018
     maximum_join_heading_error_deg: 7.0
     maximum_pose_stamp_skew: 0.04
+
+  registration:
+    # The ordered manager only arms this detector. Three independent rolling
+    # camera curves must identify a unique station before the enable gate can
+    # open. Straight observations are intentionally rejected as ambiguous.
+    sample_count: 21
+    station_search_step: 0.01
+    minimum_observed_length: 0.20
+    minimum_heading_variation_deg: 8.0
+    minimum_lateral_excitation: 0.008
+    position_inlier_threshold: 0.025
+    minimum_inlier_fraction: 0.75
+    maximum_rms: 0.018
+    ambiguity_station_separation: 0.08
+    maximum_ambiguity_rms_difference: 0.002
+    maximum_ambiguity_rms_ratio: 1.15
+    # The Gazebo route is already fixed in raw odom. Restrict curve matching
+    # to the start station near the current projected pose so repeated bends
+    # cannot consume the three-frame confirmation window.
+    maximum_start_station_error: 0.10
+    confirmation_frames: 3
+    confirmation_max_gap: 0.20
+    maximum_position_spread: 0.015
+    maximum_heading_spread_deg: 2.0
+    source_max_age: 0.35
+    future_tolerance: 0.05
+    ready_republish_period: 0.15
 
   scan:
     # /scan_mid360_raw is expressed at base_scan. Every accepted return is
@@ -227,7 +263,6 @@ zigzag:
     join_timeout: 1.5
 
   timeouts:
-    map_pose: 0.35
     odometry: 0.35
     scan: 0.35
     acquisition: 2.0

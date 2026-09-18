@@ -14,58 +14,102 @@ mission:
   lane_control_service: /control/lane_mission_handoff
   # Independent fail-stop endpoint used only when a handoff response is lost.
   lane_stop_service: /control/lane_following
-  # The upstream direction window and the later ordered mission gate are
-  # computed independently from AMCL map poses by mission_zone_manager.
+  # The ordered manager arms camera evidence first. It opens the Bool gate
+  # only after this controller publishes a matching source-stamped readiness.
+  arm_topic: /mission/arm/intersection
+  ready_topic: /mission/ready/intersection
   zone_gate_topic: /mission/enable/intersection
-  direction_observation_topic: /mission/inside/intersection_direction_observation
-  mission_map_pose_topic: /mission/map_pose
-
+  mission_name: intersection
   # 9 frames at 30 Hz preserves the former 3-frame/10 Hz evidence window.
   direction_confirm_frames: 9
-  # An upstream confirmation remains cached without starting this timeout.
-  # Once the ordered gate opens, lane control continues to the normal plane
-  # through map_entry_start. Fail closed if AMCL cannot reach it in this time.
-  entry_handoff_timeout: 5.0
+  # Maximum delay allowed between publishing ready and receiving enable.
+  # Lane control remains authoritative during this interval.
+  ready_gate_timeout: 5.0
   entry_takeover_pose_timeout: 0.75
-  # The rolling camera path loses connected paint about 135 mm before the
-  # surveyed nominal plane on the official approach.  Take over 200 mm before
-  # that plane, after the 30 Hz direction streak is complete but while the
-  # current camera path is still valid.  The executable cubic still starts at
-  # the fresh post-handoff pose; this value does not move any stored waypoint.
-  entry_handoff_lead_distance: 0.200
   # Test hook: 0=read camera, 2=force left, 3=force right.
   forced_direction: 0
-  # Absolute course-map routes. The camera selector chooses one measured entry
-  # branch after a common live-pose alignment; map->odom is frozen before
-  # conversion to the common path format. The texture-derived paint is the
-  # common validator's line boundary and is also published for RViz.
-  map_frame: map
-  map_transform_lookup_timeout: 0.20
-  map_transform_max_age: 0.50
-  map_world_size: 4.0
-  map_resolution: 0.01
-  map_boundary_inflation: 0.01
-  map_snap_max_distance: 0.45
-  exit_map_snap_max_distance: 0.05
-  map_texture_package: turtlebot3_gazebo
-  map_texture_relative_path: models/turtlebot3_autorace_2020/course/materials/textures/course.png
+  # Registration uses source timestamps, not callback receipt time. AMCL fixes
+  # only the mission heading; its map translation is intentionally ignored.
+  # A non-clipped direction-sign observation fixes translation relative to the
+  # stable local mission geometry, so a longer/shorter preceding straight does
+  # not move the entrance, exit, paint or bounds in odom.
+  registration:
+    local_frame: intersection_local
+    # Three official-run source-aligned AMCL bias means are centred at
+    # +0.52 deg. The 0.16 deg between-run standard deviation and 0.12 deg
+    # within-run source-stamp noise are retained separately below.
+    local_yaw_in_map_deg: 180.52
+    map_tf_timeout: 0.020
+    left_sign_landmark_in_local: [0.315, 0.088]
+    right_sign_landmark_in_local: [0.315, -0.022]
+    # Vertical sign diameter is stable under the oblique horizontal approach.
+    # Gazebo detector calibration differs by view direction. Remeasure these
+    # four values independently on the D405; route geometry remains unchanged.
+    sign_physical_height: 0.120
+    left_sign_range_scale: 1.235
+    right_sign_range_scale: 1.175
+    left_sign_center_bias_pixels: 24.0
+    right_sign_center_bias_pixels: 13.0
+    roi_edge_margin_pixels: 2
+    # Planar optical-origin offset from base_footprint for the measured D405
+    # mounting. Hardware recalibration changes only these values and the sign
+    # landmarks; route points remain mission-local.
+    camera_offset_in_base: [0.0580, 0.0090]
+    # Used only until CameraInfo arrives.
+    camera_fx_fallback: 337.0
+    camera_fy_fallback: 337.0
+    camera_cx_fallback: 320.0
+    observation_position_stddev: 0.005
+    observation_heading_stddev_deg: 0.12
+    # Direction-specific detector calibration parameter error and the
+    # remaining source-stamp heading interpolation error do not average away.
+    systematic_position_error: 0.0015
+    systematic_heading_error_deg: 0.16
+    required_confirmations: 3
+    maximum_confirmation_gap: 0.25
+    maximum_position_delta: 0.040
+    maximum_heading_delta_deg: 4.0
+    history_size: 12
+    # Readiness is legal only immediately before the local entry plane.
+    # The rolling lane becomes unobservable around x=-0.12 m in the official
+    # LEFT approach. The complete registered entry sweep is already safe from
+    # -0.15 m, so readiness must be available before camera control stops.
+    entry_lead_min: -0.15
+    entry_lead_max: 0.03
+    entry_lateral_max: 0.03
+    entry_heading_max_deg: 12.0
+    odom_history_duration: 2.0
+    pose_stamp_tolerance: 0.060
+    source_max_age: 0.45
+    future_tolerance: 0.05
+
+  # Every route coordinate is already expressed in intersection_local, whose
+  # origin and +x axis are the measured straight entrance centre/tangent.
+  # The texture calibration converts paint into that same local frame once.
+  # Path generation and validation do not use map translation; registration
+  # reads only the source-stamped map->odom heading before freezing the path.
+  diagnostic_map_frame: map
+  course_world_size: 4.0
+  course_resolution: 0.01
+  course_boundary_inflation: 0.01
+  exit_local_snap_max_distance: 0.05
+  course_texture_package: turtlebot3_gazebo
+  course_texture_relative_path: models/turtlebot3_autorace_2020/course/materials/textures/course.png
+  # [local x, local y, local yaw_deg] of the texture/world coordinate frame.
+  course_texture_to_local: [1.3950, -0.7500, 180.0]
   # This pose defines both the early-handoff reference plane and the measured
-  # centre of the straight intersection entrance.  A short live-pose alignment
-  # curve reaches it before the selected stored branch begins.  This removes
-  # the callback-timing sensitivity of a single live-pose-to-goal cubic.
-  map_entry_start: [1.3950, -0.7500]
-  map_entry_start_yaw_deg: 180.0
-  map_left_entry_goal: [1.2522, -0.9257]
-  map_right_entry_goal: [1.2513, -0.5886]
-  map_left_arc_entry_yaw_deg: -90.0
-  map_right_arc_entry_yaw_deg: 90.0
-  map_entry_samples: 100
-  entry_alignment_samples: 61
-  # The live pose first joins the measured entrance centre using equal 0.25
-  # chord tangents.  The stored LEFT/RIGHT branch then uses the common tangent
-  # ratios below.  Run-2 and run-3 callback-timing endpoints complete with no
-  # predicted stop in the exact rectangular swept-footprint regression.
-  entry_alignment_tangent_ratio: 0.25
+  # centre of the straight intersection entrance and the readiness envelope.
+  # The executable path begins at the post-handoff EKF pose and reaches the
+  # selected goal in one cubic, avoiding a curvature discontinuity at this
+  # reference point.
+  local_entry_start: [0.0, 0.0]
+  local_entry_start_yaw_deg: 0.0
+  local_left_entry_goal: [0.1428, 0.1757]
+  local_right_entry_goal: [0.1437, -0.1614]
+  local_left_arc_entry_yaw_deg: 90.0
+  local_right_arc_entry_yaw_deg: -90.0
+  entry_samples: 100
+  # One live-pose-to-selected-goal cubic uses these chord-relative tangents.
   entry_start_tangent_ratio: 0.50
   entry_end_tangent_ratio: 0.32
   # Reject a generated entry before motion if it accumulates more than this
@@ -81,21 +125,21 @@ mission:
   # unsafe visual convergence.  The selected fixed Bezier carries the robot
   # from that safe handoff pose to the common westbound exit start.  These
   # are independently measured because the texture is not exactly symmetric.
-  map_left_exit_control_points:
-    - [0.762200, -1.035300]
-    - [0.737117, -0.924915]
-    - [0.742982, -0.941341]
-    - [0.721843, -0.847479]
-    - [0.757456, -0.750000]
-    - [0.600000, -0.750000]
-  map_right_exit_control_points:
-    - [0.762200, -0.464700]
-    - [0.737117, -0.575085]
-    - [0.742982, -0.558659]
-    - [0.721843, -0.652521]
-    - [0.757456, -0.750000]
-    - [0.600000, -0.750000]
-  map_exit_branch_samples: 100
+  local_left_exit_control_points:
+    - [0.632800, 0.285300]
+    - [0.657883, 0.174915]
+    - [0.652018, 0.191341]
+    - [0.673157, 0.097479]
+    - [0.637544, 0.000000]
+    - [0.795000, 0.000000]
+  local_right_exit_control_points:
+    - [0.632800, -0.285300]
+    - [0.657883, -0.174915]
+    - [0.652018, -0.191341]
+    - [0.673157, -0.097479]
+    - [0.637544, 0.000000]
+    - [0.795000, 0.000000]
+  exit_branch_samples: 100
   # At lane takeover, connect the measured pose/yaw to this downstream
   # fraction of the selected surveyed branch, then retain the verified branch
   # remainder and shared exit. Tangents scale with the connector chord.
@@ -103,9 +147,9 @@ mission:
   exit_adaptive_tangent_ratio: 0.35
   exit_adaptive_connector_samples: 41
 
-  # The lane controller follows only the selected painted semicircle. A fresh
-  # mission_map_pose near its direction-specific branch start transfers
-  # cmd_vel back before vision reaches the narrow convergence.
+  # The lane controller follows only the selected painted semicircle. Odom is
+  # projected onto the selected branch under the frozen local transform to
+  # transfer cmd_vel back before vision reaches the narrow convergence.
   arc_lane_timeout: 20.0
   arc_lane_max_distance: 1.20
   # The lane controller further reduces this cap from its pixel error. The
@@ -117,25 +161,29 @@ mission:
   # sample before anchoring the separately controlled exit path.
   exit_takeover_settle_time: 0.10
   exit_takeover_pose_timeout: 0.75
-  # AMCL is projected onto the complete selected exit branch, so passing its
+  # Odom is projected onto the complete registered exit branch, so passing its
   # first stored point cannot miss the handoff. This tolerance covers the
-  # measured Gazebo AMCL lateral error while the common validator remains the
+  # measured Gazebo odometry/registration lateral error while the validator remains the
   # authority for the actual rectangular footprint.
   exit_takeover_max_distance: 0.050
 
   # Degree-five Bezier control polygon measured down the shared outgoing
   # corridor. The selected branch above joins its first point with a 180
   # degree tangent; the last control edge imposes the 90 degree exit heading.
-  map_exit_control_points:
-    - [0.600000, -0.750000]
-    - [0.341036, -0.750000]
-    - [0.295513, -0.678066]
-    - [0.256661, -0.509532]
-    - [0.250000, -0.615049]
-    - [0.250000, -0.300000]
-  map_exit_samples: 180
-  exit_goal_yaw_deg: 90.0
-  exit_path_lookahead: 0.035
+  local_exit_control_points:
+    - [0.795000, 0.000000]
+    # A 4.3 mm shorter first handle centres the measured rectangular sweep in
+    # the narrow shared corridor while preserving both endpoint tangents.
+    - [1.049664, 0.000000]
+    - [1.099487, -0.071934]
+    - [1.138339, -0.240468]
+    - [1.145000, -0.134951]
+    - [1.145000, -0.450000]
+  exit_samples: 180
+  local_exit_goal_yaw_deg: -90.0
+  # The 40 mm target plus the common feedback blend below removed the
+  # measured shared-bend CTE without changing its surveyed geometry.
+  exit_path_lookahead: 0.040
   exit_path_goal_tolerance: 0.025
   exit_path_goal_heading_tolerance_deg: 8.0
   exit_path_goal_crossing_max_distance: 0.10
@@ -146,11 +194,10 @@ mission:
   exit_path_max_angular_velocity: 0.90
   exit_path_follow_timeout: 22.0
 
-  # Search and confirm while the lane controller still owns cmd_vel. The
-  # narrow AMCL observation region rejects signs elsewhere on the course, and
-  # three matching LEFT/RIGHT observations are still required. Accept the
-  # direction sign from 3% image area so a useful frame seen before the ordered
-  # gate is retained instead of waiting until the lane image becomes stale.
+  # Search and confirm only for the current non-zero arm generation while the
+  # lane controller still owns cmd_vel. Nine matching LEFT/RIGHT source frames
+  # are required. The common entry path and complete rectangular sweep must
+  # validate before readiness is published and the manager can open enable.
   direction_acquire_min_confidence: 0.62
   direction_tracking_min_confidence: 0.58
   direction_confirm_min_confidence: 0.60
@@ -159,7 +206,7 @@ mission:
   direction_confirm_min_roi_area_ratio: 0.030
   # GUI/RViz official-start traces delivered usable processed observations up
   # to about 1.01 s apart. This gap preserves that streak without weakening
-  # the three-observation or same-direction requirements.
+  # the nine-frame same-direction requirement.
   direction_confirmation_max_gap: 1.20
   direction_search_timeout: 35.0
   # CameraInfo supplies the live resolution; these are startup fallbacks.
@@ -192,9 +239,9 @@ mission:
   linear_acceleration: 0.25
   linear_deceleration: 0.50
   path_angular_acceleration: 1.50
-  path_heading_gain: 0.35
-  path_curvature_weight: 0.25
-  path_lateral_feedback_gain: 1.0
+  path_heading_gain: 0.50
+  path_curvature_weight: 0.10
+  path_lateral_feedback_gain: 1.50
   path_search_ahead_distance: 0.30
   # At the official-start handoff the camera approach can already overlap the
   # outer paint by 20-45 mm. This common-path allowance covers at most 60 mm at
@@ -215,13 +262,15 @@ mission:
     front: 0.067645
     rear: 0.118073
     half_width: 0.0903
-    # The finite 1 cm raster cells already contribute a 7.1 mm half-diagonal
-    # in the validator. An additional 1.5 mm each remains for Gazebo AMCL and
-    # tracking error; a second arbitrary line buffer would close the measured
-    # outgoing corridor completely.
+    # The finite 1 cm raster cells already contribute a 7.1 mm half-diagonal.
+    # Base localization stays at 1.5 mm and the frozen sign registration adds
+    # its measured 4.5-5.6 mm pointwise uncertainty.  The tuned common follower
+    # replayed both exits with <0.37 mm CTE through the shared bottleneck, so a
+    # 0.5 mm route tube is retained; the actual-pose stopping sweep remains the
+    # authority if live error is larger in the favourable or adverse direction.
     line_margin: 0.0
     localization_error: 0.0015
-    tracking_error: 0.0015
+    tracking_error: 0.0005
   safety:
     reaction_time: 0.10
     stop_distance_margin: 0.005
@@ -234,7 +283,6 @@ mission:
   # controller observes both coloured lines to confirm mission completion.
   boundary_center_x: 500.0
   boundary_timeout: 0.35
-  zone_signal_timeout: 0.50
   final_lane_confirm_frames: 9
   final_lane_confirmation_max_gap: 0.20
   final_lane_width_min: 120.0

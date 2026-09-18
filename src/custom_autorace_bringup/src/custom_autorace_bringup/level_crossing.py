@@ -101,6 +101,107 @@ class HorizontalBarrierDetection:
 
 
 @dataclass(frozen=True)
+class CrossingFrame:
+    """One locally registered crossing plane in an odometry frame.
+
+    The origin lies on the crossing plane and ``yaw`` points in the normal
+    downstream travel direction.  Keeping this frame in odometry coordinates
+    makes completion independent of any accumulated displacement in the
+    course's global map.
+    """
+
+    x: float
+    y: float
+    yaw: float
+
+    def __post_init__(self):
+        object.__setattr__(self, "x", _finite_float("x", self.x))
+        object.__setattr__(self, "y", _finite_float("y", self.y))
+        object.__setattr__(self, "yaw", _finite_float("yaw", self.yaw))
+
+
+def normalize_angle(angle):
+    """Wrap one finite angle to ``[-pi, pi)``."""
+    angle = _finite_float("angle", angle)
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def compose_pose_2d(parent, child):
+    """Compose ``parent <- child`` planar poses.
+
+    Each input is ``(x, y, yaw)``.  This helper is used both for source-stamped
+    landmark poses and for the Gazebo-only scan-cluster registration fallback.
+    """
+    if len(parent) != 3 or len(child) != 3:
+        raise ValueError("planar poses must contain (x, y, yaw)")
+    parent_x, parent_y, parent_yaw = (
+        _finite_float("parent pose", value) for value in parent
+    )
+    child_x, child_y, child_yaw = (
+        _finite_float("child pose", value) for value in child
+    )
+    cosine = math.cos(parent_yaw)
+    sine = math.sin(parent_yaw)
+    return (
+        parent_x + cosine * child_x - sine * child_y,
+        parent_y + sine * child_x + cosine * child_y,
+        normalize_angle(parent_yaw + child_yaw),
+    )
+
+
+def crossing_progress(frame, pose):
+    """Return base-centre progress along a registered crossing normal."""
+    if not isinstance(frame, CrossingFrame):
+        raise TypeError("frame must be a CrossingFrame")
+    if len(pose) != 3:
+        raise ValueError("pose must contain (x, y, yaw)")
+    x, y, _yaw = (_finite_float("pose", value) for value in pose)
+    return (x - frame.x) * math.cos(frame.yaw) + (
+        y - frame.y
+    ) * math.sin(frame.yaw)
+
+
+def crossing_rear_clearance(
+    frame,
+    pose,
+    front,
+    rear,
+    half_width,
+    padding=0.0,
+):
+    """Return the rear-most rectangular-footprint progress past the plane."""
+    if not isinstance(frame, CrossingFrame):
+        raise TypeError("frame must be a CrossingFrame")
+    if len(pose) != 3:
+        raise ValueError("pose must contain (x, y, yaw)")
+    pose = tuple(_finite_float("pose", value) for value in pose)
+    front = _finite_float("front", front)
+    rear = _finite_float("rear", rear)
+    half_width = _finite_float("half_width", half_width)
+    padding = _finite_float("padding", padding)
+    if min(front, rear, half_width) <= 0.0 or padding < 0.0:
+        raise ValueError(
+            "footprint front/rear/half_width must be positive and padding "
+            "must be non-negative"
+        )
+
+    heading_delta = normalize_angle(pose[2] - frame.yaw)
+    longitudinal_projection = math.cos(heading_delta)
+    minimum_longitudinal = min(
+        -(rear + padding) * longitudinal_projection,
+        (front + padding) * longitudinal_projection,
+    )
+    minimum_lateral = -(half_width + padding) * abs(
+        math.sin(heading_delta)
+    )
+    return (
+        crossing_progress(frame, pose)
+        + minimum_longitudinal
+        + minimum_lateral
+    )
+
+
+@dataclass(frozen=True)
 class _ScanPoint:
     index: int
     x: float
@@ -225,7 +326,12 @@ def detect_horizontal_barrier(
 
 
 __all__ = [
+    "CrossingFrame",
     "HorizontalBarrierConfig",
     "HorizontalBarrierDetection",
+    "compose_pose_2d",
+    "crossing_progress",
+    "crossing_rear_clearance",
     "detect_horizontal_barrier",
+    "normalize_angle",
 ]

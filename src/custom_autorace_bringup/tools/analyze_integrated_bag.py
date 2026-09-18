@@ -67,9 +67,7 @@ MISSION_EXECUTION_STATES = {
         "ENTERING",
         "PLANNING",
         "FOLLOWING",
-        "ALIGNING_EXIT",
         "EXITING",
-        "VERIFY_EXIT",
         "JOINING_LANE",
     },
 }

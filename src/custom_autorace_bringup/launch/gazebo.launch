@@ -5,6 +5,8 @@
   <arg name="yaw_pos" default="0.0"/>
   <arg name="gui" default="true"/>
   <arg name="course_texture" default="from_model"/>
+  <!-- Default runs advance A/B/C; an explicit layout remains reproducible. -->
+  <arg name="tunnel_obstacle_layout" default="auto"/>
   <!-- Gazebo's encoder-mode diff-drive odometry publishes reverse speed as a
        positive magnitude. Use the plugin's signed world pose/twist as the EKF
        input, while keeping the EKF as the sole odom -> base_footprint TF
@@ -47,7 +49,9 @@
   <arg name="wait_for_green" default="true"/>
   <arg name="rviz" default="true"/>
   <arg name="rviz_config" default="/workspace/autorace_sim.rviz"/>
-  <arg name="publish_trajectories" default="false"/>
+  <!-- Keep the route selected by each controller and the actual/EKF driven
+       trajectory visible in RViz during the normal integrated bringup. -->
+  <arg name="publish_trajectories" default="true"/>
 
   <include file="$(find custom_autorace_description)/launch/gazebo_autorace.launch">
     <arg name="x_pos" value="$(arg x_pos)"/>
@@ -56,6 +60,7 @@
     <arg name="yaw_pos" value="$(arg yaw_pos)"/>
     <arg name="gui" value="$(arg gui)"/>
     <arg name="course_texture" value="$(arg course_texture)"/>
+    <arg name="tunnel_obstacle_layout" value="$(arg tunnel_obstacle_layout)"/>
     <arg name="fuse_imu" value="$(arg fuse_imu)"/>
     <arg name="odometry_source" value="$(arg odometry_source)"/>
     <arg name="publish_trajectories" value="$(arg publish_trajectories)"/>
@@ -127,9 +132,12 @@
               file="$(find custom_autorace_bringup)/config/sign_detector.yaml"/>
   </node>
 
-  <!-- Intersection flow: AMCL observation and direction read, common entry
-       path, normal lane following around the painted semicircle, direct AMCL
-       map-pose takeover, common exit path, and final lane handoff. -->
+  <!-- Intersection flow: the ordered arm accepts direction-sign evidence,
+       registers intersection_local from source-stamped AMCL heading plus
+       direction-sign range/bearing translation,
+       and publishes ready only near the entry after the full path sweep. The
+       common entry path, camera-lane semicircle, common exit and final lane
+       handoff then run in sequence. -->
   <group if="$(arg intersection_mission)">
     <node pkg="custom_autorace_bringup" type="intersection_mission_controller.py"
           name="intersection_mission_controller" output="screen">
@@ -140,10 +148,10 @@
     </node>
   </group>
 
-  <!-- After the ordered AMCL gate opens, LiDAR registers the surveyed course
-       and latches it in odom. One curvature-continuous path crosses all three
-       barriers; camera lines and live LiDAR validate its oriented rectangular
-       sweep. cmd_vel returns after AMCL reports the measured exit clearance. -->
+  <!-- While ordered arm is active, independent LiDAR barrier faces register
+       obstacle_local in odom. Ready is published near the local entry only
+       after the remaining curvature-continuous path passes a complete
+       rectangular sweep. Camera lines and live LiDAR remain runtime checks. -->
   <group if="$(arg obstacle_mission)">
     <node pkg="custom_autorace_bringup" type="obstacle_mission_controller.py"
           name="obstacle_mission_controller" output="screen">
@@ -153,16 +161,12 @@
     </node>
   </group>
 
-  <!-- AMCL validates the ordered parking gate and start pose. The first
-       post-handoff map-to-odom relation immutably anchors every
-       route target. Fresh raw odom drives the manoeuvre and evaluates the final
-       VERIFY/JOIN bounds. At the stopped decision pose AMCL projects Mid-360
-       returns into both bay ROIs,
-       and later provides only coarse parked/return checks. Symmetric parking
-       arcs use the uniquely clear dotted entrance. The northbound aisle exit,
-       zero-end-curvature left turn and westbound alignment tail form one
-       continuous path; fresh multi-frame lane confirmation transfers control
-       while the robot is still moving on that straight tail. -->
+  <!-- Two nonparallel fixed-sign faces register parking_local in odom before
+       the ordered gate opens. The same frozen transform moves every route,
+       bay ROI, paint edge and handoff bound. At the stopped decision pose live
+       Mid-360 points choose the empty side. Common forward/reverse paths and
+       rectangular sweeps execute the manoeuvre, then fresh rolling-lane
+       confirmation transfers control on the westbound tail. -->
   <group if="$(arg parking_mission)">
     <node pkg="custom_autorace_bringup" type="parking_mission_controller.py"
           name="parking_mission_controller" output="screen">
@@ -171,13 +175,11 @@
     </node>
   </group>
 
-  <!-- Parking leaves lane control while moving on the westbound alignment tail.
-       The ordered
-       zigzag gate then projects the live odom pose onto one texture-surveyed
-       C2 path, tracks a
-       lookahead target with curvature pre-braking, and checks the swept
-       footprint against both actual paint edges. It returns cmd_vel through a
-       verified low-speed lane join before the following U-turn. -->
+  <!-- Parking leaves lane control while moving on the westbound alignment
+       tail. Ordered zigzag arm matches several rolling camera curves to one
+       uniquely observable station on the surveyed C2 spline; Gazebo uses the
+       verified odom-aligned identity. The common follower and swept validator
+       then execute the suffix and return through a verified low-speed join. -->
   <group if="$(arg zigzag_mission)">
     <node pkg="custom_autorace_bringup" type="zigzag_mission_controller.py"
           name="zigzag_mission_controller" output="screen">
@@ -186,10 +188,11 @@
     </node>
   </group>
 
-  <!-- In the ordered level-crossing zone, inspect the raw LiDAR scan for the
-       broad horizontal barrier. Only after consecutive closed observations
-       does this controller take cmd_vel ownership and hold zero; consecutive
-       clear scans return ownership to normal lane following. -->
+  <!-- Ordered arm first registers a source-stamped crossing landmark and
+       publishes ready. Gazebo alone may use the moving-bar registration
+       fallback because its model has no fixed posts. A closed broad bar is
+       approached to the LiDAR stop distance, then fresh stopped odometry and
+       closed/open confirmations control ownership. -->
   <group if="$(arg level_crossing_mission)">
     <node pkg="custom_autorace_bringup"
           type="level_crossing_lidar_controller.py"
@@ -197,14 +200,16 @@
           required="true">
       <rosparam command="load"
                 file="$(find custom_autorace_bringup)/config/level_crossing_mission_gazebo.yaml"/>
+      <param name="level_crossing/topics/odometry"
+             value="$(arg mission_odometry_topic)"/>
     </node>
   </group>
 
-  <!-- The ordered tunnel gate transfers cmd_vel before camera lanes disappear.
-       AMCL anchors map-to-odom once at the entrance so unmapped obstacles
-       cannot pull the mission frame. Timestamped Mid-360 returns build a
-       separate dynamic layer, and forward Hybrid A* sweeps the measured
-       asymmetric footprint around obstacles whose positions were not mapped. -->
+  <!-- Ordered arm fits the longitudinal wall, perpendicular entrance wall and
+       endpoints to freeze the tunnel template in odom. Ready follows only in
+       the entry window after a source-stamped static sweep. Timestamped
+       Mid-360 returns build a separate dynamic layer, and forward Hybrid A*
+       sweeps the measured asymmetric footprint around unmapped obstacles. -->
   <group if="$(arg tunnel_mission)">
     <node pkg="custom_autorace_bringup"
           type="tunnel_mission_controller.py"
@@ -215,8 +220,9 @@
     </node>
   </group>
 
-  <!-- Compare AMCL's global map pose with fixed course polygons, activate only
-       the next expected mission, and publish per-mission enable gates. -->
+  <!-- Arm only the next ordered mission. A fresh generation-matched ready
+       Header opens its enable gate; optional AMCL polygons are diagnostics and
+       never activate a mission. -->
   <node if="$(arg mission_zones)"
         pkg="custom_autorace_bringup" type="mission_zone_manager.py"
         name="mission_zone_manager" output="screen">
@@ -224,7 +230,9 @@
               file="$(arg mission_zone_config)"/>
   </node>
 
-  <!-- AMCL is the only map -> odom authority and consumes the raw scan. -->
+  <!-- AMCL remains the map -> odom localization authority and consumes the raw
+       scan, but mission activation and local path registration do not use its
+       polygons. -->
   <include if="$(arg localization)"
            file="$(find custom_autorace_bringup)/launch/amcl_localization.launch">
     <arg name="map_file" value="$(arg map_file)"/>

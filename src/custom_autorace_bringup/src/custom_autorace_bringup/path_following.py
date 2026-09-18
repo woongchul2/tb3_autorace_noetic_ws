@@ -226,6 +226,14 @@ class CommonPath:
     # normal no-contact rule, while a positive value permits that much signed
     # line overlap and can taper to zero as the common follower converges.
     line_overlap_allowance: np.ndarray = 0.0
+    # Extra one-sigma radial pose uncertainty at each path point.  The scalar
+    # ``PathSafety.margins.localization`` remains the vehicle-wide base error;
+    # this profile carries the station-dependent part produced by a frozen
+    # SE(2) registration (notably the yaw-error lever arm).  Keeping it on the
+    # executable path lets the same full-route and reaction/braking sweeps use
+    # the correct uncertainty instead of charging every point the route-end
+    # maximum.
+    localization_uncertainty: np.ndarray = 0.0
     frame_id: str = "map"
     goal_tolerance: GoalTolerance = field(default_factory=GoalTolerance)
     safety: PathSafety = field(default_factory=PathSafety)
@@ -301,6 +309,19 @@ class CommonPath:
         ):
             raise ValueError(
                 "line overlap allowance must be finite and non-negative"
+            )
+        self.localization_uncertainty = _as_vector(
+            self.localization_uncertainty,
+            count,
+            "localization_uncertainty",
+            default=0.0,
+        )
+        if (
+            not np.all(np.isfinite(self.localization_uncertainty))
+            or np.any(self.localization_uncertainty < 0.0)
+        ):
+            raise ValueError(
+                "localization uncertainty must be finite and non-negative"
             )
         if not isinstance(self.frame_id, str) or not self.frame_id:
             raise ValueError("path frame_id must be a non-empty string")
@@ -461,6 +482,35 @@ def build_speed_profile(station, curvature, profile):
             apply_longitudinal_limits()
         else:
             raise ValueError("speed profile cannot satisfy angular acceleration")
+
+        # Pairwise scaling is deliberately conservative because reducing one
+        # point can make either neighbouring yaw-rate transition worse. It can
+        # therefore push a smooth feasible profile below the configured
+        # moving floor. Restore only the complete candidate when every
+        # longitudinal and angular constraint still holds; sharp paths whose
+        # geometry truly requires a lower speed keep the conservative result.
+        point_floor = np.minimum(profile.minimum_velocity, physical_limit)
+        restored = np.maximum(speed, point_floor)
+        longitudinal = (
+            restored[1:] ** 2 - restored[:-1] ** 2
+        ) / (2.0 * segment)
+        duration = 2.0 * segment / np.maximum(
+            restored[:-1] + restored[1:], 1e-9
+        )
+        angular = np.abs(np.diff(restored * curvature)) / np.maximum(
+            duration, 1e-9
+        )
+        tolerance = 1.0 + 1e-9
+        if (
+            np.all(longitudinal <= profile.linear_acceleration * tolerance)
+            and np.all(
+                -longitudinal <= profile.linear_deceleration * tolerance
+            )
+            and np.all(
+                angular <= profile.angular_acceleration * tolerance
+            )
+        ):
+            speed = restored
     return speed
 
 
@@ -558,6 +608,7 @@ def path_from_xy(
     feedforward_scale=1.0,
     initial_line_overlap_allowance=0.0,
     line_egress_distance=0.0,
+    localization_uncertainty=0.0,
     final_heading=None,
     goal_tolerance=None,
     safety=None,
@@ -602,6 +653,7 @@ def path_from_xy(
         direction=directions,
         feedforward_scale=feedforward_scale,
         line_overlap_allowance=line_overlap_allowance,
+        localization_uncertainty=localization_uncertainty,
         frame_id=frame_id,
         goal_tolerance=goal_tolerance or GoalTolerance(),
         safety=safety or PathSafety(),
@@ -619,6 +671,7 @@ def path_from_poses(
     feedforward_scale=1.0,
     initial_line_overlap_allowance=0.0,
     line_egress_distance=0.0,
+    localization_uncertainty=0.0,
     goal_tolerance=None,
     safety=None,
     label="",
@@ -664,6 +717,7 @@ def path_from_poses(
             initial_line_overlap_allowance,
             line_egress_distance,
         ),
+        localization_uncertainty=localization_uncertainty,
         frame_id=frame_id,
         goal_tolerance=goal_tolerance or GoalTolerance(),
         safety=safety or PathSafety(),
@@ -763,6 +817,7 @@ class RigidTransform2D:
             direction=path.direction.copy(),
             feedforward_scale=path.feedforward_scale.copy(),
             line_overlap_allowance=path.line_overlap_allowance.copy(),
+            localization_uncertainty=path.localization_uncertainty.copy(),
             frame_id=self.target_frame,
             goal_tolerance=path.goal_tolerance,
             safety=safety,
@@ -977,6 +1032,7 @@ class PathSample:
     direction: int
     feedforward_scale: float
     line_overlap_allowance: float
+    localization_uncertainty: float
 
 
 def sample_path(path, station):
@@ -997,6 +1053,7 @@ def sample_path(path, station):
             int(path.direction[0]),
             float(path.feedforward_scale[0]),
             float(path.line_overlap_allowance[0]),
+            float(path.localization_uncertainty[0]),
         )
     left = right - 1
     span = float(path.station[right] - path.station[left])
@@ -1021,6 +1078,10 @@ def sample_path(path, station):
         float(
             (1.0 - fraction) * path.line_overlap_allowance[left]
             + fraction * path.line_overlap_allowance[right]
+        ),
+        float(
+            (1.0 - fraction) * path.localization_uncertainty[left]
+            + fraction * path.localization_uncertainty[right]
         ),
     )
 
@@ -2111,6 +2172,7 @@ class SweptFootprintValidator:
         safety=None,
         live_obstacles=None,
         line_overlap_allowances=None,
+        localization_uncertainties=None,
     ):
         safety = safety or PathSafety()
         if live_obstacles is None:
@@ -2128,13 +2190,6 @@ class SweptFootprintValidator:
             obstacle_points = np.vstack(
                 (safety.fixed_obstacles, live_obstacles)
             )
-        uncertainty = safety.margins.uncertainty
-        line_footprint = self.footprint.expanded(
-            safety.margins.line + uncertainty
-        )
-        obstacle_footprint = self.footprint.expanded(
-            safety.margins.obstacle + uncertainty
-        )
         poses = [Pose2D.from_value(pose) for pose in poses]
         if not poses:
             return ValidationResult(False, samples=0, first_unsafe_distance=0.0)
@@ -2151,6 +2206,40 @@ class SweptFootprintValidator:
             raise ValueError(
                 "line overlap allowances must be finite and non-negative"
             )
+        localization = _as_vector(
+            localization_uncertainties,
+            len(poses),
+            "localization_uncertainties",
+            default=0.0,
+        )
+        if (
+            not np.all(np.isfinite(localization))
+            or np.any(localization < 0.0)
+        ):
+            raise ValueError(
+                "localization uncertainties must be finite and non-negative"
+            )
+
+        def expanded_footprints(extra_localization):
+            uncertainty = (
+                safety.margins.uncertainty + float(extra_localization)
+            )
+            return (
+                self.footprint.expanded(safety.margins.line + uncertainty),
+                self.footprint.expanded(
+                    safety.margins.obstacle + uncertainty
+                ),
+            )
+
+        if np.all(localization == localization[0]):
+            constant_footprints = expanded_footprints(localization[0])
+
+            def pose_footprints(_extra_localization):
+                return constant_footprints
+
+        else:
+            pose_footprints = expanded_footprints
+
         minimum_line = math.inf
         minimum_obstacle = math.inf
         minimum_map = math.inf
@@ -2158,6 +2247,7 @@ class SweptFootprintValidator:
         first_unsafe = math.inf
         samples = 0
         previous = poses[0]
+        line_footprint, obstacle_footprint = pose_footprints(localization[0])
         line, obstacle, map_clearance = self._pose_metrics(
             previous,
             safety,
@@ -2215,7 +2305,14 @@ class SweptFootprintValidator:
                     (1.0 - fraction) * allowances[first_index]
                     + fraction * allowances[second_index]
                 )
+                localization_uncertainty = float(
+                    (1.0 - fraction) * localization[first_index]
+                    + fraction * localization[second_index]
+                )
                 travelled += math.hypot(pose.x - previous.x, pose.y - previous.y)
+                line_footprint, obstacle_footprint = pose_footprints(
+                    localization_uncertainty
+                )
                 line, obstacle, map_clearance = self._pose_metrics(
                     pose,
                     safety,
@@ -2267,26 +2364,40 @@ class SweptFootprintValidator:
             stations.append(end_station)
         poses = []
         line_overlap_allowances = []
+        localization_uncertainties = []
         for station in stations:
             sample = sample_path(path, station)
             poses.append(Pose2D(sample.x, sample.y, sample.heading))
             line_overlap_allowances.append(sample.line_overlap_allowance)
+            localization_uncertainties.append(
+                sample.localization_uncertainty
+            )
         return self.validate_poses(
             poses,
             safety or path.safety,
             live_obstacles=live_obstacles,
             line_overlap_allowances=line_overlap_allowances,
+            localization_uncertainties=localization_uncertainties,
         )
 
     @staticmethod
-    def _line_allowances_for_poses(path, poses, path_index):
-        """Project a runtime sweep onto its non-regressing safety envelope."""
-        if np.all(path.line_overlap_allowance == path.line_overlap_allowance[0]):
-            # Most production paths use one immutable allowance (usually zero).
-            # Projection cannot change that value, so avoid repeating a nearest-
-            # path search for every reaction and braking sample.
-            return [float(path.line_overlap_allowance[0])] * len(poses)
+    def _safety_profiles_for_poses(path, poses, path_index):
+        """Project a runtime sweep onto non-regressing path safety profiles."""
+        constant_allowance = np.all(
+            path.line_overlap_allowance == path.line_overlap_allowance[0]
+        )
+        constant_localization = np.all(
+            path.localization_uncertainty == path.localization_uncertainty[0]
+        )
+        if constant_allowance and constant_localization:
+            # Most paths use immutable zeros. Avoid repeating a nearest-path
+            # search for every reaction and braking sample in that common case.
+            return (
+                [float(path.line_overlap_allowance[0])] * len(poses),
+                [float(path.localization_uncertainty[0])] * len(poses),
+            )
         allowances = []
+        localization = []
         previous_index = max(0, min(int(path_index), path.size - 1))
         previous_station = _minimum_station_for_index(path, previous_index)
         for pose in poses:
@@ -2300,9 +2411,10 @@ class SweptFootprintValidator:
             )
             sample = sample_path(path, projection.station)
             allowances.append(sample.line_overlap_allowance)
+            localization.append(sample.localization_uncertainty)
             previous_index = projection.path_index
             previous_station = projection.station
-        return allowances
+        return allowances, localization
 
     @staticmethod
     def _advance_unicycle(pose, linear, angular, elapsed):
@@ -2383,15 +2495,37 @@ class SweptFootprintValidator:
         safety=None,
         live_obstacles=None,
     ):
-        """Sweep reaction arcs and an error-preserving complete stop region."""
+        """Sweep reaction arcs and an error-preserving complete stop region.
+
+        ``pose`` is the measured robot pose, so its lateral/heading tracking
+        error is already present in the swept rectangle.  The path-wide
+        tracking tube is therefore deliberately removed here while line,
+        obstacle, localization, and pointwise registration margins remain.
+        Applying the tracking tube again would count the same realized error
+        twice and can deadlock a physically clear robot at zero speed.
+        """
         pose = Pose2D.from_value(pose)
         speed = abs(float(linear_velocity))
         reaction_time = max(0.0, float(reaction_time))
         deceleration = max(1e-6, float(linear_deceleration))
-        braking_distance = speed * speed / (2.0 * deceleration) + max(
-            0.0, float(distance_margin)
-        )
+        braking_distance = speed * speed / (2.0 * deceleration)
+        # A stopping reserve extends a real moving stop; it is not a virtual
+        # translation that a stationary robot must somehow complete.
+        if speed > 1e-9:
+            braking_distance += max(0.0, float(distance_margin))
         safety = safety or path.safety
+        if safety.margins.tracking > 0.0:
+            safety = PathSafety(
+                line_boundaries=safety.line_boundaries,
+                map_boundaries=safety.map_boundaries,
+                fixed_obstacles=safety.fixed_obstacles,
+                margins=SafetyMargins(
+                    line=safety.margins.line,
+                    obstacle=safety.margins.obstacle,
+                    localization=safety.margins.localization,
+                    tracking=0.0,
+                ),
+            )
         results = []
         angular_velocities = self._reaction_angular_samples(
             angular_velocities, reaction_time, linear_velocity
@@ -2466,14 +2600,16 @@ class SweptFootprintValidator:
                     )
                 )
             sequence = reaction_sequence + braking_sequence[1:]
+            allowances, localization = self._safety_profiles_for_poses(
+                path, sequence, path_index
+            )
             results.append(
                 self.validate_poses(
                     sequence,
                     safety,
                     live_obstacles=live_obstacles,
-                    line_overlap_allowances=self._line_allowances_for_poses(
-                        path, sequence, path_index
-                    ),
+                    line_overlap_allowances=allowances,
+                    localization_uncertainties=localization,
                 )
             )
         return combine_validation_results(results)
@@ -2494,6 +2630,8 @@ class SweptFootprintValidator:
         live_obstacles=None,
         tracking=None,
         route_safety=None,
+        route_validation=None,
+        route_start_station=None,
     ):
         """Return the only speed reduction justified by a predicted contact.
 
@@ -2504,6 +2642,14 @@ class SweptFootprintValidator:
         path, but ``safety`` always remains authoritative for the actual
         reaction and complete-stop sweep.  Omitting ``route_safety`` preserves
         the original behavior and uses ``safety`` for both sweeps.
+
+        A controller with faster pose updates than its route sweep may pass a
+        previously calculated ``route_validation`` and its absolute
+        ``route_start_station``.  The unsafe distance is then translated to
+        the current station while the complete-stop sweep is still calculated
+        from the current measured pose.  This separates the comparatively
+        expensive nominal-route check from the latency-critical stop check
+        without duplicating either safety formula in a mission controller.
         """
         pose = Pose2D.from_value(pose)
         desired_speed = max(0.0, float(desired_speed))
@@ -2532,13 +2678,47 @@ class SweptFootprintValidator:
                 raise ValueError("tracking station is outside the path")
             start_station = clamp(tracking.station, 0.0, path.length)
             stopping_path_index = tracking.path_index
-        route = self.validate_path(
-            path,
-            start_station=start_station,
-            maximum_distance=lookahead_distance,
-            safety=safety if route_safety is None else route_safety,
-            live_obstacles=live_obstacles,
-        )
+        if route_validation is None:
+            if route_start_station is not None:
+                raise ValueError(
+                    "route_start_station requires route_validation"
+                )
+            route = self.validate_path(
+                path,
+                start_station=start_station,
+                maximum_distance=lookahead_distance,
+                safety=safety if route_safety is None else route_safety,
+                live_obstacles=live_obstacles,
+            )
+        else:
+            if not isinstance(route_validation, ValidationResult):
+                raise TypeError("route_validation must be a ValidationResult")
+            if route_start_station is None:
+                raise ValueError(
+                    "route_validation requires route_start_station"
+                )
+            route_start_station = float(route_start_station)
+            if not (
+                math.isfinite(route_start_station)
+                and 0.0 <= route_start_station <= path.length + 1e-9
+            ):
+                raise ValueError("route_start_station is outside the path")
+            if start_station + 1e-9 < route_start_station:
+                raise ValueError(
+                    "current station precedes the prevalidated route"
+                )
+            station_advance = max(0.0, start_station - route_start_station)
+            first_unsafe = route_validation.first_unsafe_distance
+            if math.isfinite(first_unsafe):
+                first_unsafe = max(0.0, first_unsafe - station_advance)
+            route = ValidationResult(
+                route_validation.safe,
+                route_validation.minimum_line_clearance,
+                route_validation.minimum_obstacle_clearance,
+                route_validation.minimum_map_clearance,
+                first_unsafe,
+                route_validation.samples,
+            )
         speed_limit = desired_speed
         if not route.safe:
             usable_distance = max(
@@ -2836,6 +3016,44 @@ class PathFollower:
 
         self._record_tracking(tracking)
         return tracking
+
+    def stopping_angular_velocities(
+        self, tracking, linear_velocity, measured_angular_velocity=0.0
+    ):
+        """Return the physically reachable yaw-rate envelope for a stop sweep.
+
+        ``TrackingResult.angular_velocity`` is calculated at
+        ``target_speed``.  A reaction sweep, however, advances with the
+        measured/current linear speed.  Reusing the unscaled target rate at
+        zero speed invents an in-place rotation that the curvature-preserving
+        command limiter will never request and can permanently prevent a safe
+        restart.  The prospective rate below uses the same curvature and
+        physical angular/lateral caps as :func:`limit_velocity_command`.
+        """
+        if not isinstance(tracking, TrackingResult):
+            raise TypeError("tracking must be a TrackingResult")
+        linear_speed = abs(float(linear_velocity))
+        measured_angular = float(measured_angular_velocity)
+        if not (
+            math.isfinite(linear_speed) and math.isfinite(measured_angular)
+        ):
+            raise ValueError("stopping velocities must be finite")
+        reference_speed = max(1e-9, abs(tracking.target_speed))
+        curvature = tracking.angular_velocity / reference_speed
+        prospective = clamp(
+            linear_speed * curvature,
+            -self.config.maximum_angular_velocity,
+            self.config.maximum_angular_velocity,
+        )
+        if linear_speed > 1e-9:
+            prospective = clamp(
+                prospective,
+                -self.config.maximum_lateral_acceleration / linear_speed,
+                self.config.maximum_lateral_acceleration / linear_speed,
+            )
+        else:
+            prospective = 0.0
+        return (measured_angular, self.last_angular, prospective)
 
     def command(
         self,

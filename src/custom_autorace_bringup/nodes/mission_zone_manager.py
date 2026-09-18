@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Gate ordered AutoRace missions with polygons in fixed course coordinates."""
+"""Arm ordered missions and open their gate only from fresh readiness."""
 
 import math
 import threading
+import time
 
 import rospy
 import tf2_ros
 from geometry_msgs.msg import Point, PoseStamped
-from std_msgs.msg import Bool, String, UInt8
+from std_msgs.msg import Bool, Header, String, UInt8
 from visualization_msgs.msg import Marker, MarkerArray
 
 from custom_autorace_bringup.mission_zone import (
@@ -25,8 +26,60 @@ def yaw_from_quaternion(quaternion):
 
 
 class MissionZoneManager:
+    @staticmethod
+    def _wait_for_initial_ros_time():
+        """Return a non-zero startup stamp before publishing a sim arm.
+
+        Under ``/use_sim_time`` ROS time remains zero until Gazebo publishes
+        the first ``/clock`` sample.  Publishing the latched arm before that
+        point can permanently strand a controller which rejects a zero stamp
+        and de-duplicates later messages by generation.  Wall-clock sleep is
+        intentional here because ``rospy.sleep`` also waits on simulated time.
+        """
+        now = rospy.Time.now()
+        if now != rospy.Time() or not bool(
+            rospy.get_param("/use_sim_time", False)
+        ):
+            return now
+
+        rospy.loginfo("Waiting for the first valid simulated-time sample")
+        while not rospy.is_shutdown():
+            time.sleep(0.01)
+            now = rospy.Time.now()
+            if now != rospy.Time():
+                return now
+        raise rospy.ROSInterruptException(
+            "shutdown while waiting for valid simulated time"
+        )
+
     def __init__(self):
         get = rospy.get_param
+        activation_mode = str(get("~activation/mode", "ready")).strip().lower()
+        if activation_mode != "ready":
+            raise rospy.ROSInitException(
+                "mission activation/mode must be 'ready'"
+            )
+        self.ready_max_age = float(get("~activation/ready_max_age", 0.50))
+        self.ready_future_tolerance = float(
+            get("~activation/ready_future_tolerance", 0.05)
+        )
+        self.ready_before_arm_tolerance = float(
+            get("~activation/ready_before_arm_tolerance", 0.0)
+        )
+        if (
+            not math.isfinite(self.ready_max_age)
+            or self.ready_max_age <= 0.0
+            or not math.isfinite(self.ready_future_tolerance)
+            or self.ready_future_tolerance < 0.0
+            or not math.isfinite(self.ready_before_arm_tolerance)
+            or self.ready_before_arm_tolerance < 0.0
+        ):
+            raise rospy.ROSInitException(
+                "mission readiness timing parameters are invalid"
+            )
+        self.polygon_diagnostics_enabled = bool(
+            get("~diagnostics/polygons_enabled", False)
+        )
         self.map_frame = str(get("~pose/map_frame", "map"))
         self.base_frame = str(get("~pose/base_frame", "base_footprint"))
         self.transform_timeout = max(
@@ -48,7 +101,11 @@ class MissionZoneManager:
                 )
             seen.add(name)
             values = configured.get(name, {})
-            polygon = self._parse_polygon(name, values.get("polygon", []))
+            polygon = (
+                self._parse_polygon(name, values.get("polygon", []))
+                if self.polygon_diagnostics_enabled
+                else []
+            )
             completion_topic = str(values.get("completion_topic", "")).strip()
             if not completion_topic:
                 raise rospy.ROSInitException(
@@ -58,6 +115,12 @@ class MissionZoneManager:
                 {
                     "name": name,
                     "polygon": polygon,
+                    "arm_topic": str(
+                        values.get("arm_topic", "/mission/arm/" + name)
+                    ),
+                    "ready_topic": str(
+                        values.get("ready_topic", "/mission/ready/" + name)
+                    ),
                     "gate_topic": str(
                         values.get("gate_topic", "/mission/enable/" + name)
                     ),
@@ -85,7 +148,9 @@ class MissionZoneManager:
                 }
             )
 
-        configured_regions = get("~regions", {})
+        configured_regions = (
+            get("~regions", {}) if self.polygon_diagnostics_enabled else {}
+        )
         if configured_regions is None:
             configured_regions = {}
         if not isinstance(configured_regions, dict):
@@ -125,59 +190,90 @@ class MissionZoneManager:
             for region in self.regions
         ]
 
+        now = self._wait_for_initial_ros_time().to_sec()
+        # A per-process nonce protects against a latched readiness message from
+        # a manager that restarted within the configured freshness window.
+        initial_generation = int(time.monotonic_ns() & 0xFFFFFFFF) or 1
         self.sequence = MissionZoneSequence(
             self.missions,
-            enter_margin=self.enter_margin,
+            armed_at=now,
+            initial_generation=initial_generation,
         )
         self.lock = threading.RLock()
         self.last_reported_zone = None
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        self.tf_buffer = None
+        self.tf_listener = None
+        self.signal_timer = None
+        if self.polygon_diagnostics_enabled:
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
         self.state_pub = rospy.Publisher(
-            "/mission/state", String, queue_size=1, latch=True
+            # Preserve the immediate READY -> ACTIVE pair for diagnostics.
+            "/mission/state", String, queue_size=4, latch=True
         )
         self.current_pub = rospy.Publisher(
             "/mission/current", String, queue_size=1, latch=True
         )
-        self.detected_zone_pub = rospy.Publisher(
-            "/mission/detected_zone", String, queue_size=1, latch=True
-        )
         self.index_pub = rospy.Publisher(
             "/mission/sequence_index", UInt8, queue_size=1, latch=True
         )
-        self.pose_pub = rospy.Publisher(
-            "/mission/map_pose", PoseStamped, queue_size=1
-        )
-        self.marker_pub = rospy.Publisher(
-            "/mission/zones", MarkerArray, queue_size=1, latch=True
-        )
+        self.detected_zone_pub = None
+        self.pose_pub = None
+        self.marker_pub = None
+        if self.polygon_diagnostics_enabled:
+            self.detected_zone_pub = rospy.Publisher(
+                "/mission/detected_zone", String, queue_size=1, latch=True
+            )
+            self.pose_pub = rospy.Publisher(
+                "/mission/map_pose", PoseStamped, queue_size=1
+            )
+            self.marker_pub = rospy.Publisher(
+                "/mission/zones", MarkerArray, queue_size=1, latch=True
+            )
+        self.arm_publishers = {
+            mission["name"]: rospy.Publisher(
+                mission["arm_topic"], Header, queue_size=1, latch=True
+            )
+            for mission in self.missions
+        }
         self.gate_publishers = {
             mission["name"]: rospy.Publisher(
                 mission["gate_topic"], Bool, queue_size=1, latch=True
             )
             for mission in self.missions
         }
-        self.clearance_publishers = {
-            mission["name"]: rospy.Publisher(
-                mission["clearance_topic"], Bool, queue_size=1
-            )
-            for mission in self.missions
-        }
-        self.inside_publishers = {
-            mission["name"]: rospy.Publisher(
-                mission["inside_topic"], Bool, queue_size=1
-            )
-            for mission in self.missions
-        }
-        self.region_inside_publishers = {
-            region["name"]: rospy.Publisher(
-                region["inside_topic"], Bool, queue_size=1
-            )
-            for region in self.regions
-        }
+        self.clearance_publishers = {}
+        self.inside_publishers = {}
+        self.region_inside_publishers = {}
+        if self.polygon_diagnostics_enabled:
+            self.clearance_publishers = {
+                mission["name"]: rospy.Publisher(
+                    mission["clearance_topic"], Bool, queue_size=1
+                )
+                for mission in self.missions
+            }
+            self.inside_publishers = {
+                mission["name"]: rospy.Publisher(
+                    mission["inside_topic"], Bool, queue_size=1
+                )
+                for mission in self.missions
+            }
+            self.region_inside_publishers = {
+                region["name"]: rospy.Publisher(
+                    region["inside_topic"], Bool, queue_size=1
+                )
+                for region in self.regions
+            }
 
         for mission in self.missions:
+            rospy.Subscriber(
+                mission["ready_topic"],
+                Header,
+                self.ready_callback,
+                callback_args=mission,
+                queue_size=1,
+            )
             rospy.Subscriber(
                 mission["completion_topic"],
                 String,
@@ -186,22 +282,27 @@ class MissionZoneManager:
                 queue_size=1,
             )
 
-        self.signal_timer = rospy.Timer(
-            rospy.Duration(self.signal_period), self.signal_timer_callback
-        )
+        if self.polygon_diagnostics_enabled:
+            self.signal_timer = rospy.Timer(
+                rospy.Duration(self.signal_period), self.signal_timer_callback
+            )
         self._publish_status()
         for publisher in self.inside_publishers.values():
             publisher.publish(Bool(data=False))
         for publisher in self.region_inside_publishers.values():
             publisher.publish(Bool(data=False))
-        self._publish_markers()
         rospy.loginfo(
-            "Mission zones ready: %s (AMCL TF=%s -> %s)",
+            "Mission readiness sequence armed: %s",
             " -> ".join(mission_names),
-            self.map_frame,
-            self.base_frame,
         )
-        if self.regions:
+        if self.polygon_diagnostics_enabled:
+            self._publish_markers()
+            rospy.loginfo(
+                "Optional polygon diagnostics use AMCL TF=%s -> %s",
+                self.map_frame,
+                self.base_frame,
+            )
+        if self.polygon_diagnostics_enabled and self.regions:
             rospy.loginfo(
                 "Auxiliary map regions ready: %s",
                 ", ".join(region["name"] for region in self.regions),
@@ -289,19 +390,15 @@ class MissionZoneManager:
         self._publish_pose(stamp, map_x, map_y, map_yaw)
         self._publish_zone_signals(distances)
         self._publish_region_signals(region_distances)
-        previous_state = self.sequence.state
-        previous_name = self.sequence.current_name
-        current_distance = distances.get(previous_name)
-        changed = self.sequence.update_signed_distance(current_distance)
-        if changed:
-            self._log_transition(previous_state, previous_name)
-            self._publish_status()
-            self._publish_markers()
 
     def _publish_zone_signals(self, distances):
         for mission in self.missions:
             self.inside_publishers[mission["name"]].publish(
-                Bool(data=distances[mission["name"]] >= 0.0)
+                Bool(
+                    data=is_inside_with_margin(
+                        distances[mission["name"]], self.enter_margin
+                    )
+                )
             )
             self.clearance_publishers[mission["name"]].publish(
                 Bool(
@@ -322,13 +419,74 @@ class MissionZoneManager:
                 )
             )
 
+    def ready_callback(self, message, mission):
+        """Accept only a fresh readiness sample for the current arm token."""
+        received_at = rospy.Time.now().to_sec()
+        ready_at = message.stamp.to_sec()
+        with self.lock:
+            previous_state = self.sequence.state
+            previous_name = self.sequence.current_name
+            problem = self.sequence.readiness_problem(
+                mission["name"],
+                message.seq,
+                ready_at,
+                received_at,
+                self.ready_max_age,
+                self.ready_future_tolerance,
+                self.ready_before_arm_tolerance,
+            )
+            if problem is not None:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Rejected mission readiness on %s: %s",
+                    mission["ready_topic"],
+                    problem,
+                )
+                return
+            if message.frame_id != mission["name"]:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Rejected readiness frame '%s' on %s; expected '%s'",
+                    message.frame_id,
+                    mission["ready_topic"],
+                    mission["name"],
+                )
+                return
+            if not self.sequence.mark_ready(
+                mission["name"],
+                message.seq,
+                ready_at,
+                received_at,
+                self.ready_max_age,
+                self.ready_future_tolerance,
+                self.ready_before_arm_tolerance,
+            ):
+                return
+            self._log_transition(previous_state, previous_name)
+            # Publish READY with every enable false before the only legal
+            # transition that may open the current mission gate.
+            self._publish_status()
+            previous_state = self.sequence.state
+            previous_name = self.sequence.current_name
+            if not self.sequence.activate_current(received_at):
+                rospy.logfatal(
+                    "Fresh readiness could not activate mission '%s'",
+                    mission["name"],
+                )
+                return
+            self._log_transition(previous_state, previous_name)
+            self._publish_status()
+            self._publish_markers()
+
     def completion_callback(self, message, mission):
         if message.data not in mission["completion_values"]:
             return
         with self.lock:
             previous_state = self.sequence.state
             previous_name = self.sequence.current_name
-            if not self.sequence.complete_current(mission["name"]):
+            if not self.sequence.complete_current(
+                mission["name"], rospy.Time.now().to_sec()
+            ):
                 return
             self._log_transition(previous_state, previous_name)
             self._publish_status()
@@ -345,11 +503,28 @@ class MissionZoneManager:
 
     def _publish_status(self):
         current = self.sequence.current_name
+        now = rospy.Time.now()
         self.state_pub.publish(String(data=self.sequence.state))
         self.current_pub.publish(String(data=current))
         self.index_pub.publish(UInt8(data=min(255, self.sequence.index)))
-        for name, publisher in self.gate_publishers.items():
-            publisher.publish(
+        armed_states = (
+            MissionZoneSequence.ARMED,
+            MissionZoneSequence.READY,
+            MissionZoneSequence.ACTIVE,
+        )
+        for mission in self.missions:
+            name = mission["name"]
+            armed = name == current and self.sequence.state in armed_states
+            arm = Header()
+            arm.seq = self.sequence.generation if armed else 0
+            arm.stamp = (
+                rospy.Time.from_sec(self.sequence.armed_at)
+                if armed and self.sequence.armed_at is not None
+                else now
+            )
+            arm.frame_id = name
+            self.arm_publishers[name].publish(arm)
+            self.gate_publishers[name].publish(
                 Bool(
                     data=(
                         self.sequence.state == MissionZoneSequence.ACTIVE
@@ -369,6 +544,8 @@ class MissionZoneManager:
         self.pose_pub.publish(message)
 
     def _publish_markers(self):
+        if not self.polygon_diagnostics_enabled:
+            return
         now = rospy.Time.now()
         markers = MarkerArray()
         active_name = self.sequence.current_name

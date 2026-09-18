@@ -13,7 +13,11 @@ if str(PACKAGE_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PYTHON_DIR))
 
 from custom_autorace_bringup.level_crossing import (
+    CrossingFrame,
     HorizontalBarrierConfig,
+    compose_pose_2d,
+    crossing_progress,
+    crossing_rear_clearance,
     detect_horizontal_barrier,
 )
 
@@ -171,6 +175,36 @@ class LevelCrossingGeometryTest(unittest.TestCase):
             self.config.half_width = 0.8
         with self.assertRaises(FrozenInstanceError):
             detection.forward_distance = 0.1
+
+    def test_crossing_progress_is_invariant_to_global_longitudinal_shift(self):
+        for shift in (0.0, 4.75):
+            frame = CrossingFrame(shift + 1.20, -0.40, math.radians(20.0))
+            pose = compose_pose_2d(
+                (frame.x, frame.y, frame.yaw),
+                (0.35, 0.08, math.radians(3.0)),
+            )
+            self.assertAlmostEqual(crossing_progress(frame, pose), 0.35)
+
+    def test_rear_clearance_uses_oriented_asymmetric_rectangle(self):
+        frame = CrossingFrame(2.0, 3.0, math.pi / 2.0)
+        pose = compose_pose_2d(
+            (frame.x, frame.y, frame.yaw),
+            (0.40, 0.0, math.radians(10.0)),
+        )
+        clearance = crossing_rear_clearance(
+            frame,
+            pose,
+            front=0.07,
+            rear=0.12,
+            half_width=0.09,
+            padding=0.01,
+        )
+        expected = (
+            0.40
+            - 0.13 * math.cos(math.radians(10.0))
+            - 0.10 * math.sin(math.radians(10.0))
+        )
+        self.assertAlmostEqual(clearance, expected)
 
 
 if __name__ == "__main__":

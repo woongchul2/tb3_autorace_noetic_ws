@@ -1,12 +1,16 @@
-# Gazebo parking route. The AMCL map pose and local odometry are sampled
-# together at takeover to freeze the surveyed map route in the odom frame.
+# Gazebo parking route. Two nonparallel faces of the fixed parking signs
+# register this mission-local survey into odom before the ordered gate opens.
 parking:
+  mission_name: parking
   topics:
     scan: /scan_mid360_raw
-    # The integrated Gazebo launch selects the diff-drive plugin's signed
-    # odometry. AMCL supplies the frozen map-to-odom alignment below.
+    # The integrated Gazebo launch selects the diff-drive plugin's signed odom.
     odometry: /odom
+    # Kept only for localization diagnostics. It cannot activate, align, or
+    # complete parking.
     map_pose: /mission/map_pose
+    arm: /mission/arm/parking
+    ready: /mission/ready/parking
     zone_gate: /mission/enable/parking
     # Consume the rolling CommonPath result from the lane controller. Parking
     # must not repeat a separate near-row two-line validity calculation.
@@ -14,18 +18,17 @@ parking:
     manual_stop: /control/manual_stop
     cmd_vel: /cmd_vel
     diagnostics: /parking/diagnostics
+    planned_path_left: /parking/planned_path/left
+    planned_path_right: /parking/planned_path/right
     lane_speed_limit: /control/max_vel
     lane_control_service: /control/lane_mission_handoff
     lane_stop_service: /control/lane_following
 
-  # Surveyed geometry is expressed in map coordinates. Freeze map-to-odom once
-  # at parking takeover so later AMCL corrections cannot move an active path.
+  # Every route, ROI, paint edge, fixture and handoff box below is expressed in
+  # this parking-local survey frame. One frozen local->odom transform moves all
+  # of it together when the preceding connecting straight changes length.
   route:
-    odom_aligned: false
-    # The official-start AMCL-to-odom anchor places this surveyed centre about
-    # 14 mm east in Gazebo physics.  Bias the single straight aisle route west
-    # so the first zero-linear spin clears the occupied Burger's low wheel,
-    # which is below the 2-D LiDAR scan plane.
+    frame_id: parking_local
     aisle_x: 0.5000
     # The westbound straight and complete forward-left entry sweep clear both
     # solid paint and the two fixed parking signs with the measured footprint.
@@ -33,26 +36,19 @@ parking:
     # enough heading error to stop at 29--33% of TURN_IN.  The new curve keeps
     # positive stopping-sweep clearance under the same actuator limits.
     entry_y: 1.7425
-    # The lane controller has already centered the robot in this westbound
-    # corridor. Project only an outlying AMCL lateral sample into the measured
-    # executable band before freezing map-to-odom; this removes run-to-run
-    # localization bias without a pose gate, extra stop, or corrective move.
-    entry_anchor_min_y: 1.7425
-    entry_anchor_max_y: 1.7580
     # Drive to one central stopped scan pose, select the empty bay, and rotate
     # in place there. This removes the second branch-specific positioning move.
     decision_y: 0.6920
-    # Start the final left turn slightly west of the aisle centre. This gives
-    # the asymmetric rear enough room to sweep past the finite vertical paint
-    # endpoint while avoiding the pivot-like former 75 mm quarter circle.
-    # A zero-curvature quintic reaches the first zigzag straight, then a
-    # westbound tail settles lateral/yaw error before the moving lane handoff.
-    zigzag_turn_start_x: 0.4960
+    # Use one common zero-curvature quarter-turn for both parking entry and
+    # the final left turn.  The west-shifted final placement balances the exact
+    # texture clearance at the finite vertical paint endpoint; its shortened
+    # westbound tail preserves the surveyed lane-handoff terminal pose.
+    zigzag_turn_start_x: 0.4930
     zigzag_straight_y: 1.7500
-    zigzag_turn_offset: 0.1500
-    zigzag_turn_tangent: 0.0550
-    zigzag_alignment_tail: 0.1200
-    zigzag_turn_samples: 101
+    turn_curve_offset: 0.1950
+    turn_curve_tangent: 0.0780
+    turn_curve_samples: 101
+    zigzag_alignment_tail: 0.0720
     # Gently move directly from the central return pose to the west-shifted
     # turn start; both endpoint curvatures stay zero. A 0.10 tangent ratio
     # keeps the +/-8 mm, +/-1 degree start envelope inside the aisle without
@@ -60,20 +56,74 @@ parking:
     zigzag_approach_tangent_ratio: 0.10
     left_park_x: 0.7741
     right_park_x: 0.2275
-    entry_curve_offset: 0.1950
-    entry_curve_tangent: 0.0780
-    entry_curve_samples: 101
     path_sample_spacing: 0.004
     approach_heading_deg: 180.0
     aisle_heading_deg: -90.0
     outgoing_heading_deg: 90.0
     zigzag_heading_deg: 180.0
 
-  # At the stopped decision pose, scan returns are projected with the current
-  # AMCL pose into these two map rectangles. This selects the bay but does not
-  # update the fixed route anchor. The dynamic parked TurtleBot is absent from
-  # the static map. Exactly one ROI must be occupied and the other clear for
-  # three independent scans.
+  registration:
+    local_frame: parking_local
+    # The lower long face of the horizontal sign and the east long face of the
+    # upright sign are the first surfaces visible from the westbound approach
+    # and provide full x/y/yaw observability. A single face is
+    # intentionally insufficient, because translation along it is unknown.
+    # Derive the faces from fixed_obstacles/rectangles so registration and
+    # swept collision safety cannot drift into two coordinate definitions.
+    use_fixed_obstacle_faces: true
+    fixed_obstacle_visible_faces: [minimum_y, maximum_x]
+    # Named-face assignment, finite endpoint checks and the frozen course yaw
+    # remove the former equal-length ambiguity. Two independent transforms are
+    # sufficient and leave the full lane-to-path braking distance available.
+    confirmation_scans: 2
+    # Sparse 360-ray Gazebo returns can expose the same two short faces about
+    # one second apart while the robot advances. They are already projected at
+    # their source-stamped odom poses, so retain a consistent two-scan set
+    # across that interval instead of requiring adjacent LaserScan frames.
+    confirmation_max_gap: 1.20
+    maximum_position_delta: 0.020
+    maximum_heading_delta_deg: 2.0
+    position_inlier_threshold: 0.025
+    heading_inlier_threshold_deg: 8.0
+    source_max_age: 0.35
+    future_tolerance: 0.05
+    ready_republish_period: 0.15
+    maximum_range: 1.20
+    cluster_gap: 0.035
+    line_residual: 0.008
+    minimum_segment_points: 4
+    minimum_segment_length: 0.045
+    maximum_segment_length: 0.18
+    ambiguity_score: 0.002
+    ambiguity_position: 0.04
+    ambiguity_heading_deg: 2.0
+    # Sparse 360-ray/20 mm Gazebo returns can rotate a 47 mm visible fragment
+    # by more than 30 degrees. Classify each named face by its nearer approach
+    # axis, then freeze AMCL map->odom orientation (falling back to the initial
+    # approach orientation) while the two measured face-line offsets solve x/y.
+    face_heading_weight: 0.0
+    face_heading_class_tolerance_deg: 40.0
+    face_heading_class_margin_deg: 10.0
+    face_longitudinal_tolerance: 0.025
+    # Disambiguate the two equal-length perpendicular fixtures with the known
+    # westbound approach corridor, without using a global map pose.
+    robot_local_bounds: [0.62, 1.60, 1.55, 1.90]
+    robot_heading_tolerance_deg: 25.0
+    # The entry plane is the start of the fixed quarter turn. Registration can
+    # freeze earlier; ready is emitted only in this moving lead window after
+    # both entry CommonPaths pass their complete swept-footprint checks.
+    entry_plane_point: [0.6950, 1.7425]
+    entry_plane_normal: [-1.0, 0.0]
+    entry_lead_minimum: -0.50
+    # The 125 mm late edge still covers the measured 0.28 -> 0.09 m/s slew at
+    # 0.35 m/s^2 plus the ordered-gate callback interval.
+    entry_lead_maximum: -0.125
+    entry_lead_lateral_tolerance: 0.06
+    entry_lead_heading_tolerance_deg: 15.0
+
+  # At the stopped decision pose, source-stamped scans are projected through
+  # the same frozen local transform into these two rectangles. The parked
+  # TurtleBot only selects the empty side and remains a live obstacle.
   occupancy:
     left_roi: [0.60, 0.88, 0.65, 0.92]
     right_roi: [0.10, 0.38, 0.65, 0.92]
@@ -96,7 +146,7 @@ parking:
     half_width: 0.0903
     line_margin: 0.009
 
-  # Fixed Gazebo collision rectangles expressed in the surveyed map frame.
+  # Fixed Gazebo collision rectangles expressed in parking_local.
   # The selected parked TurtleBot is deliberately not listed here: its random
   # left/right placement is supplied by the synchronized live LiDAR points.
   fixed_obstacles:
@@ -149,9 +199,10 @@ parking:
     # zigzag handoff; its path profile still slows independently for curvature.
     post_completion_velocity_cap: 0.10
     approach_velocity: 0.09
-    # Request up to 0.20 m/s on straight parking motion. The common profile
-    # still limits each short segment by the physical 0.03 m/s^2 accel/decel;
-    # curves and lane handoffs retain their separately verified lower bounds.
+    # Request up to 0.20 m/s on straight parking motion. This same common
+    # cruise cap applies while the armed aligner confirms its two LiDAR scans,
+    # retaining the measured entry braking distance without changing cmd_vel
+    # ownership. Each short segment remains acceleration/deceleration limited.
     aisle_velocity: 0.20
     parking_velocity: 0.20
     reverse_velocity: 0.20
@@ -177,6 +228,13 @@ parking:
     # the initial 9 mm planning margin. Accept a still-separated footprint;
     # below 9 mm the generated path may not reduce that initial clearance.
     entry_handoff_minimum_clearance: 0.003
+    # Ready commits one fully swept connector.  At takeover the current pose
+    # is projected onto that same CommonPath instead of rebuilding a short,
+    # line-cutting suffix.  Official-start run 12 measured 12.3 mm and 5.0 deg
+    # at the first capped command; these bounds retain a measured margin while
+    # rejecting a base that is no longer on the prepared route.
+    entry_handoff_maximum_path_error: 0.015
+    entry_handoff_maximum_heading_error_deg: 8.0
     entry_curve_end_position_tolerance: 0.004
     entry_curve_end_crossing_max_distance: 0.015
     # Official-start run 10 reached the connector terminal only 2.6 mm past
@@ -201,11 +259,13 @@ parking:
     path_heading_gain: 0.35
     path_search_back: 3
     path_search_ahead: 0.30
-    # Gazebo wheelAcceleration=1 rad/s^2 and the measured 0.04775 m wheel
-    # radius limit straight-line body acceleration to about 0.048 m/s^2.
-    # Staying below that limit makes straight braking reproducible.
+    # gazebo_ros_diff_drive applies wheelAcceleration to wheel tangential
+    # speed in m/s, so the configured 1.0 permits 1.0 m/s^2 per wheel.  A
+    # 0.13 m/s^2 body stop plus the worst 0.55 rad/s^2 yaw ramp requests only
+    # about 0.171 m/s^2 at either wheel.  Keep acceleration gentle, but brake
+    # later and harder so the short parking legs do not crawl to their stops.
     linear_acceleration: 0.03
-    linear_deceleration: 0.03
+    linear_deceleration: 0.13
     angular_acceleration: 0.55
     # These are local odom tolerances. The narrow-route value applies to
     # aisle, parking and reverse stages; arcs use distance plus heading.
@@ -217,9 +277,8 @@ parking:
     overshoot_tolerance: 0.05
     pose_confirmation_samples: 2
     prepare_settle_time: 0.10
-    # AMCL uses the heading threshold for the stopped decision scan and both
-    # thresholds for coarse parked/return checks. Local odom tracks the route
-    # through the map-to-odom transform frozen at mission takeover.
+    # The stopped decision scan uses the local heading threshold. Both values
+    # also annotate optional AMCL checkpoint drift without affecting control.
     checkpoint_position_tolerance: 0.045
     checkpoint_heading_tolerance_deg: 10.0
 
@@ -241,15 +300,13 @@ parking:
     live_validation_distance: 0.15
     require_live_scan: true
     # Project each scan with an interpolated odom pose that brackets the scan
-    # acquisition stamp. The same bound pairs the AMCL map pose with raw odom
-    # when the immutable route transform is latched. Unbracketed samples are
-    # rejected instead of being combined with a newer robot pose.
+    # acquisition stamp. Unbracketed samples are rejected.
     scan_odom_sync_tolerance: 0.05
     odom_history_duration: 1.0
     pending_scan_limit: 4
     swept_translation_step: 0.004
     swept_heading_step_deg: 1.0
-    map_bounds: [-2.0, 2.0, -2.0, 2.0]
+    local_bounds: [-2.0, 2.0, -2.0, 2.0]
 
   # Count 0.30 s of fresh, already validated rolling CommonPath results only
   # after the smooth turn has reached its westbound alignment tail. Parking
@@ -259,11 +316,11 @@ parking:
   # of braking past it. A valid one-boundary camera path is sufficient.
   rejoin:
     lane_path_timeout: 0.35
-    # The turn ends at x=0.346 and its straight tail ends at x=0.226. Begin
-    # accepting frames only after x=0.310 so yaw/lateral alignment occurs
+    # The turn ends at x=0.298 and its straight tail ends at x=0.226. Begin
+    # accepting frames only after x=0.298 so yaw/lateral alignment occurs
     # while moving on the straight, with the endpoint still inside the box.
     handoff_min_x: 0.215
-    handoff_max_x: 0.310
+    handoff_max_x: 0.298
     handoff_min_y: 1.738
     handoff_max_y: 1.762
     handoff_heading_tolerance_deg: 5.0
@@ -283,15 +340,17 @@ parking:
     complete_max_y: 1.762
     # Speed-adaptive camera lookahead begins steering toward the first zigzag
     # bend while the base is still inside this straight completion window.
-    # Official LEFT run 17 measured 5.2--5.7 deg with nine consecutive safe
-    # frames here. Keep 6 deg below Zigzag's independent 7 deg path-acquisition
-    # limit while accepting that intentional preview steering.
-    complete_heading_tolerance_deg: 6.0
+    # The shared turn's official-start run reached 6.25 deg while the camera
+    # lookahead was already steering into the first bend.  Use Zigzag's same
+    # independently validated 7 deg acquisition envelope so those safe rolling
+    # frames complete the ownership transfer instead of timing out afterward.
+    complete_heading_tolerance_deg: 7.0
     complete_confirmation_frames: 9
     complete_confirmation_max_gap: 0.20
     complete_timeout: 8.0
 
   timeouts:
+    # AMCL freshness is used only by optional diagnostic checkpoint logs.
     map_pose: 0.35
     odometry: 0.35
     scan: 0.35
