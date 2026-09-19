@@ -6,7 +6,7 @@ course-left. Collision checks use the robot's oriented, asymmetric rectangle;
 a circumscribed circle would incorrectly close the narrow legal passages.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import numpy as np
@@ -165,7 +165,9 @@ class CourseSplinePlanner:
         entry_connector_minimum_join_distance=0.12,
         entry_connector_maximum_join_distance=0.32,
         entry_connector_join_step=0.02,
-        entry_connector_tangent_ratios=(
+        entry_connector_start_tangent_ratios=(0.12, 0.15, 0.18),
+        entry_connector_end_tangent_ratios=(0.24, 0.30, 0.36),
+        entry_connector_symmetric_tangent_ratios=(
             0.12,
             0.14,
             0.16,
@@ -267,21 +269,46 @@ class CourseSplinePlanner:
             self.sample_spacing, float(entry_connector_join_step)
         )
         try:
-            tangent_ratios = tuple(
-                float(value) for value in entry_connector_tangent_ratios
+            start_tangent_ratios = tuple(
+                float(value)
+                for value in entry_connector_start_tangent_ratios
+            )
+            end_tangent_ratios = tuple(
+                float(value)
+                for value in entry_connector_end_tangent_ratios
+            )
+            symmetric_tangent_ratios = tuple(
+                float(value)
+                for value in entry_connector_symmetric_tangent_ratios
             )
         except (TypeError, ValueError) as error:
             raise ValueError(
                 "entry connector tangent ratios must be finite and positive"
             ) from error
-        if not tangent_ratios or not all(
-            math.isfinite(value) and value > 0.0 for value in tangent_ratios
+        if (
+            not start_tangent_ratios
+            or not end_tangent_ratios
+            or not symmetric_tangent_ratios
+            or not all(
+                math.isfinite(value) and value > 0.0
+                for value in (
+                    start_tangent_ratios
+                    + end_tangent_ratios
+                    + symmetric_tangent_ratios
+                )
+            )
         ):
             raise ValueError(
                 "entry connector tangent ratios must be finite and positive"
             )
-        self.entry_connector_tangent_ratios = tuple(
-            dict.fromkeys(tangent_ratios)
+        self.entry_connector_start_tangent_ratios = tuple(
+            dict.fromkeys(start_tangent_ratios)
+        )
+        self.entry_connector_end_tangent_ratios = tuple(
+            dict.fromkeys(end_tangent_ratios)
+        )
+        self.entry_connector_symmetric_tangent_ratios = tuple(
+            dict.fromkeys(symmetric_tangent_ratios)
         )
         self._template = None
         self._nominal_obstacles = np.empty((0, 2), dtype=np.float64)
@@ -648,10 +675,18 @@ class CourseSplinePlanner:
         )
 
     def _entry_tangent_pairs(self):
-        """Use balanced controls so the bounded search stays sensor-rate safe."""
+        """Return the deduplicated asymmetric and legacy symmetric lattice."""
 
-        ratios = self.entry_connector_tangent_ratios
-        return tuple((ratio, ratio) for ratio in ratios)
+        asymmetric = tuple(
+            (start_ratio, end_ratio)
+            for start_ratio in self.entry_connector_start_tangent_ratios
+            for end_ratio in self.entry_connector_end_tangent_ratios
+        )
+        symmetric = tuple(
+            (ratio, ratio)
+            for ratio in self.entry_connector_symmetric_tangent_ratios
+        )
+        return tuple(dict.fromkeys(asymmetric + symmetric))
 
     def _entry_connector_passes_sampled_boundaries(self, connector, path):
         """Cheap necessary boundary check before the exact swept validator.
@@ -672,16 +707,67 @@ class CourseSplinePlanner:
             safety.margins.line + uncertainty
         )
         boundaries = (*safety.line_boundaries, *safety.map_boundaries)
-        for point, yaw in zip(points, heading):
-            pose = Pose2D(float(point[0]), float(point[1]), float(yaw))
-            if any(
-                boundary.clearance(pose, footprint) <= 0.0
-                for boundary in boundaries
-            ):
-                return False
+        local_x = np.asarray(
+            [-footprint.rear, -footprint.rear, footprint.front, footprint.front],
+            dtype=np.float64,
+        )
+        local_y = np.asarray(
+            [
+                -footprint.half_width,
+                footprint.half_width,
+                -footprint.half_width,
+                footprint.half_width,
+            ],
+            dtype=np.float64,
+        )
+        for boundary in boundaries:
+            if isinstance(boundary, StraightCorridorBoundary):
+                boundary_cosine = math.cos(boundary.heading)
+                boundary_sine = math.sin(boundary.heading)
+                dx = points[:, 0] - boundary.origin[0]
+                dy = points[:, 1] - boundary.origin[1]
+                center_progress = boundary_cosine * dx + boundary_sine * dy
+                center_lateral = -boundary_sine * dx + boundary_cosine * dy
+                relative_heading = heading - boundary.heading
+                cosine = np.cos(relative_heading)[:, None]
+                sine = np.sin(relative_heading)[:, None]
+                progress_offset = cosine * local_x - sine * local_y
+                lateral_offset = sine * local_x + cosine * local_y
+                minimum_progress = center_progress + np.min(
+                    progress_offset, axis=1
+                )
+                maximum_progress = center_progress + np.max(
+                    progress_offset, axis=1
+                )
+                active = (
+                    maximum_progress >= boundary.minimum_progress
+                ) & (minimum_progress <= boundary.maximum_progress)
+                minimum_lateral = center_lateral + np.min(
+                    lateral_offset, axis=1
+                )
+                maximum_lateral = center_lateral + np.max(
+                    lateral_offset, axis=1
+                )
+                clearance = np.minimum(
+                    minimum_lateral - boundary.right,
+                    boundary.left - maximum_lateral,
+                )
+                if np.any(active & (clearance <= 0.0)):
+                    return False
+                continue
+            for point, yaw in zip(points, heading):
+                pose = Pose2D(float(point[0]), float(point[1]), float(yaw))
+                if boundary.clearance(pose, footprint) <= 0.0:
+                    return False
         return True
 
-    def _join_entry_connector(self, path, connector, join_index):
+    def _join_entry_connector(
+        self,
+        path,
+        connector,
+        join_index,
+        connected_speed=None,
+    ):
         """Join one G2 connector to a suffix and rebuild common metadata."""
 
         points, heading, curvature = connector
@@ -697,7 +783,11 @@ class CourseSplinePlanner:
             y=np.concatenate((points[:, 1], path.y[tail])),
             heading=np.concatenate((heading, path.heading[tail])),
             curvature=np.concatenate((curvature, path.curvature[tail])),
-            speed=0.0,
+            speed=(
+                0.0
+                if connected_speed is None
+                else np.asarray(connected_speed, dtype=np.float64)
+            ),
             direction=np.concatenate(
                 (
                     np.full(count, direction, dtype=np.int8),
@@ -727,11 +817,8 @@ class CourseSplinePlanner:
             safety=path.safety,
             label=path.label + "_entry_connected",
         )
-        connected.speed = build_speed_profile(
-            connected.station,
-            connected.curvature * connected.feedforward_scale,
-            self.speed_profile,
-        )
+        if connected_speed is not None and connected.speed.size != connected.size:
+            raise ValueError("connected speed profile size differs from geometry")
         connected.curvature_variation = float(
             np.sum(np.abs(np.diff(connected.curvature)))
         )
@@ -747,25 +834,130 @@ class CourseSplinePlanner:
         )
         return connected
 
-    def connect_entry(self, path, start_heading, start_curvature=0.0):
+    def _connected_entry_profile(
+        self,
+        connected,
+        start_linear_velocity,
+        exit_linear_velocity,
+    ):
+        """Profile the connector and suffix as one executable route.
+
+        Profiling only the connector can leave its final speed below the first
+        suffix speed.  Concatenating those independent profiles creates an
+        instantaneous linear/yaw acceleration at the seam and also makes the
+        candidate time optimistic.  The common profile below applies every
+        bound across that seam and the complete remaining route.
+        """
+
+        entry_velocity = min(
+            self.speed_profile.cruise_velocity,
+            max(self.speed_profile.minimum_velocity, start_linear_velocity),
+        )
+        exit_velocity = min(
+            self.speed_profile.cruise_velocity,
+            max(self.speed_profile.minimum_velocity, exit_linear_velocity),
+        )
+        nominal_floor = min(
+            self.speed_profile.minimum_velocity,
+            entry_velocity,
+            exit_velocity,
+        )
+        profile = replace(
+            self.speed_profile,
+            minimum_velocity=nominal_floor,
+            entry_velocity=entry_velocity,
+            exit_velocity=exit_velocity,
+        )
+        speed = build_speed_profile(
+            connected.station,
+            connected.curvature,
+            profile,
+        )
+        segment = np.diff(connected.station)
+        expected_time = float(
+            np.sum(
+                2.0
+                * segment
+                / np.maximum(speed[:-1] + speed[1:], 1e-6)
+            )
+        )
+        return speed, expected_time
+
+    def _entry_connector_profile(
+        self,
+        connector,
+        path,
+        join_index,
+        start_linear_velocity,
+    ):
+        """Profile one G2 edge against the already-profiled suffix state."""
+
+        points, _, curvature = connector
+        station = np.concatenate(
+            ([0.0], np.cumsum(np.hypot(np.diff(points[:, 0]), np.diff(points[:, 1]))))
+        )
+        entry_velocity = min(
+            self.speed_profile.cruise_velocity,
+            max(self.speed_profile.minimum_velocity, start_linear_velocity),
+        )
+        exit_velocity = float(path.speed[join_index])
+        nominal_floor = min(
+            self.speed_profile.minimum_velocity,
+            entry_velocity,
+            exit_velocity,
+        )
+        profile = replace(
+            self.speed_profile,
+            minimum_velocity=nominal_floor,
+            entry_velocity=entry_velocity,
+            exit_velocity=exit_velocity,
+        )
+        speed = build_speed_profile(station, curvature, profile)
+        segment = np.diff(station)
+        expected_time = float(
+            np.sum(
+                2.0
+                * segment
+                / np.maximum(speed[:-1] + speed[1:], 1e-6)
+            )
+        )
+        return speed, expected_time
+
+    def connect_entry(
+        self,
+        path,
+        start_heading,
+        start_linear_velocity,
+        start_angular_velocity,
+    ):
         """Connect the live body pose to a safe downstream spline pose.
 
         ``path`` is already expressed relative to the live body position by
         :meth:`plan`.  Every candidate therefore starts at exactly ``(0, 0)``
-        with the measured heading.  A candidate is executable only when its
-        curvature stays inside the configured yaw/lateral limits and its
-        rectangle sweep is safe.  The controller freezes the returned complete
-        connector-plus-suffix path and performs the one authoritative full
-        sweep (including the seam) before readiness.  No direct two-point or
-        lateral-jump fallback is retained.
+        with the measured heading and measured ``v, w`` curvature. Every
+        bounded asymmetric G2 candidate receives the same runtime acceleration
+        profile. The minimum-time candidate whose exact rectangle sweep is
+        safe is returned; the controller then freezes and validates the full
+        connector-plus-suffix route before readiness.
         """
 
         if not isinstance(path, CommonPath) or path.size < 3:
             return None
         start_heading = float(start_heading)
-        start_curvature = float(start_curvature)
-        if not all(math.isfinite(value) for value in (start_heading, start_curvature)):
+        start_linear_velocity = float(start_linear_velocity)
+        start_angular_velocity = float(start_angular_velocity)
+        if not all(
+            math.isfinite(value)
+            for value in (
+                start_heading,
+                start_linear_velocity,
+                start_angular_velocity,
+            )
+        ):
             return None
+        if start_linear_velocity <= 0.0:
+            return None
+        start_curvature = start_angular_velocity / start_linear_velocity
         maximum_curvature = min(
             self.maximum_angular_velocity / self.minimum_velocity,
             self.maximum_lateral_acceleration / self.minimum_velocity ** 2,
@@ -787,6 +979,8 @@ class CourseSplinePlanner:
                 join_indexes.append(index)
 
         start_pose = (0.0, 0.0, start_heading)
+        candidates = []
+        tail_metrics = {}
         for join_index in join_indexes:
             end_pose = (
                 float(path.x[join_index]),
@@ -810,20 +1004,10 @@ class CourseSplinePlanner:
                         end_ratio * chord,
                         self.sample_spacing,
                     )
-                    connector_path = CommonPath(
-                        x=connector[0][:, 0],
-                        y=connector[0][:, 1],
-                        heading=connector[1],
-                        curvature=connector[2],
-                        direction=int(path.direction[join_index]),
-                        frame_id=path.frame_id,
-                        safety=path.safety,
-                        label="obstacle_entry_connector",
-                    )
                 except ValueError:
                     continue
                 if (
-                    float(np.max(np.abs(connector_path.curvature)))
+                    float(np.max(np.abs(connector[2])))
                     > maximum_curvature + 1e-9
                 ):
                     continue
@@ -831,29 +1015,127 @@ class CourseSplinePlanner:
                     connector, path
                 ):
                     continue
-                connector_validation = self.collision_checker.validator.validate_path(
-                    connector_path
-                )
-                if not connector_validation.safe:
+                try:
+                    connector_speed, connector_time = (
+                        self._entry_connector_profile(
+                            connector,
+                            path,
+                            join_index,
+                            start_linear_velocity,
+                        )
+                    )
+                except ValueError:
+                    # This geometry cannot meet the yaw-acceleration limit;
+                    # another member of the bounded lattice still may.
                     continue
+                if join_index not in tail_metrics:
+                    tail_station = path.station[join_index:]
+                    tail_speed = path.speed[join_index:]
+                    tail_metrics[join_index] = (
+                        float(
+                            np.sum(
+                                2.0
+                                * np.diff(tail_station)
+                                / np.maximum(
+                                    tail_speed[:-1] + tail_speed[1:], 1e-6
+                                )
+                            )
+                        ),
+                        float(
+                            np.sum(
+                                np.abs(np.diff(path.curvature[join_index:]))
+                            )
+                        ),
+                    )
+                tail_time, tail_curvature_variation = tail_metrics[join_index]
+                expected_time = connector_time + tail_time
+                curvature_variation = float(
+                    np.sum(np.abs(np.diff(connector[2])))
+                    + tail_curvature_variation
+                )
+                candidates.append(
+                    (
+                        # Independently executable connector/tail profiles are
+                        # an optimistic time bound because their shared seam is
+                        # allowed to change speed instantaneously.  Use it only
+                        # to order and prune candidates; the selected route is
+                        # reprofiled continuously below.
+                        expected_time,
+                        curvature_variation,
+                        float(np.max(np.abs(connector[2]))),
+                        float(path.station[join_index]),
+                        start_ratio,
+                        end_ratio,
+                        connector,
+                        join_index,
+                    )
+                )
 
-                connected = self._join_entry_connector(
-                    path, connector, join_index
+        # Expected executable time is authoritative.  Exact rectangle sweeps
+        # are evaluated in that order, so the first safe result is the global
+        # minimum-time member of the complete bounded lattice; candidates that
+        # rank after it cannot improve the answer and need no expensive sweep.
+        candidates.sort(key=lambda candidate: candidate[:6])
+        best_connected = None
+        best_key = None
+        for candidate in candidates:
+            if (
+                best_connected is not None
+                and candidate[0] >= best_connected.expected_time - 1e-12
+            ):
+                break
+            connector = candidate[6]
+            connector_path = CommonPath(
+                x=connector[0][:, 0],
+                y=connector[0][:, 1],
+                heading=connector[1],
+                curvature=connector[2],
+                direction=int(path.direction[candidate[7]]),
+                frame_id=path.frame_id,
+                safety=path.safety,
+                label="obstacle_entry_connector",
+            )
+            connector_validation = self.collision_checker.validator.validate_path(
+                connector_path
+            )
+            if not connector_validation.safe:
+                continue
+            join_index = candidate[7]
+            connected = self._join_entry_connector(
+                path,
+                connector,
+                join_index,
+            )
+            try:
+                connected_speed, connected_time = self._connected_entry_profile(
+                    connected,
+                    start_linear_velocity,
+                    float(path.speed[-1]),
                 )
-                connected.line_clearance = min(
-                    path.line_clearance,
-                    connector_validation.minimum_line_clearance,
-                )
-                connected.obstacle_clearance = min(
-                    path.obstacle_clearance,
-                    connector_validation.minimum_obstacle_clearance,
-                )
-                connected.map_clearance = min(
-                    path.map_clearance,
-                    connector_validation.minimum_map_clearance,
-                )
-                return connected
-        return None
+            except ValueError:
+                continue
+            connected.speed = connected_speed
+            connected.expected_time = connected_time
+            connected.entry_join_distance = candidate[3]
+            connected.entry_start_tangent_ratio = candidate[4]
+            connected.entry_end_tangent_ratio = candidate[5]
+            connected.line_clearance = min(
+                path.line_clearance,
+                connector_validation.minimum_line_clearance,
+            )
+            connected.obstacle_clearance = min(
+                path.obstacle_clearance,
+                connector_validation.minimum_obstacle_clearance,
+            )
+            connected.map_clearance = min(
+                path.map_clearance,
+                connector_validation.minimum_map_clearance,
+            )
+            key = (connected.expected_time,) + candidate[1:6]
+            if best_key is None or key < best_key:
+                best_connected = connected
+                best_key = key
+        return best_connected
 
     def plan(
         self,

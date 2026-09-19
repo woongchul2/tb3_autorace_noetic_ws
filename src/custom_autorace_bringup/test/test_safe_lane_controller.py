@@ -19,6 +19,8 @@ if str(NODE_DIR) not in sys.path:
 
 import safe_lane_controller as controller_module
 from safe_lane_controller import SafeLaneController
+import zigzag_mission_controller as zigzag_module
+from zigzag_mission_controller import ZigzagMissionController
 from custom_autorace_bringup.path_following import (
     AsymmetricFootprint,
     PathSafety,
@@ -68,6 +70,7 @@ class SafeLaneControllerTest(unittest.TestCase):
         controller.last_command_time = None
         controller.last_command_linear = 0.0
         controller.last_command_angular = 0.0
+        controller.last_lane_speed_limit = 0.0
         controller.control_period = 1.0 / 30.0
         controller.odom_timeout = 0.35
         controller.maximum_pose_stamp_skew = 0.06
@@ -283,7 +286,7 @@ class SafeLaneControllerTest(unittest.TestCase):
         self.assertEqual(controller.last_valid_lane_time, cached_time)
         self.assertEqual(controller.cmd_vel_pub.messages, [])
 
-    def test_handoff_discards_stale_cache_and_watchdog_stops(self):
+    def test_handoff_rejects_stale_cache_without_changing_owner(self):
         controller = self.make_controller()
         self.handoff(controller, False)
         self.append_odom(controller)
@@ -293,12 +296,140 @@ class SafeLaneControllerTest(unittest.TestCase):
         response = self.handoff(controller, True)
         controller.watchdog_callback(None)
 
+        self.assertFalse(response.success)
+        self.assertIn("retryable", response.message)
+        self.assertTrue(controller.mission_has_control)
+        self.assertFalse(controller.enabled)
+        self.assertEqual(controller.cmd_vel_pub.messages, [])
+
+    def test_handoff_rejects_cache_without_one_control_tick_of_freshness(self):
+        controller = self.make_controller()
+        self.handoff(controller, False)
+        self.append_odom(controller, speed=0.07)
+        controller.lane_centerline_callback(self.make_centerline())
+
+        self.advance(
+            controller.lane_timeout - 0.5 * controller.control_period
+        )
+        response = self.handoff(controller, True)
+
+        self.assertFalse(response.success)
+        self.assertTrue(controller.mission_has_control)
+        self.assertFalse(controller.enabled)
+        self.assertEqual(controller.cmd_vel_pub.messages, [])
+
+    def test_accepted_handoff_survives_next_watchdog_and_first_tick_is_positive(self):
+        controller = self.make_controller()
+        self.handoff(controller, False)
+        self.append_odom(controller, speed=0.07, angular=0.11)
+        controller.lane_centerline_callback(self.make_centerline())
+
+        self.advance(
+            controller.lane_timeout - controller.control_period - 1e-4
+        )
+        response = self.handoff(controller, True)
+        self.advance(controller.control_period)
+        controller.watchdog_callback(None)
+
         self.assertTrue(response.success)
-        self.assertIsNone(controller.last_valid_lane_time)
-        self.assertEqual(len(controller.cmd_vel_pub.messages), 1)
-        stop = controller.cmd_vel_pub.messages[0]
-        self.assertAlmostEqual(stop.linear.x, 0.0)
-        self.assertAlmostEqual(stop.angular.z, 0.0)
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(controller.cmd_vel_pub.messages, [])
+
+        self.append_odom(controller, speed=0.07, angular=0.11)
+        controller.lane_centerline_callback(self.make_centerline())
+        self.assertGreater(controller.cmd_vel_pub.messages[-1].linear.x, 0.0)
+
+    def test_retryable_handoff_preserves_positive_seam_until_lane_command(self):
+        controller = self.make_controller()
+        self.handoff(controller, False)
+        self.append_odom(controller, speed=0.07, angular=0.11)
+        controller.lane_centerline_callback(self.make_centerline())
+
+        self.advance(controller.lane_timeout + 0.01)
+        rejected = self.handoff(controller, True)
+        self.assertFalse(rejected.success)
+        self.assertTrue(controller.mission_has_control)
+
+        mission_command = controller_module.Twist()
+        mission_command.linear.x = 0.07
+        mission_command.angular.z = 0.11
+        controller.cmd_vel_pub.publish(mission_command)
+        self.append_odom(controller, speed=0.07, angular=0.11)
+        controller.lane_centerline_callback(self.make_centerline())
+
+        accepted = self.handoff(controller, True)
+        controller.watchdog_callback(None)
+        self.advance(controller.control_period)
+        self.append_odom(controller, speed=0.07, angular=0.11)
+        controller.lane_centerline_callback(self.make_centerline())
+
+        self.assertTrue(accepted.success)
+        self.assertFalse(controller.mission_has_control)
+        self.assertTrue(controller.enabled)
+        self.assertGreaterEqual(len(controller.cmd_vel_pub.messages), 2)
+        self.assertTrue(
+            all(message.linear.x > 0.0 for message in controller.cmd_vel_pub.messages)
+        )
+
+    def test_zigzag_and_lane_retry_the_real_handoff_seam_without_zero(self):
+        lane = self.make_controller()
+        shared_commands = RecordingPublisher()
+        lane.cmd_vel_pub = shared_commands
+        self.handoff(lane, False)
+        self.append_odom(lane, speed=0.07, angular=0.11)
+        lane.lane_centerline_callback(self.make_centerline())
+        self.advance(lane.lane_timeout + 0.01)
+
+        mission = ZigzagMissionController.__new__(ZigzagMissionController)
+        mission.lane_service_name = "/control/lane_mission_handoff"
+        mission.lane_service = lambda enabled: lane.mission_handoff_callback(
+            SimpleNamespace(data=bool(enabled))
+        )
+        mission.mission_has_control = True
+        mission.handoff_ambiguous = False
+        mission.speed_limit_pub = RecordingPublisher()
+        mission.join_velocity_cap = 0.10
+        mission.boundary_confirmation_count = 3
+        mission.last_boundary_confirmation_time = controller_module.rospy.Time.now()
+        mission.confirmation_started_at = None
+        mission.exit_confirmation_started = True
+        mission.join_origin_ready = False
+        mission.state = mission.FOLLOWING
+        mission._set_state = mock.Mock(
+            side_effect=lambda state, now=None: setattr(mission, "state", state)
+        )
+
+        with mock.patch.object(zigzag_module.rospy, "wait_for_service"):
+            self.assertFalse(
+                mission._start_lane_join(controller_module.rospy.Time.now())
+            )
+            self.assertTrue(mission.mission_has_control)
+            self.assertTrue(lane.mission_has_control)
+
+            continued = controller_module.Twist()
+            continued.linear.x = 0.07
+            continued.angular.z = 0.11
+            shared_commands.publish(continued)
+
+            self.append_odom(lane, speed=0.07, angular=0.11)
+            lane.lane_centerline_callback(self.make_centerline())
+            self.assertTrue(
+                mission._start_lane_join(controller_module.rospy.Time.now())
+            )
+
+        self.assertFalse(mission.mission_has_control)
+        self.assertFalse(lane.mission_has_control)
+        lane.watchdog_callback(None)
+        self.advance(lane.control_period)
+        self.append_odom(lane, speed=0.07, angular=0.11)
+        lane.lane_centerline_callback(self.make_centerline())
+
+        self.assertGreaterEqual(len(shared_commands.messages), 2)
+        self.assertTrue(
+            all(message.linear.x > 0.0 for message in shared_commands.messages)
+        )
+        mission._set_state.assert_called_once()
+        self.assertEqual(mission._set_state.call_args.args[0], mission.JOINING_LANE)
 
     def test_manual_stop_is_published_only_by_the_current_owner(self):
         controller = self.make_controller()
@@ -1599,11 +1730,12 @@ class SafeLaneControllerTest(unittest.TestCase):
 
     def test_first_path_after_mission_handoff_starts_from_current_odom(self):
         controller = self.make_controller()
-        controller.enabled = False
-        controller.mission_has_control = True
-        controller.rolling_path = object()
+        self.handoff(controller, False)
+        self.append_odom(controller, speed=0.29, angular=-1.0)
+        controller.lane_centerline_callback(self.make_centerline())
         controller.path_follower.last_linear = 0.29
         controller.path_follower.last_angular = -1.0
+        self.advance(0.01)
         self.append_odom(controller, speed=0.10, angular=0.15)
 
         response = self.handoff(controller, True)

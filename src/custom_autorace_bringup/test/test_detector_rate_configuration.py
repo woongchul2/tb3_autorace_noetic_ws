@@ -176,15 +176,21 @@ class DetectorRateConfigurationTest(unittest.TestCase):
         self.assertEqual(parking["handoff_confirmation_frames"], 9)
         self.assertEqual(parking["complete_confirmation_frames"], 9)
 
-        for filename, root_key in (
-            ("zigzag_mission_gazebo.yaml", "zigzag"),
-            ("tunnel_mission_gazebo.yaml", "tunnel"),
-        ):
-            mission = yaml.safe_load(
-                (config_dir / filename).read_text(encoding="utf-8")
-            )[root_key]["exit"]
-            self.assertEqual(mission["confirmation_frames"], 6)
-            self.assertEqual(mission["join_confirmation_frames"], 6)
+        zigzag = yaml.safe_load(
+            (config_dir / "zigzag_mission_gazebo.yaml").read_text(
+                encoding="utf-8"
+            )
+        )["zigzag"]["exit"]
+        self.assertNotIn("confirmation_frames", zigzag)
+        self.assertEqual(zigzag["join_confirmation_frames"], 6)
+
+        tunnel = yaml.safe_load(
+            (config_dir / "tunnel_mission_gazebo.yaml").read_text(
+                encoding="utf-8"
+            )
+        )["tunnel"]["exit"]
+        self.assertEqual(tunnel["confirmation_frames"], 6)
+        self.assertEqual(tunnel["join_confirmation_frames"], 6)
 
     def test_original_launches_default_to_full_camera_rate(self):
         lane_root = ET.parse(

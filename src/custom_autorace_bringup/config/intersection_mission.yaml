@@ -25,7 +25,6 @@ mission:
   # Maximum delay allowed between publishing ready and receiving enable.
   # Lane control remains authoritative during this interval.
   ready_gate_timeout: 5.0
-  entry_takeover_pose_timeout: 0.75
   # Test hook: 0=read camera, 2=force left, 3=force right.
   forced_direction: 0
   # Registration uses source timestamps, not callback receipt time. AMCL fixes
@@ -157,10 +156,6 @@ mission:
   # and completed three official-start camera-selected runs per direction.
   arc_lane_max_velocity: 0.12
   lane_resume_max_velocity: 0.30
-  # Hold zero across two 20 Hz control ticks and require a newer EKF odometry
-  # sample before anchoring the separately controlled exit path.
-  exit_takeover_settle_time: 0.10
-  exit_takeover_pose_timeout: 0.75
   # Odom is projected onto the complete registered exit branch, so passing its
   # first stored point cannot miss the handoff. This tolerance covers the
   # measured Gazebo odometry/registration lateral error while the validator remains the

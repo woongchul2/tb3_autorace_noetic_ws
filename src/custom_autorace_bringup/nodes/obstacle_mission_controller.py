@@ -800,9 +800,6 @@ class ObstacleMissionController:
         self.boundary_heading_limit = math.radians(
             abs(float(get(p + "course/boundary_max_heading_deg", 12.0)))
         )
-        self.acquisition_heading_tolerance = math.radians(
-            abs(float(get(p + "course/acquisition_max_heading_deg", 12.0)))
-        )
         self.camera_timeout = max(
             0.05, float(get(p + "course/camera_timeout", 0.50))
         )
@@ -956,41 +953,12 @@ class ObstacleMissionController:
         self.control_period = max(
             0.02, float(get(p + "control/period", 0.05))
         )
-        self.entry_velocity_cap = max(
-            0.0, float(get(p + "control/entry_velocity_cap", 0.09))
-        )
-        self.entry_handoff_velocity_tolerance = max(
-            0.0,
-            float(
-                get(
-                    p + "control/entry_handoff_velocity_tolerance",
-                    0.005,
-                )
-            ),
-        )
-        self.entry_projection_position_tolerance = max(
-            0.001,
-            float(
-                get(
-                    p + "control/entry_projection_position_tolerance",
-                    0.015,
-                )
-            ),
-        )
-        self.entry_projection_heading_tolerance = math.radians(
-            abs(
-                float(
-                    get(
-                        p
-                        + "control/entry_projection_heading_tolerance_deg",
-                        8.0,
-                    )
-                )
-            )
-        )
         self.lane_resume_max_velocity = max(
-            self.entry_velocity_cap,
-            float(get(p + "control/lane_resume_max_velocity", 0.30)),
+            0.0, float(get(p + "control/lane_resume_max_velocity", 0.30))
+        )
+        self.lane_handoff_lead_distance = max(
+            0.0,
+            float(get(p + "control/lane_handoff_lead_distance", 0.06)),
         )
         self.maximum_angular_velocity = max(
             0.05, float(get(p + "control/maximum_angular_velocity", 0.85))
@@ -1401,9 +1369,27 @@ class ObstacleMissionController:
             entry_connector_join_step=float(
                 get(p + "planner/entry_connector_join_step", 0.02)
             ),
-            entry_connector_tangent_ratios=get(
-                p + "planner/entry_connector_tangent_ratios",
-                [0.12, 0.14, 0.16, 0.18, 0.20, 0.22, 0.10, 0.24, 0.28],
+            entry_connector_start_tangent_ratios=get(
+                p + "planner/entry_connector_start_tangent_ratios",
+                [0.12, 0.15, 0.18],
+            ),
+            entry_connector_end_tangent_ratios=get(
+                p + "planner/entry_connector_end_tangent_ratios",
+                [0.24, 0.30, 0.36],
+            ),
+            entry_connector_symmetric_tangent_ratios=get(
+                p + "planner/entry_connector_symmetric_tangent_ratios",
+                [
+                    0.12,
+                    0.14,
+                    0.16,
+                    0.18,
+                    0.20,
+                    0.22,
+                    0.10,
+                    0.24,
+                    0.28,
+                ],
             ),
             cruise_velocity=self.cruise_velocity,
             minimum_velocity=self.minimum_velocity,
@@ -1463,7 +1449,6 @@ class ObstacleMissionController:
         self.pending_scans = deque()
         self.scan_generation = 0
         self.last_plan_scan_generation = -1
-        self.last_refresh_scan_generation = -1
 
         self.odom_ready = False
         self.odom_x = self.odom_y = self.odom_yaw = 0.0
@@ -1496,21 +1481,7 @@ class ObstacleMissionController:
         self.observed_lane_angular = 0.0
         self.observed_lane_command_received = None
         self.lane_command_generation = 0
-        self.gate_lane_command_generation = 0
-        self.gate_odom_generation = 0
-        self.gate_lane_command_received = None
-        self.gate_odom_stamp = None
-        self.gate_odom_frame = None
-        self.handoff_refresh_scan_generation = -1
-        self.handoff_refresh_lane_command_generation = -1
-        self.handoff_refresh_odom_generation = -1
-        self.handoff_refresh_lane_command_received = None
-        self.handoff_refresh_odom_stamp = None
-        self.handoff_refresh_odom_frame = None
         self.handoff_service_pending = False
-        self.handoff_takeover_odom_generation = -1
-        self.handoff_takeover_odom_stamp = None
-        self.handoff_takeover_odom_frame = None
 
         self.cmd_pub = rospy.Publisher(self.cmd_vel_topic, Twist, queue_size=1)
         self.emergency_stop_pub = rospy.Publisher(
@@ -1602,18 +1573,6 @@ class ObstacleMissionController:
         self._publish_state()
         rospy.loginfo("Obstacle mission state: %s", state)
 
-    def _reset_handoff_refresh(self):
-        self.handoff_refresh_scan_generation = -1
-        self.handoff_refresh_lane_command_generation = -1
-        self.handoff_refresh_odom_generation = -1
-        self.handoff_refresh_lane_command_received = None
-        self.handoff_refresh_odom_stamp = None
-        self.handoff_refresh_odom_frame = None
-        self.handoff_service_pending = False
-        self.handoff_takeover_odom_generation = -1
-        self.handoff_takeover_odom_stamp = None
-        self.handoff_takeover_odom_frame = None
-
     def _reset_preparation(self, reason):
         self.prepared_generation = 0
         self.prepared_stamp = None
@@ -1625,7 +1584,6 @@ class ObstacleMissionController:
         self.registration_source_stamp = None
         self.last_registration_scan_generation = -1
         self.last_plan_scan_generation = -1
-        self.last_refresh_scan_generation = -1
         self.registration_filter.reset(reason)
         self.committed_path = None
         self.path_follower = PathFollower(self.tracking_config)
@@ -1637,10 +1595,7 @@ class ObstacleMissionController:
         self.line_center_absolute = None
         self.line_observation_progress_absolute = None
         self.line_observation_stamp = None
-        self.gate_lane_command_received = None
-        self.gate_odom_stamp = None
-        self.gate_odom_frame = None
-        self._reset_handoff_refresh()
+        self.handoff_service_pending = False
 
     def arm_callback(self, message):
         """Start one local-registration generation while lane keeps control."""
@@ -1689,24 +1644,7 @@ class ObstacleMissionController:
             was_open = self.zone_gate
             self.zone_gate = requested
             if self.zone_gate and not was_open:
-                # Keep lane control through the speed transition.  Obstacle
-                # may acquire /cmd_vel only after both a lane command and an
-                # odometry sample newer than this edge show the cap has taken
-                # effect.
-                self.gate_lane_command_generation = (
-                    self.lane_command_generation
-                )
-                self.gate_odom_generation = self.odom_generation
-                self.gate_lane_command_received = (
-                    self.observed_lane_command_received
-                )
-                self.gate_odom_stamp = self.odom_stamp
-                self.gate_odom_frame = self.odom_frame
-                self._reset_handoff_refresh()
                 self.start_requested = True
-                self.speed_limit_pub.publish(
-                    Float64(data=self.entry_velocity_cap)
-                )
             elif not self.zone_gate and was_open and self.state != self.COMPLETE:
                 self.revoke_requested = True
 
@@ -2084,7 +2022,16 @@ class ObstacleMissionController:
             rospy.wait_for_service(self.lane_service_name, timeout=2.0)
             response = self.lane_service(enabled)
             if not response.success:
-                raise rospy.ServiceException(response.message)
+                # A negative response is an unambiguous ownership decision.
+                # In particular, lane resume may be retried while this mission
+                # keeps publishing through a temporarily stale camera cache.
+                self.handoff_ambiguous = False
+                rospy.logwarn_throttle(
+                    1.0,
+                    "Obstacle cmd_vel handoff deferred: %s",
+                    response.message,
+                )
+                return False
             self.mission_has_control = not enabled
             self.handoff_ambiguous = False
             return True
@@ -2130,138 +2077,43 @@ class ObstacleMissionController:
         self.last_command_time = None
         self._set_state(self.ACQUIRING)
 
-    def _entry_handoff_input_problem(
-        self,
-        now,
-        minimum_odom_generation=None,
-        minimum_lane_command_generation=None,
-        minimum_odom_stamp=None,
-        minimum_lane_command_received=None,
-        minimum_odom_frame=None,
-    ):
-        """Return why lane control must still retain the obstacle entry."""
+    def _measured_handoff_motion(self):
+        """Return the latest measured motion inside the follower envelope."""
 
-        minimum_odom_generation = (
-            self.gate_odom_generation
-            if minimum_odom_generation is None
-            else int(minimum_odom_generation)
+        config = self.path_follower.config
+        linear = clamp(
+            self.odom_linear_velocity,
+            0.0,
+            config.maximum_linear_velocity,
         )
-        minimum_lane_command_generation = (
-            self.gate_lane_command_generation
-            if minimum_lane_command_generation is None
-            else int(minimum_lane_command_generation)
+        angular = clamp(
+            self.odom_angular_velocity,
+            -config.maximum_angular_velocity,
+            config.maximum_angular_velocity,
         )
-        minimum_odom_stamp = (
-            self.gate_odom_stamp
-            if minimum_odom_stamp is None
-            else minimum_odom_stamp
-        )
-        minimum_lane_command_received = (
-            self.gate_lane_command_received
-            if minimum_lane_command_received is None
-            else minimum_lane_command_received
-        )
-        minimum_odom_frame = (
-            self.gate_odom_frame
-            if minimum_odom_frame is None
-            else str(minimum_odom_frame)
-        )
-        if self.odom_generation <= minimum_odom_generation:
-            return "waiting for newer odometry"
-        if self.lane_command_generation <= minimum_lane_command_generation:
-            return "waiting for a newer lane command"
-        if (
-            minimum_odom_stamp is not None
-            and (
-                self.odom_stamp is None
-                or self.odom_stamp <= minimum_odom_stamp
-            )
-        ):
-            return "waiting for newer source-stamped odometry"
-        if (
-            minimum_odom_frame is not None
-            and self.odom_frame != minimum_odom_frame
-        ):
-            return "odometry frame changed during entry handoff"
-        if (
-            minimum_lane_command_received is not None
-            and (
-                self.observed_lane_command_received is None
-                or self.observed_lane_command_received
-                <= minimum_lane_command_received
-            )
-        ):
-            return "waiting for a lane command received after the handoff edge"
-        if (
-            self.observed_lane_command_received is None
-            or (now - self.observed_lane_command_received).to_sec()
-            > self.odom_timeout
-        ):
-            return "lane command is unavailable or stale"
+        if linear > 1e-9:
+            lateral_limit = config.maximum_lateral_acceleration / linear
+            angular = clamp(angular, -lateral_limit, lateral_limit)
+        return linear, angular
 
-        maximum_handoff_velocity = (
-            self.entry_velocity_cap
-            + self.entry_handoff_velocity_tolerance
-        )
-        if not (
-            -self.entry_handoff_velocity_tolerance
-            <= self.observed_lane_linear
-            <= maximum_handoff_velocity
-        ):
-            return "lane command has not reached the entry velocity cap"
-        if not (
-            -self.entry_handoff_velocity_tolerance
-            <= self.odom_linear_velocity
-            <= maximum_handoff_velocity
-        ):
-            return "measured velocity has not reached the entry velocity cap"
-        if abs(self.observed_lane_angular) > self.maximum_angular_velocity:
-            return "lane angular command exceeds the obstacle limit"
-        return None
-
-    def _activate_after_handoff_service(self, now):
-        """Use only post-service odometry before the first mission command."""
-
-        if self.odom_generation <= self.handoff_takeover_odom_generation:
-            return False
-        if (
-            self.odom_stamp is None
-            or self.handoff_takeover_odom_stamp is None
-            or self.odom_stamp <= self.handoff_takeover_odom_stamp
-        ):
-            return False
-        if self.odom_frame != self.handoff_takeover_odom_frame:
-            self._fail("odometry frame changed after cmd_vel handoff")
-            return False
-        if (now - self.odom_stamp).to_sec() > self.odom_timeout:
-            return False
+    def _activate_after_handoff(self):
+        """Seed the mission follower from measured motion without stopping."""
 
         current_pose = self._current_pose()
+        initial_linear, initial_angular = self._measured_handoff_motion()
         projection = self.path_follower.reset(
             self.committed_path,
             current_pose,
-            initial_linear=0.0,
-            initial_angular=0.0,
+            initial_linear=initial_linear,
+            initial_angular=initial_angular,
         )
-        # Heading is gated immediately before the service call.  While that
-        # call is in flight the lane owner can rotate across the very short,
-        # high-curvature G2 seam even though it remains on the validated
-        # route.  Once ownership is exclusive and velocity is reset to zero,
-        # the common follower and the runtime swept-footprint check own that
-        # heading transient; only lateral departure invalidates the join.
-        if projection.distance > self.entry_projection_position_tolerance:
-            self._fail(
-                "post-service obstacle entry moved outside join tolerance: "
-                "join=%.4fm"
-                % projection.distance
-            )
-            return False
         self.remaining_distance = max(
             0.0, self.committed_path.length - projection.station
         )
-        self.path_follower.diagnostics.commanded_linear = 0.0
-        self.path_follower.diagnostics.commanded_angular = 0.0
-        self.last_command_time = now
+        # The ownership callback publishes immediately. Treat that first
+        # follower step as one normal control period so even a zero measured
+        # seed produces a positive mission command instead of a handoff zero.
+        self.last_command_time = None
         self._set_state(self.AVOIDING)
         return True
 
@@ -2680,33 +2532,15 @@ class ObstacleMissionController:
         self.last_ready_stamp = source_stamp
         return True
 
-    def _attempt_path(self, now, refresh=False):
+    def _attempt_path(self, now):
         if not self._update_local_registration():
             return False
         if not self._entry_is_ready():
             self.planner_status_pub.publish(String(data="APPROACHING_ENTRY"))
             return False
-        if refresh:
-            # The lane controller may move on new odometry while its entry
-            # cap settles. Permit one takeover rebuild from the current scan,
-            # then wait for the next scan if that fresh-pose sweep is rejected.
-            if self.scan_generation == getattr(
-                self, "last_refresh_scan_generation", -1
-            ):
-                return False
-            self.last_refresh_scan_generation = self.scan_generation
-        elif self.scan_generation == self.last_plan_scan_generation:
+        if self.scan_generation == self.last_plan_scan_generation:
             return False
         self.last_plan_scan_generation = self.scan_generation
-        if not refresh:
-            # Full-path planning takes about one LiDAR period.  Begin the lane
-            # controller's bounded deceleration before that sweep, instead of
-            # spending the narrow swept-safe G2 join window at cruise speed.
-            # The gate edge republishes the same cap and records fresh command
-            # and odometry generations before ownership can change.
-            self.speed_limit_pub.publish(
-                Float64(data=self.entry_velocity_cap)
-            )
         heading_error = self._course_heading_error()
         course_coordinates = self._course_template_coordinates()
         if course_coordinates is None:
@@ -2731,17 +2565,18 @@ class ObstacleMissionController:
             return False
 
         current_heading = normalize_angle(-heading_error)
-        start_curvature = 0.0
-        if abs(self.observed_lane_linear) >= self.minimum_velocity:
-            start_curvature = clamp(
-                self.observed_lane_angular / self.observed_lane_linear,
-                -self.maximum_angular_velocity / self.minimum_velocity,
-                self.maximum_angular_velocity / self.minimum_velocity,
-            )
         path = self.spline_planner.connect_entry(
             path,
             current_heading,
-            start_curvature=start_curvature,
+            start_linear_velocity=max(
+                self.minimum_velocity,
+                self.odom_linear_velocity,
+            ),
+            start_angular_velocity=clamp(
+                self.odom_angular_velocity,
+                -self.maximum_angular_velocity,
+                self.maximum_angular_velocity,
+            ),
         )
         if path is None:
             rospy.logwarn_throttle(
@@ -2773,17 +2608,12 @@ class ObstacleMissionController:
             self.planner_status_pub.publish(String(data="PATH_REJECTED"))
             return False
         candidate_follower = PathFollower(self.tracking_config)
+        initial_linear, initial_angular = self._measured_handoff_motion()
         projection = candidate_follower.reset(
             candidate_path,
             self._current_pose(),
-            initial_linear=min(
-                max(0.0, self.observed_lane_linear), self.entry_velocity_cap
-            ),
-            initial_angular=clamp(
-                self.observed_lane_angular,
-                -self.maximum_angular_velocity,
-                self.maximum_angular_velocity,
-            ),
+            initial_linear=initial_linear,
+            initial_angular=initial_angular,
         )
         candidate_follower.update_clearance(fixed_validation)
         candidate_path.line_clearance = fixed_validation.minimum_line_clearance
@@ -2792,9 +2622,8 @@ class ObstacleMissionController:
         )
         candidate_path.map_clearance = fixed_validation.minimum_map_clearance
 
-        # Commit atomically.  If a takeover refresh is rejected, the lane
-        # controller keeps ownership and the pre-gate path remains available
-        # for diagnostics instead of being partially replaced.
+        # Commit the complete pre-gate route atomically; the gate later
+        # projects the newest pose onto this exact swept-valid path.
         self.committed_path = candidate_path
         self.path_follower = candidate_follower
         self.fixed_path_validation = fixed_validation
@@ -2922,11 +2751,6 @@ class ObstacleMissionController:
             )
             maximum_snapshot_advance = (
                 max(
-                    getattr(
-                        self,
-                        "entry_velocity_cap",
-                        follower.config.maximum_linear_velocity,
-                    ),
                     follower.config.maximum_linear_velocity,
                     abs(self.odom_linear_velocity),
                     abs(follower.last_linear),
@@ -3130,15 +2954,17 @@ class ObstacleMissionController:
         self._publish_diagnostics()
         return command
 
-    def _terminal_hold_command(self, now, tracking, pose):
-        """Bounded stop while the AMCL-owned handoff signal catches up."""
+    def _terminal_continuation_command(self, now, tracking, pose):
+        """Keep moving on the validated exit tangent while lane retries."""
         if self.last_command_time is None:
             elapsed = self.control_period
         else:
             elapsed = clamp((now - self.last_command_time).to_sec(), 0.0, 0.15)
-        limited, _tracking, _status = self.path_follower.terminal_hold(
+        limited, _tracking = self.path_follower.terminal_continuation(
             pose,
             elapsed,
+            target_speed=float(self.committed_path.speed[-1]),
+            speed_limit=self.live_speed_limit,
             tracking=tracking,
         )
         self.remaining_distance = self.path_follower.diagnostics.remaining_distance
@@ -3150,13 +2976,15 @@ class ObstacleMissionController:
         return command
 
     def _complete(self):
-        self.planner_status_pub.publish(String(data="COMPLETE"))
         self.speed_limit_pub.publish(Float64(data=self.lane_resume_max_velocity))
         if not self._set_lane_controller(True):
-            self._fail("could not return cmd_vel to lane controller")
-            return
+            if self.handoff_ambiguous:
+                self._fail("could not return cmd_vel to lane controller")
+            return False
+        self.planner_status_pub.publish(String(data="COMPLETE"))
         self._set_state(self.COMPLETE)
         rospy.loginfo("Obstacle course complete; lane controller owns cmd_vel")
+        return True
 
     def control_callback(self, _event):
         handoff_service_requested = False
@@ -3219,121 +3047,21 @@ class ObstacleMissionController:
                 if problem is not None:
                     rospy.logwarn_throttle(
                         1.0,
-                        "Committed obstacle path waits for refreshed input: %s",
+                        "Committed obstacle path waits for fresh safety input: %s",
                         problem,
                     )
                     return
                 if self.mission_has_control:
-                    # The lane publisher is already disabled. Hold zero until
-                    # an odom sample sourced after the service response proves
-                    # that the frozen path is still joined to the real pose.
-                    self._publish_stop()
-                    if not self._activate_after_handoff_service(now):
-                        rospy.logwarn_throttle(
-                            1.0,
-                            "Obstacle holds zero for post-service odometry "
-                            "and entry reprojection",
-                        )
+                    if not self._activate_after_handoff():
                         return
                     now = rospy.Time.now()
                 else:
-                    if (
-                        abs(self._course_heading_error())
-                        > self.acquisition_heading_tolerance
-                    ):
-                        return
-                    handoff_problem = self._entry_handoff_input_problem(now)
-                    if handoff_problem is not None:
-                        rospy.logwarn_throttle(
-                            1.0,
-                            "Obstacle waits for capped post-gate lane motion "
-                            "while lane control remains active: %s",
-                            handoff_problem,
-                        )
-                        return
-                    if self.handoff_refresh_odom_generation < 0:
-                        # The lane has moved while the cap settled. Rebuild the
-                        # G2 connector from this exact post-gate pose and wait
-                        # for newer pose/command callbacks before ownership.
-                        if not self._attempt_path(now, refresh=True):
-                            rospy.logwarn_throttle(
-                                1.0,
-                                "Obstacle waits for a fresh swept-valid entry "
-                                "connector while lane control remains active",
-                            )
-                            return
-                        self.handoff_refresh_scan_generation = self.scan_generation
-                        self.handoff_refresh_lane_command_generation = (
-                            self.lane_command_generation
-                        )
-                        self.handoff_refresh_odom_generation = self.odom_generation
-                        self.handoff_refresh_lane_command_received = (
-                            self.observed_lane_command_received
-                        )
-                        self.handoff_refresh_odom_stamp = self.odom_stamp
-                        self.handoff_refresh_odom_frame = self.odom_frame
-                        return
-
-                    handoff_problem = self._entry_handoff_input_problem(
-                        now,
-                        minimum_odom_generation=(
-                            self.handoff_refresh_odom_generation
-                        ),
-                        minimum_lane_command_generation=(
-                            self.handoff_refresh_lane_command_generation
-                        ),
-                        minimum_odom_stamp=self.handoff_refresh_odom_stamp,
-                        minimum_lane_command_received=(
-                            self.handoff_refresh_lane_command_received
-                        ),
-                        minimum_odom_frame=self.handoff_refresh_odom_frame,
-                    )
-                    if handoff_problem is not None:
-                        rospy.logwarn_throttle(
-                            1.0,
-                            "Obstacle waits for capped post-refresh lane motion "
-                            "while lane control remains active: %s",
-                            handoff_problem,
-                        )
-                        return
-                    current_pose = self._current_pose()
-                    projection = self.path_follower.reset(
-                        self.committed_path,
-                        current_pose,
-                        initial_linear=min(
-                            max(0.0, self.observed_lane_linear),
-                            self.entry_velocity_cap,
-                        ),
-                        initial_angular=clamp(
-                            self.observed_lane_angular,
-                            -self.maximum_angular_velocity,
-                            self.maximum_angular_velocity,
-                        ),
-                    )
-                    join_heading_error = abs(
-                        normalize_angle(projection.heading - current_pose.yaw)
-                    )
-                    if (
-                        projection.distance
-                        > self.entry_projection_position_tolerance
-                        or join_heading_error
-                        > self.entry_projection_heading_tolerance
-                    ):
-                        rospy.logwarn(
-                            "Obstacle refreshed entry moved outside join tolerance: "
-                            "join=%.4fm/%.2fdeg",
-                            projection.distance,
-                            math.degrees(join_heading_error),
-                        )
-                        self._reset_handoff_refresh()
-                        self.planner_status_pub.publish(
-                            String(data="PATH_REJECTED")
-                        )
-                        return
-                    self.remaining_distance = max(
-                        0.0,
-                        self.committed_path.length - projection.station,
-                    )
+                    # The frozen path was generated from the live entry pose,
+                    # validated over the complete rectangle sweep and marked
+                    # ready immediately before the gate. Acquire it directly;
+                    # waiting for a capped lane sample and rebuilding the G2
+                    # seam here can strand the lane owner after its camera
+                    # path has naturally gone stale inside the obstacle zone.
                     self.handoff_service_pending = True
                     handoff_service_requested = True
 
@@ -3344,17 +3072,27 @@ class ObstacleMissionController:
                 if not handoff_succeeded:
                     self._fail("could not acquire cmd_vel control")
                     return
-                # The mission is now the sole publisher. Stop the old lane
-                # command immediately, then require source-stamped odometry
-                # strictly newer than this service response before moving.
-                self._publish_stop()
-                self.handoff_takeover_odom_generation = self.odom_generation
-                self.handoff_takeover_odom_stamp = self.odom_stamp
-                self.handoff_takeover_odom_frame = self.odom_frame
-                self.last_command_time = None
                 if self.revoke_requested:
                     self._revoke()
-            return
+                    return
+                if self.shutting_down:
+                    return
+                if self.manual_stop:
+                    self._publish_stop()
+                    return
+                command_time = rospy.Time.now()
+                if not self._activate_after_handoff():
+                    return
+                # The route passed the complete fixed rectangle sweep only
+                # 0.1 s before the gate. Publish its measured-motion-seeded
+                # first command in the same callback as the ownership service;
+                # live LiDAR/camera stop sweeps resume on the next 20 Hz tick.
+                command = self._common_path_command(command_time)
+                if command is None:
+                    self._fail("prepared obstacle path has no executable command")
+                    return
+                self.cmd_pub.publish(command)
+                return
 
         validated = self._validate_committed_path(now)
         if not validated:
@@ -3387,10 +3125,37 @@ class ObstacleMissionController:
                 tracking_pose, tracking=tracking
             )
             self.remaining_distance = goal.remaining_distance
+            handoff_attempted = False
+            if (
+                goal.remaining_distance <= self.lane_handoff_lead_distance
+                and abs(goal.heading_error)
+                <= self.committed_path.goal_tolerance.heading
+            ):
+                # The final curve is already aligned with the normal camera
+                # lane. Ask the lane controller to take over while this
+                # validated path still has positive distance left, giving a
+                # temporarily stale camera cache several moving retry ticks.
+                if self.state == self.AVOIDING:
+                    self._set_state(self.REJOINING)
+                if self._complete():
+                    return
+                handoff_attempted = True
+                if self.state == self.FAILED or not self.mission_has_control:
+                    return
             if goal.complete:
                 if self.state == self.AVOIDING:
                     self._set_state(self.REJOINING)
-                self._complete()
+                if not handoff_attempted and self._complete():
+                    return
+                if self.state == self.FAILED or not self.mission_has_control:
+                    return
+                # The lane service rejected only because its warm path cache is
+                # not fresh yet. Continue along the exit tangent instead of
+                # entering the common endpoint stop while ownership is retried.
+                command = self._terminal_continuation_command(
+                    rospy.Time.now(), tracking=tracking, pose=tracking_pose
+                )
+                self.cmd_pub.publish(command)
                 return
             if (
                 goal.crossed_terminal
@@ -3400,11 +3165,10 @@ class ObstacleMissionController:
                 self._fail("fixed path crossed its local terminal outside tolerance")
                 return
             if goal.crossed_terminal:
-                # Crossing the selected CommonPath ends translation even if a
-                # heading correction still prevents handoff. The common hold
-                # retains only the bounded endpoint-heading correction.
+                # The same bounded follower holds the endpoint tangent while
+                # the lane cache catches up; live swept safety remains active.
                 self.cmd_pub.publish(
-                    self._terminal_hold_command(
+                    self._terminal_continuation_command(
                         rospy.Time.now(), tracking, tracking_pose
                     )
                 )

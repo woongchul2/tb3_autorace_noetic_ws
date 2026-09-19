@@ -73,9 +73,9 @@ tunnel:
     maximum_sample_gap: 0.20
     maximum_position_delta: 0.04
     maximum_heading_delta_deg: 4.0
-    # Freeze farther out, but publish ready only in this handoff window after
-    # the current source-stamped entry path has passed the static footprint
-    # sweep. Lane cruise remains the sole owner until ready opens the gate.
+    # Freeze farther out and run Hybrid A* asynchronously as soon as the live
+    # layer is confirmed. Publish ready in this handoff window only after the
+    # complete entry-through-exit route passes the rectangular-footprint sweep.
     ready_minimum_entry_lead: 0.20
     ready_maximum_entry_lead: 0.50
     ready_maximum_heading_error_deg: 30.0
@@ -171,6 +171,14 @@ tunnel:
   control:
     period: 0.05
     entry_velocity_cap: 0.04
+    # Apply only after the locally registered live layer invalidates the arm-
+    # time static route. Lane control remains the sole cmd_vel owner while one
+    # dynamic Hybrid A* worker runs; stale or no-path results unlock a retry
+    # against the latest scan.
+    preplan_lane_velocity_cap: 0.025
+    # Lane control keeps ownership while this cap settles. The accepted lane
+    # v,w becomes the tunnel controller's first command without a zero seam.
+    entry_handoff_velocity_tolerance: 0.005
     lane_resume_max_velocity: 0.30
     cruise_velocity: 0.075
     minimum_velocity: 0.035
@@ -187,6 +195,8 @@ tunnel:
     # Conservative measured-motion bounds used by the reaction-and-stop sweep.
     safety_linear_deceleration: 0.15
     safety_angular_deceleration: 0.55
+    # These stopped-motion thresholds apply only to a later in-tunnel replan
+    # caused by new LiDAR evidence; normal gate activation uses the preplan.
     planning_stopped_linear: 0.008
     planning_stopped_angular: 0.03
     lookahead_distance: 0.065
@@ -229,6 +239,8 @@ tunnel:
     confirmation_frames: 6
     confirmation_max_gap: 0.20
     lane_path_timeout: 0.35
+    # Publish this when the exit connector begins, before any lane-control
+    # service request, so the first accepted lane command already uses it.
     join_velocity_cap: 0.06
     join_minimum_distance: 0.04
     join_confirmation_frames: 6
@@ -242,6 +254,8 @@ tunnel:
     acquisition: 2.0
     entry_alignment: 12.0
     entry_straight: 15.0
+    # Applies to an in-tunnel obstacle replan. The initial Hybrid A* runs while
+    # the lane controller is still approaching the gate.
     planning: 15.0
     plan_retry_period: 0.50
     mission: 120.0

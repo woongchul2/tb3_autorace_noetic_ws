@@ -93,6 +93,28 @@ class ObstacleControllerTest(unittest.TestCase):
         )
 
     @staticmethod
+    def production_tracking_config():
+        obstacle = yaml.safe_load(CONFIG_PATH.read_text())["obstacle"]
+        control = obstacle["control"]
+        return TrackingConfig(
+            lookahead_distance=control["lookahead_distance"],
+            maximum_linear_velocity=obstacle["template"]["cruise_velocity"],
+            maximum_angular_velocity=control["maximum_angular_velocity"],
+            maximum_lateral_acceleration=control[
+                "maximum_lateral_acceleration"
+            ],
+            linear_acceleration=control["linear_acceleration"],
+            linear_deceleration=control["linear_deceleration"],
+            angular_acceleration=control["angular_acceleration"],
+            heading_gain=control["heading_gain"],
+            curvature_feedforward_weight=control[
+                "curvature_feedforward_weight"
+            ],
+            lateral_feedback_gain=control["lateral_feedback_gain"],
+            search_ahead_distance=control["search_ahead_distance"],
+        )
+
+    @staticmethod
     def straight_path():
         return CommonPath(
             x=np.asarray([0.0, 0.5, 1.0]),
@@ -127,28 +149,12 @@ class ObstacleControllerTest(unittest.TestCase):
         controller.live_requires_stop = False
         controller.control_period = 0.05
         controller.last_command_time = None
-        controller.entry_handoff_velocity_tolerance = 0.005
-        controller.entry_projection_position_tolerance = 0.015
-        controller.entry_projection_heading_tolerance = math.radians(8.0)
+        controller.lane_handoff_lead_distance = 0.06
         controller.observed_lane_linear = 0.0
         controller.observed_lane_angular = 0.0
         controller.observed_lane_command_received = None
         controller.lane_command_generation = 0
-        controller.gate_lane_command_generation = 0
-        controller.gate_odom_generation = 0
-        controller.gate_lane_command_received = None
-        controller.gate_odom_stamp = None
-        controller.gate_odom_frame = None
-        controller.handoff_refresh_scan_generation = -1
-        controller.handoff_refresh_lane_command_generation = -1
-        controller.handoff_refresh_odom_generation = -1
-        controller.handoff_refresh_lane_command_received = None
-        controller.handoff_refresh_odom_stamp = None
-        controller.handoff_refresh_odom_frame = None
         controller.handoff_service_pending = False
-        controller.handoff_takeover_odom_generation = -1
-        controller.handoff_takeover_odom_stamp = None
-        controller.handoff_takeover_odom_frame = None
         controller.scan_generation = 0
         controller.remaining_distance = controller.committed_path.length
         controller.diagnostics_pub = RecordingPublisher()
@@ -477,20 +483,16 @@ class ObstacleControllerTest(unittest.TestCase):
         self.assertEqual(planner["entry_connector_minimum_join_distance"], 0.12)
         self.assertEqual(planner["entry_connector_maximum_join_distance"], 0.32)
         self.assertEqual(planner["entry_connector_join_step"], 0.02)
-        self.assertIn(0.12, planner["entry_connector_tangent_ratios"])
+        self.assertIn(0.12, planner["entry_connector_start_tangent_ratios"])
+        self.assertIn(0.36, planner["entry_connector_end_tangent_ratios"])
+        self.assertIn(0.22, planner["entry_connector_symmetric_tangent_ratios"])
+        self.assertNotIn("entry_handoff_velocity_tolerance", obstacle["control"])
+        self.assertNotIn("entry_velocity_cap", obstacle["control"])
         self.assertEqual(
-            obstacle["control"]["entry_handoff_velocity_tolerance"],
-            0.005,
+            obstacle["control"]["lane_handoff_lead_distance"], 0.060
         )
-        self.assertEqual(obstacle["control"]["entry_velocity_cap"], 0.09)
-        self.assertEqual(
-            obstacle["control"]["entry_projection_position_tolerance"],
-            0.015,
-        )
-        self.assertEqual(
-            obstacle["control"]["entry_projection_heading_tolerance_deg"],
-            8.0,
-        )
+        self.assertNotIn("entry_projection_position_tolerance", obstacle["control"])
+        self.assertNotIn("entry_projection_heading_tolerance_deg", obstacle["control"])
         self.assertEqual(
             obstacle["course"]["boundary_support_half_length"], 0.004
         )
@@ -1854,16 +1856,12 @@ class ObstacleControllerTest(unittest.TestCase):
         controller._update_local_registration = mock.Mock(return_value=True)
         real_plan = controller.spline_planner.plan
 
-        def plan_after_entry_cap(*args, **kwargs):
-            self.assertEqual(len(controller.speed_limit_pub.messages), 1)
-            self.assertEqual(
-                controller.speed_limit_pub.messages[0].data,
-                controller.entry_velocity_cap,
-            )
+        def plan_while_lane_keeps_cruise(*args, **kwargs):
+            self.assertEqual(controller.speed_limit_pub.messages, [])
             return real_plan(*args, **kwargs)
 
         controller.spline_planner.plan = mock.Mock(
-            side_effect=plan_after_entry_cap
+            side_effect=plan_while_lane_keeps_cruise
         )
 
         self.assertTrue(controller._attempt_path(self.now()))
@@ -1892,29 +1890,11 @@ class ObstacleControllerTest(unittest.TestCase):
         self.assertEqual(controller.ready_pub.messages[0].seq, 7)
         self.assertEqual(controller.ready_pub.messages[0].frame_id, "obstacle")
 
-        # A capped lane command may advance the robot after pre-gate planning.
-        # Rebuild once from the same latest scan but the new odom pose, and
-        # make that exact live pose the first executable sample.
+        # The prepared path stays frozen until the gate; takeover projects the
+        # newest pose onto this already swept-valid route instead of replanning.
         prepared_path = controller.committed_path
-        controller.odom_x += 0.004
-        self.assertTrue(controller._attempt_path(self.now(), refresh=True))
-        self.assertEqual(len(controller.speed_limit_pub.messages), 1)
-        self.assertIsNot(controller.committed_path, prepared_path)
-        self.assertAlmostEqual(
-            float(controller.committed_path.x[0]), controller.odom_x, places=9
-        )
-
-        # A rejected later takeover refresh is atomic: it cannot erase or
-        # partially replace the last fully validated path while lane owns cmd.
-        refreshed_path = controller.committed_path
-        refreshed_follower = controller.path_follower
-        controller.scan_generation += 1
-        with mock.patch.object(
-            controller.spline_planner, "connect_entry", return_value=None
-        ):
-            self.assertFalse(controller._attempt_path(self.now(), refresh=True))
-        self.assertIs(controller.committed_path, refreshed_path)
-        self.assertIs(controller.path_follower, refreshed_follower)
+        self.assertFalse(controller._attempt_path(self.now()))
+        self.assertIs(controller.committed_path, prepared_path)
 
     def test_start_requires_same_generation_prepared_path(self):
         controller = self.make_path_harness()
@@ -1927,7 +1907,6 @@ class ObstacleControllerTest(unittest.TestCase):
         controller.odom_from_course = None
         controller.start_requested = True
         controller.revoke_requested = False
-        controller.entry_velocity_cap = 0.09
         controller.speed_limit_pub = RecordingPublisher()
         controller._set_state = mock.Mock()
 
@@ -2264,10 +2243,8 @@ class ObstacleControllerTest(unittest.TestCase):
         self.assertEqual(controller.scan_stamp, old_stamp)
         np.testing.assert_array_equal(controller.scan_points, old_points)
 
-    def test_gate_acquisition_waits_for_fresh_capped_command_and_odometry(self):
+    def test_gate_acquires_frozen_path_immediately_after_run24_latency(self):
         controller = self.make_path_harness()
-        controller.lock = threading.RLock()
-        controller.shutting_down = False
         controller.state = controller.WAIT_GATE
         controller.zone_gate = False
         controller.start_requested = False
@@ -2277,6 +2254,7 @@ class ObstacleControllerTest(unittest.TestCase):
         controller.handoff_ambiguous = False
         controller.arm_generation = 3
         controller.prepared_generation = 3
+        controller.prepared_stamp = self.now()
         controller.ready_published_generation = 3
         controller.last_ready_stamp = self.now()
         controller.maximum_scan_odom_skew = 0.075
@@ -2284,6 +2262,7 @@ class ObstacleControllerTest(unittest.TestCase):
         controller.odom_timeout = 0.35
         controller.odom_ready = True
         controller.odom_stamp = self.now()
+        controller.scan_stamp = self.now()
         controller.odom_from_course = RigidTransform2D(
             0.0,
             0.0,
@@ -2294,30 +2273,14 @@ class ObstacleControllerTest(unittest.TestCase):
         controller.state_pub = RecordingPublisher()
         controller.cmd_pub = RecordingPublisher()
         controller.speed_limit_pub = RecordingPublisher()
-        controller.acquisition_heading_tolerance = 1.0
-        controller.maximum_angular_velocity = 0.8
-        controller.entry_velocity_cap = 0.10
-        controller.entry_handoff_velocity_tolerance = 0.005
-        controller.entry_projection_position_tolerance = 0.015
-        controller.entry_projection_heading_tolerance = math.radians(8.0)
-        controller.observed_lane_linear = 0.22
-        controller.observed_lane_angular = 0.149
-        # Reproduce the run4 seam: the future CommonPath curvature is not the
-        # still-active lane controller's feedback curvature.  Geometric join
-        # gates, not equality between those unrelated commands, decide the
-        # ownership transfer.
-        controller.committed_path.curvature[:] = 14.216568
-        controller._course_heading_error = mock.Mock(return_value=0.0)
-        controller._acquisition_data_problem = mock.Mock(return_value=None)
-        controller._attempt_path = mock.Mock(side_effect=[False, True, True])
-        candidate_follower = controller.path_follower
-        tracking = candidate_follower.calculate_tracking(
-            controller._current_pose()
+        controller._attempt_path = mock.Mock(
+            side_effect=AssertionError("gate takeover must not replan")
         )
         controller._validate_committed_path = mock.Mock(
-            return_value=(tracking, controller._current_pose())
+            side_effect=AssertionError(
+                "first command must precede the next live sweep"
+            )
         )
-        controller._common_path_command = mock.Mock(return_value=Twist())
         handoffs = []
 
         def handoff(enabled):
@@ -2327,143 +2290,68 @@ class ObstacleControllerTest(unittest.TestCase):
             return True
 
         controller._set_lane_controller = handoff
+        frozen_path = controller.committed_path
+
+        # The robot continues at lane speed during the manager's ready-to-gate
+        # latency.  The next official run reached the gate with a 9.94 degree
+        # tangent mismatch, which the normal follower can converge without a
+        # stop; takeover must not add a separate pose-tolerance veto.
+        self.seconds = 10.10
+        controller.odom_x = 0.0053
+        controller.odom_yaw = math.radians(9.94)
+        controller.odom_linear_velocity = 0.168
+        controller.odom_angular_velocity = math.radians(17.0)
+        controller.odom_generation += 1
+        controller.odom_stamp = self.now()
+        controller.scan_stamp = self.now()
+        controller.observed_lane_linear = 0.168
+        controller.observed_lane_command_received = (
+            controller_module.rospy.Time.from_sec(9.0)
+        )
         controller.gate_callback(Bool(data=True))
-
-        self.assertEqual(len(controller.speed_limit_pub.messages), 1)
-        self.assertEqual(controller.speed_limit_pub.messages[0].data, 0.10)
-        self.assertFalse(controller.mission_has_control)
-        controller.control_callback(None)
-
-        self.assertEqual(handoffs, [])
-        self.assertFalse(controller.mission_has_control)
-        self.assertEqual(controller.state, controller.ACQUIRING)
-        self.assertEqual(controller.cmd_pub.messages, [])
-
-        # New samples alone are insufficient while both commanded and
-        # measured forward speed still exceed the cap. A callback generation
-        # carrying a queued pre-gate odom source stamp is not fresh either.
-        self.seconds = 10.01
-        controller.lane_command_generation += 1
-        controller.observed_lane_command_received = self.now()
-        controller.odom_generation += 1
-        controller.odom_linear_velocity = 0.22
-        controller.control_callback(None)
-        self.assertEqual(handoffs, [])
-        self.assertEqual(controller._attempt_path.call_count, 0)
-
-        self.seconds = 10.02
-        controller.odom_generation += 1
-        controller.odom_stamp = self.now()
-        controller.control_callback(None)
-        self.assertEqual(handoffs, [])
-
-        # A capped command still leaves lane control active until fresh odom
-        # confirms the vehicle itself has decelerated too.
-        self.seconds = 10.03
-        controller.lane_command_generation += 1
-        controller.observed_lane_linear = 0.10
-        controller.observed_lane_command_received = self.now()
-        controller.control_callback(None)
-        self.assertEqual(handoffs, [])
-
-        self.seconds = 10.04
-        controller.odom_generation += 1
-        controller.odom_stamp = self.now()
-        controller.odom_linear_velocity = 0.104
-        controller.control_callback(None)
-
-        # A fresh-pose connector that fails its complete swept validation
-        # cannot take ownership or publish Twist. The next scan may retry.
-        self.assertEqual(handoffs, [])
-        self.assertFalse(controller.mission_has_control)
-        self.assertEqual(controller.state, controller.ACQUIRING)
-        self.assertEqual(controller.cmd_pub.messages, [])
-        controller.scan_generation += 1
-        controller.control_callback(None)
-
-        # Even a successful refresh cannot hand off on its sweep tick. The
-        # lane keeps ownership until callbacks deliver newer capped command
-        # and odometry samples.
-        self.assertEqual(handoffs, [])
-        self.assertFalse(controller.mission_has_control)
-        self.assertEqual(controller.cmd_pub.messages, [])
-        refresh_odom_generation = controller.odom_generation
-        refresh_command_generation = controller.lane_command_generation
-        self.assertEqual(
-            controller.handoff_refresh_odom_generation,
-            refresh_odom_generation,
-        )
-        self.assertEqual(
-            controller.handoff_refresh_lane_command_generation,
-            refresh_command_generation,
-        )
-        self.assertEqual(controller.handoff_refresh_odom_stamp, self.now())
-        self.assertEqual(
-            controller.handoff_refresh_lane_command_received,
-            controller.observed_lane_command_received,
-        )
-
-        # If the new post-refresh pose has moved outside join tolerance, keep
-        # the validated candidate for diagnostics but clear the activation
-        # marker and wait for another scan/refresh under lane ownership.
-        prepared_path = controller.committed_path
-        self.seconds = 10.05
-        controller.lane_command_generation += 1
-        controller.observed_lane_command_received = self.now()
-        controller.odom_generation += 1
-        controller.odom_stamp = self.now()
-        controller.odom_y = 0.20
-        controller.control_callback(None)
-        self.assertEqual(handoffs, [])
-        self.assertFalse(controller.mission_has_control)
-        self.assertIs(controller.committed_path, prepared_path)
-        self.assertEqual(controller.handoff_refresh_odom_generation, -1)
-
-        controller.odom_y = 0.0
-        controller.scan_generation += 1
-        controller.control_callback(None)
-        self.assertEqual(handoffs, [])
-        self.assertFalse(controller.mission_has_control)
-
-        self.seconds = 10.06
-        controller.lane_command_generation += 1
-        controller.observed_lane_command_received = self.now()
-        controller.odom_generation += 1
-        controller.odom_stamp = self.now()
         controller.control_callback(None)
 
         self.assertEqual(handoffs, [False])
         self.assertTrue(controller.mission_has_control)
-        self.assertEqual(controller.state, controller.ACQUIRING)
-        self.assertEqual(len(controller.cmd_pub.messages), 1)
-        self.assertAlmostEqual(controller.cmd_pub.messages[0].linear.x, 0.0)
-        self.assertAlmostEqual(controller.cmd_pub.messages[0].angular.z, 0.0)
-
-        # Ownership alone is not activation. A source-stamped odom sample
-        # newer than the service response must reproject successfully first.
-        self.seconds = 10.07
-        controller.odom_generation += 1
-        controller.odom_stamp = self.now()
-        controller.control_callback(None)
-
         self.assertEqual(controller.state, controller.AVOIDING)
-        self.assertEqual(len(controller.cmd_pub.messages), 3)
-        self.assertEqual(controller._attempt_path.call_count, 3)
-        self.assertTrue(
-            all(
-                call.kwargs == {"refresh": True}
-                for call in controller._attempt_path.call_args_list
+        self.assertIs(controller.committed_path, frozen_path)
+        controller._attempt_path.assert_not_called()
+        controller._validate_committed_path.assert_not_called()
+        self.assertEqual(controller.speed_limit_pub.messages, [])
+        self.assertEqual(len(controller.cmd_pub.messages), 1)
+        self.assertGreater(controller.cmd_pub.messages[0].linear.x, 0.0)
+
+    def test_gate_first_command_is_positive_from_zero_measured_speed(self):
+        controller = self.make_runtime_harness()
+        controller.state = controller.ACQUIRING
+        controller.mission_has_control = False
+        controller.odom_linear_velocity = 0.0
+        controller.odom_angular_velocity = 0.0
+        controller.path_follower.reset(
+            controller.committed_path,
+            controller._current_pose(),
+            initial_linear=0.0,
+            initial_angular=0.0,
+        )
+        controller._validate_committed_path = mock.Mock(
+            side_effect=AssertionError(
+                "first command must precede the next live sweep"
             )
         )
 
-    def test_handoff_service_does_not_block_odom_and_zero_gates_first_motion(self):
+        controller.control_callback(None)
+
+        controller._set_lane_controller.assert_called_once_with(False)
+        self.assertEqual(controller.state, controller.AVOIDING)
+        self.assertEqual(len(controller.cmd_pub.messages), 1)
+        self.assertGreater(controller.cmd_pub.messages[0].linear.x, 0.0)
+
+    def test_handoff_service_does_not_block_odom_or_inject_zero_command(self):
         controller = self.make_runtime_harness()
         controller.state = controller.ACQUIRING
         controller.zone_gate = True
         controller.mission_has_control = False
         controller.maximum_angular_velocity = 0.8
-        controller.acquisition_heading_tolerance = 1.0
-        controller.entry_velocity_cap = 0.10
         controller.observed_lane_linear = 0.09
         controller.observed_lane_angular = 0.0
         controller.observed_lane_command_received = (
@@ -2473,24 +2361,6 @@ class ObstacleControllerTest(unittest.TestCase):
         controller.odom_generation = 2
         controller.odom_stamp = controller_module.rospy.Time.from_sec(10.0)
         controller.odom_frame = "odom"
-        controller.handoff_refresh_scan_generation = controller.scan_generation
-        controller.handoff_refresh_lane_command_generation = 1
-        controller.handoff_refresh_odom_generation = 1
-        controller.handoff_refresh_lane_command_received = (
-            controller_module.rospy.Time.from_sec(9.99)
-        )
-        controller.handoff_refresh_odom_stamp = (
-            controller_module.rospy.Time.from_sec(9.99)
-        )
-        controller.handoff_refresh_odom_frame = "odom"
-        controller._course_heading_error = mock.Mock(return_value=0.0)
-
-        tracking = controller.path_follower.calculate_tracking(
-            controller._current_pose()
-        )
-        controller._validate_committed_path = mock.Mock(
-            return_value=(tracking, controller._current_pose())
-        )
         moving_command = Twist()
         moving_command.linear.x = 0.04
         controller._common_path_command = mock.Mock(
@@ -2577,85 +2447,44 @@ class ObstacleControllerTest(unittest.TestCase):
             service_times["returned"] - service_times["entered"], 0.20
         )
         self.assertTrue(controller.mission_has_control)
-        self.assertEqual(controller.state, controller.ACQUIRING)
+        self.assertEqual(controller.state, controller.AVOIDING)
         self.assertEqual(len(controller.cmd_pub.messages), 1)
-        self.assertAlmostEqual(controller.cmd_pub.messages[0].linear.x, 0.0)
+        self.assertAlmostEqual(controller.cmd_pub.messages[0].linear.x, 0.04)
         self.assertAlmostEqual(controller.cmd_pub.messages[0].angular.z, 0.0)
-
-        # Neither a timer tick nor a newer callback generation carrying the
-        # same source stamp may release a nonzero mission command.
-        controller.control_callback(None)
-        same_source = Odometry()
-        same_source.header.stamp = controller_module.rospy.Time.from_sec(
-            10.01
-        )
-        same_source.header.frame_id = "odom"
-        same_source.pose.pose.orientation.w = 1.0
-        same_source.twist.twist.linear.x = 0.09
-        controller.odom_callback(same_source)
-        controller.control_callback(None)
         self.assertTrue(
             all(
-                abs(message.linear.x) <= 1e-12
-                and abs(message.angular.z) <= 1e-12
+                message.linear.x > 0.0
                 for message in controller.cmd_pub.messages
             )
         )
 
-        # The first nonzero command is permitted only after odometry whose
-        # source stamp is strictly newer than the completed service barrier.
-        newer_source = Odometry()
-        newer_source.header.stamp = controller_module.rospy.Time.from_sec(
-            10.02
-        )
-        newer_source.header.frame_id = "odom"
-        newer_source.pose.pose.orientation.w = 1.0
-        newer_source.twist.twist.linear.x = 0.09
-        self.seconds = 10.02
-        controller.odom_callback(newer_source)
-        zero_count_before_activation = len(controller.cmd_pub.messages)
-        controller.control_callback(None)
-
-        self.assertEqual(controller.state, controller.AVOIDING)
-        nonzero_indexes = [
-            index
-            for index, message in enumerate(controller.cmd_pub.messages)
-            if abs(message.linear.x) > 1e-12
-            or abs(message.angular.z) > 1e-12
-        ]
-        self.assertEqual(nonzero_indexes, [len(controller.cmd_pub.messages) - 1])
-        self.assertGreaterEqual(nonzero_indexes[0], zero_count_before_activation)
-
-    def test_post_service_zero_reset_owns_heading_and_future_curvature(self):
+    def test_handoff_seeds_follower_from_measured_motion_at_production_limits(self):
         controller = self.make_runtime_harness()
-        controller.committed_path.curvature[:] = 14.216568
+        controller.tracking_config = self.production_tracking_config()
+        controller.path_follower = PathFollower(controller.tracking_config)
         controller.path_follower.reset(
             controller.committed_path, controller._current_pose()
         )
         controller.state = controller.ACQUIRING
         controller.mission_has_control = True
-        controller.handoff_takeover_odom_generation = 4
-        controller.handoff_takeover_odom_stamp = (
-            controller_module.rospy.Time.from_sec(9.99)
-        )
-        controller.handoff_takeover_odom_frame = "odom"
-        controller.odom_generation = 5
-        controller.odom_stamp = self.now()
-        # The service returned after the robot crossed the sharp connector
-        # seam.  It is still only 0 mm from the route, but its body heading is
-        # now beyond the 8 degree pre-service join limit seen in run4.
-        controller.odom_yaw = math.radians(9.183)
-        controller.observed_lane_linear = 0.09
-        controller.observed_lane_angular = 0.148696
+        controller.odom_linear_velocity = 0.09
+        controller.odom_angular_velocity = 0.148696
+        # The prior lane command is not the physical motion seed after
+        # ownership changes.
+        controller.observed_lane_linear = 0.04
+        controller.observed_lane_angular = -0.20
+        controller.maximum_angular_velocity = 0.8
         controller._fail = mock.Mock()
 
         self.assertTrue(
-            controller._activate_after_handoff_service(self.now())
+            controller._activate_after_handoff()
         )
         controller._fail.assert_not_called()
         self.assertEqual(controller.state, controller.AVOIDING)
-        self.assertAlmostEqual(controller.path_follower.last_linear, 0.0)
-        self.assertAlmostEqual(controller.path_follower.last_angular, 0.0)
+        self.assertAlmostEqual(controller.path_follower.last_linear, 0.070)
+        self.assertAlmostEqual(
+            controller.path_follower.last_angular, 0.148696
+        )
 
         validated = controller._validate_committed_path(self.now())
         self.assertTrue(validated)
@@ -2665,13 +2494,13 @@ class ObstacleControllerTest(unittest.TestCase):
             self.now(), tracking=tracking, pose=pose
         )
         self.assertLessEqual(
-            abs(command.linear.x),
+            abs(command.linear.x - 0.070),
             controller.tracking_config.linear_acceleration
             * controller.control_period
             + 1e-12,
         )
         self.assertLessEqual(
-            abs(command.angular.z),
+            abs(command.angular.z - 0.148696),
             controller.tracking_config.angular_acceleration
             * controller.control_period
             + 1e-12,
@@ -2681,30 +2510,24 @@ class ObstacleControllerTest(unittest.TestCase):
             controller.tracking_config.maximum_lateral_acceleration + 1e-12,
         )
 
-    def test_post_service_handoff_rejects_pose_beyond_join_tolerance(self):
+    def test_handoff_projects_latest_pose_without_a_stop_veto(self):
         controller = self.make_path_harness()
         controller.state = controller.ACQUIRING
         controller.state_pub = RecordingPublisher()
         controller.cmd_pub = RecordingPublisher()
         controller.mission_has_control = True
         controller.odom_timeout = 0.35
-        controller.handoff_takeover_odom_generation = 4
-        controller.handoff_takeover_odom_stamp = (
-            controller_module.rospy.Time.from_sec(9.99)
-        )
-        controller.handoff_takeover_odom_frame = "odom"
-        controller.odom_generation = 5
-        controller.odom_stamp = self.now()
-        controller.odom_y = 0.020
+        controller.maximum_angular_velocity = 0.8
+        controller.odom_y = 0.030
+        controller.odom_yaw = math.radians(10.0)
         controller._fail = mock.Mock()
 
-        self.assertFalse(
-            controller._activate_after_handoff_service(self.now())
+        self.assertTrue(
+            controller._activate_after_handoff()
         )
 
-        controller._fail.assert_called_once()
-        self.assertIn("outside join tolerance", controller._fail.call_args.args[0])
-        self.assertEqual(controller.state, controller.ACQUIRING)
+        controller._fail.assert_not_called()
+        self.assertEqual(controller.state, controller.AVOIDING)
 
     def test_premature_gate_does_not_stop_preparation(self):
         controller = self.make_runtime_harness()
@@ -3193,7 +3016,7 @@ class ObstacleControllerTest(unittest.TestCase):
             return True
 
         controller._set_lane_controller = handoff
-        controller._complete()
+        self.assertTrue(controller._complete())
 
         self.assertEqual(handoffs, [True])
         self.assertFalse(controller.mission_has_control)
@@ -3222,6 +3045,140 @@ class ObstacleControllerTest(unittest.TestCase):
         self.assertFalse(controller.mission_has_control)
         controller._set_lane_controller.assert_called_once_with(True)
         self.assertEqual(controller.cmd_pub.messages, [])
+
+    def test_lane_resume_rejection_keeps_positive_command_and_retries(self):
+        controller = self.make_runtime_harness()
+        controller.tracking_config = self.production_tracking_config()
+        controller.path_follower = PathFollower(controller.tracking_config)
+        controller.state = controller.AVOIDING
+        controller.odom_x = float(controller.committed_path.x[-1])
+        controller.odom_y = float(controller.committed_path.y[-1])
+        controller.odom_yaw = float(controller.committed_path.heading[-1])
+        pose = controller._current_pose()
+        controller.path_follower.reset(
+            controller.committed_path,
+            pose,
+            initial_linear=0.07,
+        )
+
+        def validated_current_pose(_now):
+            current_pose = controller._current_pose()
+            return (
+                controller.path_follower.calculate_tracking(current_pose),
+                current_pose,
+            )
+
+        controller._validate_committed_path = mock.Mock(
+            side_effect=validated_current_pose
+        )
+        attempts = []
+
+        def retryable_handoff(enabled):
+            self.assertTrue(enabled)
+            attempts.append(enabled)
+            controller.handoff_ambiguous = False
+            if len(attempts) <= 20:
+                return False
+            controller.mission_has_control = False
+            return True
+
+        controller._set_lane_controller = mock.Mock(
+            side_effect=retryable_handoff
+        )
+
+        for _ in range(21):
+            command_count = len(controller.cmd_pub.messages)
+            controller.control_callback(None)
+            if len(controller.cmd_pub.messages) > command_count:
+                controller.odom_x += (
+                    controller.cmd_pub.messages[-1].linear.x
+                    * controller.control_period
+                )
+            self.seconds += controller.control_period
+            controller.odom_stamp = self.now()
+            controller.scan_stamp = self.now()
+
+        self.assertGreater(
+            20 * controller.control_period,
+            max(controller.odom_timeout, controller.scan_timeout),
+        )
+        self.assertEqual(attempts, [True] * 21)
+        self.assertEqual(controller.state, controller.COMPLETE)
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(len(controller.cmd_pub.messages), 20)
+        self.assertGreater(
+            controller.odom_x - float(controller.committed_path.x[-1]),
+            controller.committed_path.goal_tolerance.position,
+        )
+        self.assertTrue(
+            all(message.linear.x > 0.0 for message in controller.cmd_pub.messages)
+        )
+
+    def test_lane_resume_retries_while_validated_exit_is_still_moving(self):
+        controller = self.make_runtime_harness()
+        controller.state = controller.AVOIDING
+        controller.lane_handoff_lead_distance = 0.08
+        controller.odom_x = 0.94
+        controller.odom_y = 0.0
+        controller.odom_yaw = 0.0
+        pose = controller._current_pose()
+        controller.path_follower.reset(
+            controller.committed_path,
+            pose,
+            initial_linear=0.07,
+        )
+        tracking = controller.path_follower.calculate_tracking(pose)
+        controller._validate_committed_path = mock.Mock(
+            return_value=(tracking, pose)
+        )
+        attempts = []
+
+        def retryable_handoff(enabled):
+            self.assertTrue(enabled)
+            attempts.append(enabled)
+            controller.handoff_ambiguous = False
+            if len(attempts) < 4:
+                return False
+            controller.mission_has_control = False
+            return True
+
+        controller._set_lane_controller = mock.Mock(
+            side_effect=retryable_handoff
+        )
+
+        for _ in range(4):
+            controller.control_callback(None)
+            self.seconds += controller.control_period
+            controller.odom_stamp = self.now()
+            controller.scan_stamp = self.now()
+
+        self.assertEqual(attempts, [True, True, True, True])
+        self.assertEqual(controller.state, controller.COMPLETE)
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(len(controller.cmd_pub.messages), 3)
+        self.assertTrue(
+            all(message.linear.x > 0.0 for message in controller.cmd_pub.messages)
+        )
+
+    def test_explicit_lane_handoff_rejection_is_not_ambiguous(self):
+        controller = ObstacleMissionController.__new__(
+            ObstacleMissionController
+        )
+        controller.lane_service_name = "/control/lane_mission_handoff"
+        controller.lane_service = mock.Mock(
+            return_value=mock.Mock(
+                success=False,
+                message="retryable: fresh executable lane path is not ready",
+            )
+        )
+        controller.mission_has_control = True
+        controller.handoff_ambiguous = True
+
+        with mock.patch.object(controller_module.rospy, "wait_for_service"):
+            self.assertFalse(controller._set_lane_controller(True))
+
+        self.assertTrue(controller.mission_has_control)
+        self.assertFalse(controller.handoff_ambiguous)
 
     def test_handoff_failure_uses_shared_stop_without_cmd_vel_publish(self):
         controller = ObstacleMissionController.__new__(

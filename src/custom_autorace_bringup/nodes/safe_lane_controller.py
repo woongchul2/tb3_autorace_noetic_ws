@@ -1570,6 +1570,7 @@ class SafeLaneController:
         self.last_command_time = None
         self.last_command_linear = 0.0
         self.last_command_angular = 0.0
+        self.last_lane_speed_limit = 0.0
         self.odom_history = deque(
             maxlen=max(10, int(rospy.get_param("~lane_path/odom_buffer_size", 120)))
         )
@@ -1619,7 +1620,7 @@ class SafeLaneController:
             "/control/lane_mission_handoff", SetBool, self.mission_handoff_callback
         )
         self.watchdog = rospy.Timer(
-            rospy.Duration(0.05), self.watchdog_callback
+            rospy.Duration(self.control_period), self.watchdog_callback
         )
         rospy.on_shutdown(self.shutdown)
         self.manual_stop_pub.publish(Bool(data=self.manual_stop_requested))
@@ -1830,6 +1831,9 @@ class SafeLaneController:
             self.path_follower.update_clearance(
                 combine_validation_results((decision.route, decision.stopping))
             )
+            self.last_lane_speed_limit = min(
+                max(0.0, self.maximum_velocity), decision.speed_limit
+            )
             self.last_valid_lane_time = now
             if self.enabled:
                 self.initialize_active_path_from_odometry = False
@@ -1847,10 +1851,7 @@ class SafeLaneController:
                 limited, tracking = self.path_follower.command(
                     latest.pose,
                     elapsed,
-                    speed_limit=min(
-                        max(0.0, self.maximum_velocity),
-                        decision.speed_limit,
-                    ),
+                    speed_limit=self.last_lane_speed_limit,
                     tracking=tracking,
                 )
                 command = Twist()
@@ -1898,6 +1899,31 @@ class SafeLaneController:
         """Transfer cmd_vel ownership without injecting a stop command."""
         now = rospy.Time.now()
         with self.lock:
+            if request.data and self.mission_has_control:
+                cache_age = (
+                    math.inf
+                    if self.last_valid_lane_time is None
+                    else (now - self.last_valid_lane_time).to_sec()
+                )
+                maximum_cache_age = max(
+                    0.0, self.lane_timeout - self.control_period
+                )
+                lane_cache_ready = bool(
+                    self.enabled is False
+                    and self.green_received
+                    and not self.manual_stop_requested
+                    and self.rolling_path is not None
+                    and self.path_follower.path is self.rolling_path
+                    and 0.0 <= cache_age <= maximum_cache_age
+                    and self.last_lane_speed_limit > 1e-9
+                )
+                if not lane_cache_ready:
+                    return SetBoolResponse(
+                        success=False,
+                        message=(
+                            "retryable: fresh executable lane path is not ready"
+                        ),
+                    )
             self.mission_has_control = not request.data
             self.enabled = (
                 request.data

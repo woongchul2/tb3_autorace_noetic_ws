@@ -1201,12 +1201,21 @@ class LevelCrossingLidarController:
         )
 
     def _set_lane_controller(self, enabled):
+        self.handoff_retryable = False
         try:
             rospy.wait_for_service(
                 self.lane_service_name, timeout=self.handoff_timeout
             )
             response = self.lane_service(enabled)
             if not response.success:
+                if enabled:
+                    self.handoff_retryable = True
+                    rospy.logwarn_throttle(
+                        0.5,
+                        "Level-crossing keeps control while lane return waits: %s",
+                        response.message,
+                    )
+                    return False
                 raise rospy.ServiceException(response.message)
             self.mission_has_control = not enabled
             return True
@@ -1237,8 +1246,8 @@ class LevelCrossingLidarController:
         if not self._set_lane_controller(False):
             self._fail_safe_stop("could not acquire cmd_vel control")
             return False
-        # The lane handoff deliberately emits no command. Publish zero in the
-        # same control cycle so there is no gap between the two owners.
+        # This zero is the commanded physical stop for the confirmed lowered
+        # barrier, not an ownership-transfer barrier.
         self._publish_stop()
         self.stop_command_stamp = rospy.Time.now()
         self.stop_requested = False
@@ -1259,12 +1268,13 @@ class LevelCrossingLidarController:
         return True
 
     def _release_after_open(self):
-        self._publish_stop()
         if not self._set_lane_controller(True):
+            if self.handoff_retryable:
+                return False
             self._fail_safe_stop(
                 "could not return cmd_vel control after the barrier opened"
             )
-            return
+            return False
         self.resume_requested = False
         self._reset_confirmation()
         self.barrier_pub.publish(Bool(data=False))
@@ -1273,11 +1283,14 @@ class LevelCrossingLidarController:
             "Raised barrier confirmed; lane controller owns cmd_vel while "
             "clearing the crossing"
         )
+        return True
 
     def _revoke(self):
         if self.mission_has_control:
             self._publish_stop()
             if not self._set_lane_controller(True):
+                if self.handoff_retryable:
+                    return
                 self.revoke_requested = False
                 self._fail_safe_stop(
                     "could not return cmd_vel control after gate revocation"

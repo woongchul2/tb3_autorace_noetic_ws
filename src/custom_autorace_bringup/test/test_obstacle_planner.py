@@ -2,6 +2,7 @@
 
 import math
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -85,10 +86,33 @@ class ObstaclePlannerTest(unittest.TestCase):
             barrier_association_distance=template[
                 "barrier_association_distance"
             ],
+            entry_connector_minimum_join_distance=config["planner"][
+                "entry_connector_minimum_join_distance"
+            ],
+            entry_connector_maximum_join_distance=config["planner"][
+                "entry_connector_maximum_join_distance"
+            ],
+            entry_connector_join_step=config["planner"][
+                "entry_connector_join_step"
+            ],
+            entry_connector_start_tangent_ratios=config["planner"][
+                "entry_connector_start_tangent_ratios"
+            ],
+            entry_connector_end_tangent_ratios=config["planner"][
+                "entry_connector_end_tangent_ratios"
+            ],
+            entry_connector_symmetric_tangent_ratios=config["planner"][
+                "entry_connector_symmetric_tangent_ratios"
+            ],
             cruise_velocity=template["cruise_velocity"],
             minimum_velocity=template["minimum_velocity"],
+            entry_velocity=template["entry_velocity"],
+            exit_velocity=template["exit_velocity"],
             maximum_angular_velocity=config["control"][
                 "maximum_angular_velocity"
+            ],
+            maximum_lateral_acceleration=config["control"][
+                "maximum_lateral_acceleration"
             ],
             linear_acceleration=config["control"]["linear_acceleration"],
             linear_deceleration=config["control"]["linear_deceleration"],
@@ -289,7 +313,8 @@ class ObstaclePlannerTest(unittest.TestCase):
         path = spline.connect_entry(
             suffix,
             start_heading,
-            start_curvature=start_curvature,
+            start_linear_velocity=0.07,
+            start_angular_velocity=0.07 * start_curvature,
         )
 
         self.assertIsNotNone(path)
@@ -302,6 +327,165 @@ class ObstaclePlannerTest(unittest.TestCase):
         self.assertTrue(self.checker.validator.validate_path(path).safe)
         self.assertGreater(path.line_clearance, 0.0)
         self.assertGreater(path.obstacle_clearance, 0.0)
+        self.assertAlmostEqual(path.entry_join_distance, 0.200, places=2)
+        self.assertEqual(path.entry_start_tangent_ratio, 0.12)
+        self.assertEqual(path.entry_end_tangent_ratio, 0.36)
+        self.assertGreaterEqual(float(np.min(path.speed)), 0.035 - 1e-12)
+        self.assertLess(path.expected_time, 25.0)
+        segment = np.diff(path.station)
+        interval_time = 2.0 * segment / (
+            path.speed[:-1] + path.speed[1:]
+        )
+        longitudinal_acceleration = (
+            path.speed[1:] ** 2 - path.speed[:-1] ** 2
+        ) / (2.0 * segment)
+        yaw_acceleration = np.abs(
+            np.diff(path.speed * path.curvature)
+        ) / interval_time
+        self.assertLessEqual(
+            float(np.max(longitudinal_acceleration)),
+            spline.linear_acceleration + 1e-9,
+        )
+        self.assertLessEqual(
+            float(np.max(-longitudinal_acceleration)),
+            spline.linear_deceleration + 1e-9,
+        )
+        self.assertLessEqual(
+            float(np.max(yaw_acceleration)),
+            spline.angular_acceleration + 1e-6,
+        )
+
+        spline.entry_connector_start_tangent_ratios = tuple(
+            reversed(spline.entry_connector_start_tangent_ratios)
+        )
+        spline.entry_connector_end_tangent_ratios = tuple(
+            reversed(spline.entry_connector_end_tangent_ratios)
+        )
+        spline.entry_connector_symmetric_tangent_ratios = tuple(
+            reversed(spline.entry_connector_symmetric_tangent_ratios)
+        )
+        reordered = spline.connect_entry(
+            suffix,
+            start_heading,
+            start_linear_velocity=0.07,
+            start_angular_velocity=0.07 * start_curvature,
+        )
+        self.assertIsNotNone(reordered)
+        self.assertAlmostEqual(
+            reordered.expected_time, path.expected_time, places=9
+        )
+        self.assertEqual(
+            reordered.entry_start_tangent_ratio,
+            path.entry_start_tangent_ratio,
+        )
+        self.assertEqual(
+            reordered.entry_end_tangent_ratio,
+            path.entry_end_tangent_ratio,
+        )
+
+    def test_entry_search_keeps_faster_legacy_symmetric_candidate(self):
+        spline, obstacles = self.production_spline()
+        self.assertTrue(
+            spline.prepare(obstacles, self.right_line, self.left_line)
+        )
+        lateral_offset = 0.12
+        suffix = spline.plan(
+            0.40,
+            lateral_offset,
+            np.empty((0, 2), dtype=np.float64),
+            self.right_line + lateral_offset,
+            self.left_line + lateral_offset,
+        )
+
+        path = spline.connect_entry(
+            suffix,
+            math.radians(-10.0),
+            start_linear_velocity=0.07,
+            start_angular_velocity=0.0,
+        )
+
+        self.assertIsNotNone(path)
+        self.assertTrue(self.checker.validator.validate_path(path).safe)
+        self.assertAlmostEqual(path.entry_join_distance, 0.180, places=2)
+        self.assertEqual(path.entry_start_tangent_ratio, 0.22)
+        self.assertEqual(path.entry_end_tangent_ratio, 0.22)
+        self.assertLess(path.expected_time, 23.70)
+        self.assertGreater(float(np.min(path.speed)), 0.064)
+
+    def test_selected_entry_profile_is_continuous_across_suffix_seam(self):
+        spline, obstacles = self.production_spline()
+        self.assertTrue(
+            spline.prepare(obstacles, self.right_line, self.left_line)
+        )
+        progress = 0.42018351253905656
+        lateral_offset = 0.1219877281243856
+        suffix = spline.plan(
+            progress,
+            lateral_offset,
+            np.empty((0, 2), dtype=np.float64),
+            self.right_line + lateral_offset,
+            self.left_line + lateral_offset,
+        )
+
+        path = spline.connect_entry(
+            suffix,
+            math.radians(-27.044448760103883),
+            start_linear_velocity=0.059948444130236575,
+            start_angular_velocity=-0.04248550929273729,
+        )
+
+        self.assertIsNotNone(path)
+        segment = np.diff(path.station)
+        interval_time = 2.0 * segment / (
+            path.speed[:-1] + path.speed[1:]
+        )
+        longitudinal_acceleration = (
+            path.speed[1:] ** 2 - path.speed[:-1] ** 2
+        ) / (2.0 * segment)
+        yaw_acceleration = np.abs(
+            np.diff(path.speed * path.curvature)
+        ) / interval_time
+        self.assertLessEqual(
+            float(np.max(longitudinal_acceleration)),
+            spline.linear_acceleration + 1e-9,
+        )
+        self.assertLessEqual(
+            float(np.max(-longitudinal_acceleration)),
+            spline.linear_deceleration + 1e-9,
+        )
+        self.assertLessEqual(
+            float(np.max(yaw_acceleration)),
+            spline.angular_acceleration + 1e-6,
+        )
+        self.assertAlmostEqual(
+            path.expected_time,
+            float(np.sum(interval_time)),
+            places=9,
+        )
+
+    def test_infeasible_candidate_profile_does_not_abort_lattice(self):
+        spline, obstacles = self.production_spline()
+        self.assertTrue(
+            spline.prepare(obstacles, self.right_line, self.left_line)
+        )
+        lateral_offset = 0.12
+        suffix = spline.plan(
+            0.35,
+            lateral_offset,
+            np.empty((0, 2), dtype=np.float64),
+            self.right_line + lateral_offset,
+            self.left_line + lateral_offset,
+        )
+
+        path = spline.connect_entry(
+            suffix,
+            math.radians(-10.0),
+            start_linear_velocity=0.07,
+            start_angular_velocity=0.105,
+        )
+
+        self.assertIsNotNone(path)
+        self.assertTrue(self.checker.validator.validate_path(path).safe)
 
         # The first exact suffix sample is the quintic seam.  Both heading and
         # curvature must come from the same surveyed sample, not from a
@@ -359,7 +543,12 @@ class ObstaclePlannerTest(unittest.TestCase):
         self.assertIsNotNone(suffix)
 
         self.assertIsNone(
-            spline.connect_entry(suffix, math.radians(-1.678))
+            spline.connect_entry(
+                suffix,
+                math.radians(-1.678),
+                start_linear_velocity=0.07,
+                start_angular_velocity=0.0,
+            )
         )
 
     def test_entry_search_bounds_exact_sweeps_before_final_route_validation(self):
@@ -383,11 +572,14 @@ class ObstaclePlannerTest(unittest.TestCase):
         self.checker.validator.validate_path.reset_mock()
         self.assertIsNotNone(
             spline.connect_entry(
-                early, math.radians(-24.4), start_curvature=3.17
+                early,
+                math.radians(-24.4),
+                start_linear_velocity=0.07,
+                start_angular_velocity=0.07 * 3.17,
             )
         )
-        # The first ranked connector is exact-swept once.  The controller then
-        # performs the sole full connector-plus-suffix sweep after freezing.
+        # Candidates are time-ranked before exact sweeps; the fastest candidate
+        # passes, so no slower candidate consumes another exact sweep.
         self.assertEqual(self.checker.validator.validate_path.call_count, 1)
 
         late_offset = 0.145573
@@ -400,11 +592,47 @@ class ObstaclePlannerTest(unittest.TestCase):
         )
         self.checker.validator.validate_path.reset_mock()
         self.assertIsNone(
-            spline.connect_entry(late, math.radians(-1.678))
+            spline.connect_entry(
+                late,
+                math.radians(-1.678),
+                start_linear_velocity=0.07,
+                start_angular_velocity=0.0,
+            )
         )
         # All late candidates already fail the cheap full-margin boundary
         # necessity check; none consume an exact obstacle sweep.
         self.assertEqual(self.checker.validator.validate_path.call_count, 0)
+
+    def test_entry_lattice_runs_inside_sensor_period_budget(self):
+        spline, obstacles = self.production_spline()
+        self.assertTrue(
+            spline.prepare(obstacles, self.right_line, self.left_line)
+        )
+        durations = []
+        replays = (
+            (0.3782, 0.1186, -24.4, 0.07, 0.07 * 3.17),
+            (0.448836, 0.091623, -12.692, 0.09, 0.148696),
+        )
+        for progress, offset, heading, linear, angular in replays:
+            suffix = spline.plan(
+                progress,
+                offset,
+                np.empty((0, 2), dtype=np.float64),
+                self.right_line + offset,
+                self.left_line + offset,
+            )
+            for _ in range(8):
+                started = time.monotonic()
+                path = spline.connect_entry(
+                    suffix,
+                    math.radians(heading),
+                    start_linear_velocity=linear,
+                    start_angular_velocity=angular,
+                )
+                durations.append(time.monotonic() - started)
+                self.assertIsNotNone(path)
+
+        self.assertLess(float(np.percentile(durations, 95.0)), 0.20)
 
     def test_curvature_matched_quintic_matches_both_end_conditions(self):
         start = (0.0, 0.0, math.radians(-8.0))

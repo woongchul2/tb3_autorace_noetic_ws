@@ -175,6 +175,7 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.map_path = None
         controller.odom_path = None
         controller.entry_staging_station = None
+        controller.entry_inside_station = None
         controller.exit_connector_station = None
         controller.path_index = 0
         controller.map_path_index = 0
@@ -191,6 +192,15 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.last_expanded_nodes = 0
         controller.plan_attempts = 0
         controller.replan_count = 0
+        controller.prepared_arm_generation = 1
+        controller.prepared_tunnel_path = None
+        controller.prepared_exit_connector_station = None
+        controller.prepared_grid = None
+        controller.prepared_costmap_version = 1
+        controller.prepared_soft_contact_station = None
+        controller.prepared_plan_kind = "dynamic"
+        controller.dynamic_preplan_generation = 0
+        controller.preplan_cap_generation = 0
         controller.maximum_position_error_seen = 0.0
         controller.maximum_heading_error_seen = 0.0
         controller.amcl_anchor_position_delta = 0.0
@@ -204,14 +214,20 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.lane_path_minimum_line_clearance = math.nan
         controller.lane_path_confirmation_count = 0
         controller.last_lane_path_confirmation_time = None
+        controller.lane_command_linear = math.nan
+        controller.lane_command_angular = math.nan
+        controller.lane_command_stamp = None
         controller.exit_confirmation_started = False
         controller.confirmation_started_at = None
+        controller.lane_handoff_retry_pending = False
         controller.join_start_x = 0.0
         controller.join_start_y = 0.0
         controller.join_start_yaw = 0.0
         controller.join_origin_ready = False
 
         controller.entry_velocity_cap = 0.04
+        controller.preplan_lane_velocity_cap = 0.025
+        controller.entry_handoff_velocity_tolerance = 0.005
         controller.lane_resume_max_velocity = 0.30
         controller.cruise_velocity = 0.075
         controller.minimum_velocity = 0.035
@@ -265,6 +281,27 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.entry_inside_pose = controller_module.Pose2D(
             -1.7475895, -0.28, -0.5 * math.pi
         )
+        controller.prepared_tunnel_path = controller_module.path_from_poses(
+            np.asarray(
+                (
+                    (
+                        controller.entry_inside_pose.x,
+                        controller.entry_inside_pose.y,
+                        controller.entry_inside_pose.yaw,
+                    ),
+                    (
+                        controller.entry_inside_pose.x,
+                        controller.entry_inside_pose.y - 0.10,
+                        controller.entry_inside_pose.yaw,
+                    ),
+                )
+            ),
+            frame_id="map",
+            target_speed=controller.entry_velocity,
+            label="test_tunnel_preplan",
+        )
+        controller.prepared_exit_connector_station = 0.05
+        controller.prepared_grid = object()
         controller.entry_portal_plane_y = -0.105857
         controller.registration_reference_pose = controller_module.Pose2D(
             -1.757968, -0.041389, math.radians(-89.4336)
@@ -1224,32 +1261,99 @@ class TunnelMissionControllerTest(unittest.TestCase):
                 )
             )
 
-    def test_gate_handoff_first_command_is_zero_and_enters_entry_alignment(self):
+    def test_gate_handoff_preserves_motion_and_enters_entry_alignment(self):
         controller = self.make_controller()
         controller._input_problem = lambda now, require_scan=True: None
-        controller._synchronized_odom_pose = lambda _stamp: (0.0, 0.0, 0.0)
-        alignment_ticks = []
-        controller._entry_alignment_tick = lambda now: alignment_ticks.append(
-            now
-        )
+        controller._planner_grid = lambda: object()
+        controller._path_is_safe = lambda _grid, _path, _index: True
+        controller._command_is_safe = lambda _grid, _linear, _angular: True
+        controller.odom_linear_velocity = 0.035
+        controller.lane_command_linear = 0.035
+        controller.lane_command_angular = 0.08
+        controller.lane_command_stamp = self.now
 
         controller.gate_callback(Bool(data=True))
         controller.control_callback(None)
 
         self.assertEqual(controller.state, controller.ALIGNING_ENTRY)
-        self.assertEqual(alignment_ticks, [self.now])
         self.assertEqual(controller.lane_service.calls, [False])
         self.assertTrue(controller.mission_has_control)
+        self.assertIsNotNone(controller.map_path)
+        self.assertIsNotNone(controller.odom_path)
         handoff_index = controller.events.index(("handoff", False))
         first_command_event = next(
             event
             for event in controller.events[handoff_index + 1 :]
             if event[0:2] == ("publish", "/cmd_vel")
         )
-        self.assert_zero(first_command_event[2])
+        self.assertAlmostEqual(first_command_event[2].linear.x, 0.035)
+        self.assertAlmostEqual(first_command_event[2].angular.z, 0.08)
+
+    def test_gate_handoff_clamps_a_stale_fast_lane_command_and_offsets_soft_contact(self):
+        controller = self.make_controller()
+        controller._input_problem = lambda now, require_scan=True: None
+        controller._planner_grid = lambda: object()
+        controller._path_is_safe = lambda _grid, _path, _index: True
+        controller._command_is_safe = lambda _grid, _linear, _angular: True
+        controller.odom_linear_velocity = 0.035
+        controller.lane_command_linear = 0.30
+        controller.lane_command_angular = 0.30
+        controller.lane_command_stamp = self.now
+        controller.prepared_soft_contact_station = 0.40
+
+        controller.gate_callback(Bool(data=True))
+        controller.control_callback(None)
+
+        command = controller.cmd_pub.messages[-1]
+        self.assertAlmostEqual(command.linear.x, controller.entry_velocity_cap)
+        self.assertAlmostEqual(command.angular.z, 0.04)
+        self.assertAlmostEqual(
+            controller.soft_replan_contact_station,
+            controller.entry_inside_station + 0.40,
+        )
+
+    def test_entry_hybrid_seam_uses_the_first_planner_curvature(self):
+        entry = controller_module.path_from_poses(
+            np.asarray(((0.0, 0.0, 0.0), (0.10, 0.0, 0.0))),
+            frame_id="map",
+            target_speed=0.035,
+        )
+        distance = 0.05
+        curvature = 2.0
+        tail = controller_module.CommonPath(
+            x=np.asarray(
+                [0.10, 0.10 + math.sin(curvature * distance) / curvature]
+            ),
+            y=np.asarray(
+                [0.0, (1.0 - math.cos(curvature * distance)) / curvature]
+            ),
+            heading=np.asarray([0.0, curvature * distance]),
+            curvature=np.asarray([curvature, curvature]),
+            speed=np.asarray([0.035, 0.035]),
+            frame_id="map",
+        )
+
+        combined = controller_module.tracking_path_with_entry(
+            entry,
+            tail,
+            cruise_velocity=0.075,
+            minimum_velocity=0.035,
+            entry_velocity=0.035,
+            exit_velocity=0.075,
+            maximum_angular_velocity=0.55,
+            maximum_lateral_acceleration=0.03,
+            linear_acceleration=0.15,
+            linear_deceleration=0.40,
+            maximum_angular_acceleration=0.55,
+            frame_id="map",
+        )
+
+        seam_index = entry.x.size - 1
+        self.assertAlmostEqual(combined.curvature[seam_index], curvature)
 
     def test_registration_generation_source_stamp_and_ready_identity(self):
         controller = self.make_controller()
+        prepared_path = controller.prepared_tunnel_path
         controller.arm_generation = 0
         controller.armed_at = None
         controller.ready_published_generation = 0
@@ -1294,6 +1398,9 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.costmap = object()
         controller._planner_grid = lambda: object()
         controller._path_is_safe = lambda _grid, _path, _index: True
+        controller.prepared_arm_generation = 7
+        controller.prepared_tunnel_path = prepared_path
+        controller.prepared_exit_connector_station = 0.05
 
         self.assertTrue(controller._try_publish_ready(ready_stamp))
         ready = controller.ready_pub.messages[-1]
@@ -1333,6 +1440,209 @@ class TunnelMissionControllerTest(unittest.TestCase):
         self.assertEqual(controller.arm_generation, 0)
         self.assertIsNone(controller.armed_at)
 
+    def test_arm_starts_static_preplan_without_taking_lane_control(self):
+        controller = self.make_controller()
+        controller.arm_generation = 0
+        controller.armed_at = None
+        controller.costmap = SimpleNamespace(reset_dynamic=mock.Mock())
+        controller._publish_costmap = mock.Mock()
+        controller._start_preplan = mock.Mock(return_value=True)
+        arm = Header()
+        arm.seq = 7
+        arm.stamp = controller_module.rospy.Time.from_sec(9.50)
+        arm.frame_id = "tunnel"
+
+        controller.arm_callback(arm)
+
+        controller.costmap.reset_dynamic.assert_called_once_with()
+        controller._start_preplan.assert_called_once_with(
+            arm.stamp, plan_kind="static"
+        )
+        self.assertEqual(controller.lane_service.calls, [])
+        self.assertEqual(controller.cmd_pub.messages, [])
+
+    def test_static_collision_starts_one_capped_dynamic_preplan(self):
+        controller = self.make_controller()
+        controller.arm_generation = 3
+        controller.ready_published_generation = 0
+        controller.prepared_arm_generation = 3
+        controller.prepared_plan_kind = "static"
+        controller.costmap = object()
+        controller.registration_source_stamp = (
+            controller_module.rospy.Time.from_sec(9.8)
+        )
+        controller.odom_history.append(
+            (
+                self.now,
+                controller.entry_staging_pose.x,
+                controller.entry_portal_plane_y + 0.30,
+                controller.entry_staging_pose.yaw,
+                "odom",
+            )
+        )
+        controller._planner_grid = lambda: object()
+        controller._path_is_safe = mock.Mock(return_value=False)
+        controller._start_preplan = mock.Mock(return_value=True)
+
+        self.assertFalse(controller._try_publish_ready(self.now))
+        self.assertEqual(
+            [message.data for message in controller.speed_limit_pub.messages],
+            [controller.preplan_lane_velocity_cap],
+        )
+        self.assertEqual(controller.dynamic_preplan_generation, 3)
+        controller._start_preplan.assert_called_once_with(
+            self.now, plan_kind="dynamic"
+        )
+        self.assertIsNone(controller.prepared_tunnel_path)
+        self.assertFalse(controller._try_publish_ready(self.now))
+        self.assertEqual(len(controller.speed_limit_pub.messages), 1)
+        self.assertEqual(controller._start_preplan.call_count, 1)
+        self.assertEqual(controller.lane_service.calls, [])
+        self.assertEqual(controller.cmd_pub.messages, [])
+
+    def test_static_soft_contact_starts_dynamic_preplan_but_baseline_cost_does_not(self):
+        controller = self.make_controller()
+        controller.arm_generation = 3
+        controller.ready_published_generation = 0
+        controller.prepared_arm_generation = 3
+        controller.prepared_plan_kind = "static"
+        controller.costmap = object()
+        controller.registration_source_stamp = (
+            controller_module.rospy.Time.from_sec(9.8)
+        )
+        controller.odom_history.append(
+            (
+                self.now,
+                controller.entry_staging_pose.x,
+                controller.entry_portal_plane_y + 0.30,
+                controller.entry_staging_pose.yaw,
+                "odom",
+            )
+        )
+        latest_grid = object()
+        controller._planner_grid = lambda: latest_grid
+        controller._path_is_safe = mock.Mock(return_value=True)
+        controller._path_has_new_soft_cost = mock.Mock(return_value=False)
+
+        self.assertTrue(controller._try_publish_ready(self.now))
+        controller._path_has_new_soft_cost.assert_called_once_with(
+            latest_grid,
+            controller.prepared_tunnel_path,
+            controller.prepared_grid,
+        )
+        self.assertEqual(controller.speed_limit_pub.messages, [])
+
+        controller.ready_published_generation = 0
+        controller._path_has_new_soft_cost = mock.Mock(return_value=True)
+        controller._start_preplan = mock.Mock(return_value=True)
+
+        self.assertFalse(controller._try_publish_ready(self.now))
+        self.assertEqual(
+            [message.data for message in controller.speed_limit_pub.messages],
+            [controller.preplan_lane_velocity_cap],
+        )
+        controller._start_preplan.assert_called_once_with(
+            self.now, plan_kind="dynamic"
+        )
+        self.assertIsNone(controller.prepared_tunnel_path)
+
+    def test_acquire_rechecks_static_soft_contact_before_cmd_vel_handoff(self):
+        controller = self.make_controller()
+        controller.state = controller.ACQUIRING
+        controller.state_started = controller_module.rospy.Time.from_sec(9.0)
+        controller.zone_gate = True
+        controller._input_problem = lambda now, require_scan=True: None
+        controller._planner_grid = lambda: object()
+        controller._prepared_path_needs_dynamic_preplan = mock.Mock(
+            return_value=True
+        )
+        controller._restart_dynamic_preplan = mock.Mock(return_value=True)
+
+        self.assertFalse(controller._acquire(self.now))
+
+        self.assertEqual(controller.map_from_odom, (0.0, 0.0, 0.0))
+        self.assertEqual(controller.frozen_odom_frame, "odom")
+        controller._restart_dynamic_preplan.assert_called_once_with(self.now)
+        self.assertEqual(controller.state_started, self.now)
+        self.assertEqual(controller.lane_service.calls, [])
+        self.assertEqual(controller.cmd_pub.messages, [])
+
+    def test_new_soft_cost_check_subtracts_the_planning_baseline(self):
+        controller = self.make_controller()
+        controller.planner = controller_module.HybridAStarPlanner(
+            footprint=controller_module.RectangularFootprint(
+                front=0.005,
+                rear=0.005,
+                half_width=0.005,
+                padding=0.0,
+            ),
+            soft_obstacle_cost_weight=1.0,
+            soft_cost_check_step=0.01,
+            collision_check_step=0.01,
+        )
+        data = np.zeros((20, 30), dtype=np.int8)
+        baseline_soft = np.zeros_like(data)
+        baseline_soft[5, 7] = 43
+        baseline = controller_module.OccupancyGrid(
+            data,
+            resolution=0.02,
+            origin_x=0.0,
+            origin_y=0.0,
+            occupied_threshold=65,
+            unknown_is_occupied=False,
+            soft_cost_data=baseline_soft,
+        )
+        path = controller_module.path_from_poses(
+            np.asarray(((0.10, 0.10, 0.0), (0.30, 0.10, 0.0))),
+            frame_id="map",
+            target_speed=0.035,
+        )
+
+        same = controller_module.OccupancyGrid(
+            data,
+            resolution=0.02,
+            origin_x=0.0,
+            origin_y=0.0,
+            occupied_threshold=65,
+            unknown_is_occupied=False,
+            soft_cost_data=baseline_soft.copy(),
+        )
+        self.assertFalse(
+            controller._path_has_new_soft_cost(same, path, baseline)
+        )
+
+        latest_soft = baseline_soft.copy()
+        latest_soft[5, 12] = 64
+        latest = controller_module.OccupancyGrid(
+            data,
+            resolution=0.02,
+            origin_x=0.0,
+            origin_y=0.0,
+            occupied_threshold=65,
+            unknown_is_occupied=False,
+            soft_cost_data=latest_soft,
+        )
+        self.assertTrue(
+            controller._path_has_new_soft_cost(latest, path, baseline)
+        )
+
+    def test_stale_scan_cannot_consume_the_ready_generation(self):
+        controller = self.make_controller()
+        controller.arm_generation = 3
+        controller.ready_published_generation = 0
+        controller.prepared_arm_generation = 3
+        controller.costmap = object()
+        controller.registration_source_stamp = (
+            controller_module.rospy.Time.from_sec(9.0)
+        )
+        stale_stamp = controller_module.rospy.Time.from_sec(
+            self.seconds - controller.scan_timeout - 0.01
+        )
+
+        self.assertFalse(controller._try_publish_ready(stale_stamp))
+        self.assertEqual(controller.ready_published_generation, 0)
+        self.assertEqual(controller.ready_pub.messages, [])
+
     def test_ready_before_gate_does_not_stop_or_take_lane_control(self):
         controller = self.make_controller()
         controller.arm_generation = 3
@@ -1343,6 +1653,7 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.registration_source_stamp = (
             controller_module.rospy.Time.from_sec(9.8)
         )
+        controller.prepared_arm_generation = 3
         ready_stamp = self.now
         lead = 0.30
         controller.odom_history.append(
@@ -1370,6 +1681,172 @@ class TunnelMissionControllerTest(unittest.TestCase):
         self.assertEqual(controller.lane_service.calls, [])
         self.assertEqual(controller.cmd_pub.messages, [])
         self.assertEqual(controller.speed_limit_pub.messages, [])
+
+    def test_hybrid_preplan_starts_before_the_ready_lead_without_lane_handoff(self):
+        controller = self.make_controller()
+        controller.prepared_arm_generation = 0
+        controller.prepared_tunnel_path = None
+        controller.prepared_exit_connector_station = None
+        controller.ready_published_generation = 0
+        controller.costmap = object()
+        controller.scan_updates = controller.minimum_initial_scans
+        controller.registration_source_stamp = (
+            controller_module.rospy.Time.from_sec(9.8)
+        )
+        far_stamp = self.now
+        controller.odom_history.append(
+            (
+                far_stamp,
+                controller.entry_staging_pose.x,
+                controller.entry_portal_plane_y + 0.80,
+                controller.entry_staging_pose.yaw,
+                "odom",
+            )
+        )
+        controller._planner_grid = lambda: object()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_worker(*_args, **_kwargs):
+            started.set()
+            release.wait(timeout=1.0)
+
+        controller._plan_worker = blocking_worker
+
+        self.assertFalse(controller._try_publish_ready(far_stamp))
+        self.assertTrue(started.wait(timeout=0.25))
+        self.assertEqual(controller.state, controller.WAIT_GATE)
+        self.assertEqual(controller.lane_service.calls, [])
+        self.assertEqual(controller.cmd_pub.messages, [])
+
+        release.set()
+        controller.planning_thread.join(timeout=0.50)
+        self.assertFalse(controller.planning_thread.is_alive())
+
+    def test_rearm_keeps_the_live_worker_reference_and_prevents_overlap(self):
+        controller = self.make_controller()
+        live_worker = SimpleNamespace(is_alive=lambda: True)
+        controller.planning_thread = live_worker
+        controller.costmap = object()
+        controller._planner_grid = mock.Mock()
+
+        controller._reset_preplan()
+
+        self.assertIs(controller.planning_thread, live_worker)
+        self.assertFalse(
+            controller._start_preplan(self.now, plan_kind="static")
+        )
+        controller._planner_grid.assert_not_called()
+
+    def test_completed_preplan_publishes_ready_without_taking_cmd_vel(self):
+        controller = self.make_controller()
+        tail = controller.prepared_tunnel_path
+        controller.prepared_arm_generation = 0
+        controller.prepared_tunnel_path = None
+        controller.prepared_exit_connector_station = None
+        controller.ready_published_generation = 0
+        controller.costmap = object()
+        controller.scan_updates = controller.minimum_initial_scans
+        controller.scan_stamp = self.now
+        controller.registration_source_stamp = (
+            controller_module.rospy.Time.from_sec(9.8)
+        )
+        controller.odom_history.append(
+            (
+                self.now,
+                controller.entry_staging_pose.x,
+                controller.entry_portal_plane_y + 0.30,
+                controller.entry_staging_pose.yaw,
+                "odom",
+            )
+        )
+        returned_plan = SimpleNamespace(expanded_nodes=12)
+        controller.planner.plan = lambda *_args, **_kwargs: returned_plan
+        controller._build_moving_exit_path = (
+            lambda _plan, _grid: (tail, 0.05, "")
+        )
+        grid = object()
+        controller._planner_grid = lambda: grid
+        controller._path_is_safe = lambda _grid, _path, _index: True
+
+        controller.planning_generation += 1
+        generation = controller.planning_generation
+        controller._plan_worker(
+            generation,
+            grid,
+            controller.entry_inside_pose,
+            None,
+            controller.costmap_version,
+            1,
+            pre_gate=True,
+            arm_generation=controller.arm_generation,
+        )
+
+        self.assertEqual(controller.state, controller.WAIT_GATE)
+        self.assertEqual(
+            controller.prepared_arm_generation, controller.arm_generation
+        )
+        self.assertIs(controller.prepared_tunnel_path, tail)
+        self.assertEqual(controller.ready_pub.messages[-1].seq, 1)
+        self.assertEqual(controller.lane_service.calls, [])
+        self.assertEqual(controller.cmd_pub.messages, [])
+
+    def test_rejected_dynamic_preplan_unlocks_one_newer_scan_retry(self):
+        tail = self.make_controller().prepared_tunnel_path
+        returned_plan = SimpleNamespace(expanded_nodes=12)
+
+        for rejection in ("no_path", "new_hard", "near_soft"):
+            with self.subTest(rejection=rejection):
+                controller = self.make_controller()
+                controller.state = controller.WAIT_GATE
+                controller.zone_gate = False
+                controller.prepared_arm_generation = 0
+                controller.prepared_tunnel_path = None
+                controller.prepared_exit_connector_station = None
+                controller.prepared_plan_kind = ""
+                controller.dynamic_preplan_generation = controller.arm_generation
+                controller.costmap_version = 2
+                controller.planner.plan = (
+                    (lambda *_args, **_kwargs: None)
+                    if rejection == "no_path"
+                    else (lambda *_args, **_kwargs: returned_plan)
+                )
+                controller._build_moving_exit_path = (
+                    lambda _plan, _grid: (tail, 0.05, "")
+                )
+                controller._planner_grid = lambda: object()
+                controller._path_is_safe = mock.Mock(
+                    return_value=rejection != "new_hard"
+                )
+                controller._path_future_soft_contact_station = mock.Mock(
+                    return_value=(
+                        0.10 if rejection == "near_soft" else None
+                    )
+                )
+
+                controller._plan_worker(
+                    controller.planning_generation,
+                    object(),
+                    controller.entry_inside_pose,
+                    None,
+                    1,
+                    1,
+                    pre_gate=True,
+                    arm_generation=controller.arm_generation,
+                    plan_kind="dynamic",
+                )
+
+                self.assertEqual(controller.dynamic_preplan_generation, 0)
+                self.assertIsNone(controller.prepared_tunnel_path)
+                controller._start_preplan = mock.Mock(return_value=True)
+                self.assertTrue(controller._start_dynamic_preplan(self.now))
+                self.assertEqual(
+                    controller.dynamic_preplan_generation,
+                    controller.arm_generation,
+                )
+                controller._start_preplan.assert_called_once_with(
+                    self.now, plan_kind="dynamic"
+                )
 
     def test_ready_lead_is_invariant_to_longitudinal_connector_shift(self):
         template_portal = (
@@ -1403,6 +1880,7 @@ class TunnelMissionControllerTest(unittest.TestCase):
             controller.registration_source_stamp = (
                 controller_module.rospy.Time.from_sec(9.8)
             )
+            controller.prepared_arm_generation = 9
             controller.odom_history.append(
                 (self.now,) + actual_robot + ("odom",)
             )
@@ -1443,7 +1921,7 @@ class TunnelMissionControllerTest(unittest.TestCase):
         )
         self.assertEqual(controller.cmd_pub.messages, [])
 
-    def test_entry_clear_requires_fresh_interior_scan_threshold(self):
+    def test_entry_clear_continues_directly_into_preplanned_hybrid_path(self):
         controller = self.make_controller()
         controller.state = controller.ENTERING
         controller.state_started = self.now
@@ -1451,29 +1929,37 @@ class TunnelMissionControllerTest(unittest.TestCase):
         controller.mission_has_control = True
         controller.map_from_odom = (0.0, 0.0, 0.0)
         controller.frozen_odom_frame = "odom"
-        controller.costmap = object()
-        controller.scan_updates = 7
-        controller.minimum_initial_scans = 3
-        controller.map_path = object()
-        controller.odom_path = object()
-        controller.planned_grid = object()
+        path = controller_module.path_from_poses(
+            np.asarray(((0.0, 0.0, 0.0), (0.1, 0.0, 0.0))),
+            frame_id="map",
+            target_speed=0.035,
+        )
+        controller.map_path = path
+        controller.odom_path = path
+        controller.entry_inside_station = 0.05
+        controller.exit_connector_station = 1.0
+        controller._input_problem = lambda now, require_scan=True: None
+        controller._planner_grid = lambda: object()
+        controller._command_is_safe = lambda _grid, _linear, _angular: True
         controller._entry_clearance_ready = lambda: True
-
-        controller._finish_tracking_phase(self.now)
-
-        self.assertEqual(controller.state, controller.PLANNING)
-        self.assertEqual(controller.minimum_planning_scan_updates, 10)
-        self.assertIsNone(controller.map_path)
-        self.assertIsNone(controller.odom_path)
-        controller.scan_updates = 9
-        self.assertEqual(
-            controller._input_problem(self.now, require_scan=True),
-            "confirmed LiDAR costmap",
+        tracking = SimpleNamespace(
+            path_index=1,
+            position_error=0.0,
+            heading_error=0.0,
+            target_speed=0.035,
+            angular_velocity=0.0,
         )
-        controller.scan_updates = 10
-        self.assertIsNone(
-            controller._input_problem(self.now, require_scan=True)
-        )
+
+        with mock.patch.object(
+            controller_module, "calculate_tracking", return_value=tracking
+        ):
+            controller.control_callback(None)
+
+        self.assertEqual(controller.state, controller.FOLLOWING)
+        self.assertIs(controller.map_path, path)
+        self.assertIs(controller.odom_path, path)
+        self.assertTrue(controller.cmd_pub.messages)
+        self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
 
     def test_entry_staging_transition_keeps_the_continuous_path(self):
         controller = self.make_controller()
@@ -1602,6 +2088,63 @@ class TunnelMissionControllerTest(unittest.TestCase):
         )
         self.assertEqual(len(controller.tf_buffer.calls), 1)
         self.assertEqual(len(controller.costmap.calls), 1)
+
+    def test_wait_gate_keeps_updating_scans_after_ready_publication(self):
+        controller = self.make_controller()
+        controller.state = controller.WAIT_GATE
+        controller.zone_gate = False
+        controller.ready_published_generation = controller.arm_generation
+        controller.map_from_odom = None
+        controller.frozen_odom_frame = ""
+        controller.registered_map_from_odom = (0.0, 0.0, 0.0)
+        controller.registered_odom_frame = "odom"
+        controller.costmap = RecordingCostmap()
+        transform = SimpleNamespace(
+            transform=SimpleNamespace(
+                translation=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            )
+        )
+        controller.tf_buffer = SimpleNamespace(
+            lookup_transform=lambda *_args, **_kwargs: transform
+        )
+        controller._try_publish_ready = mock.Mock(return_value=False)
+
+        controller.scan_callback(
+            self.scan(controller_module.rospy.Time.from_sec(9.90))
+        )
+
+        self.assertEqual(len(controller.costmap.calls), 1)
+        controller._try_publish_ready.assert_called_once()
+
+    def test_acquiring_new_scan_restarts_an_unlocked_dynamic_preplan(self):
+        controller = self.make_controller()
+        controller.state = controller.ACQUIRING
+        controller.zone_gate = True
+        controller.mission_has_control = False
+        controller.map_from_odom = (0.0, 0.0, 0.0)
+        controller.frozen_odom_frame = "odom"
+        controller.prepared_arm_generation = 0
+        controller.prepared_tunnel_path = None
+        controller.dynamic_preplan_generation = 0
+        controller.costmap = RecordingCostmap()
+        transform = SimpleNamespace(
+            transform=SimpleNamespace(
+                translation=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            )
+        )
+        controller.tf_buffer = SimpleNamespace(
+            lookup_transform=lambda *_args, **_kwargs: transform
+        )
+        controller._start_dynamic_preplan = mock.Mock(return_value=True)
+
+        controller.scan_callback(
+            self.scan(controller_module.rospy.Time.from_sec(9.90))
+        )
+
+        self.assertEqual(len(controller.costmap.calls), 1)
+        controller._start_dynamic_preplan.assert_called_once_with(self.now)
 
     def test_synchronized_odom_selects_nearest_matching_frame(self):
         controller = self.make_controller()
@@ -2083,6 +2626,46 @@ class TunnelMissionControllerTest(unittest.TestCase):
         self.assertAlmostEqual(swept[0][1], 5.0)
         self.assertAlmostEqual(swept[0][2], 0.01)
 
+    def test_new_interior_collision_during_entry_requests_replan_not_failure(self):
+        controller = self.make_controller()
+        controller.state = controller.ALIGNING_ENTRY
+        controller.state_started = self.now
+        controller.mission_started = self.now
+        controller.mission_has_control = True
+        controller.zone_gate = True
+        controller.map_from_odom = (0.0, 0.0, 0.0)
+        controller.frozen_odom_frame = "odom"
+        path = controller_module.path_from_poses(
+            np.asarray(
+                (
+                    (0.0, 0.0, 0.0),
+                    (0.10, 0.0, 0.0),
+                    (0.20, 0.0, 0.0),
+                    (0.30, 0.0, 0.0),
+                )
+            ),
+            frame_id="map",
+            target_speed=0.035,
+        )
+        controller.map_path = path
+        controller.odom_path = path
+        controller.entry_inside_station = 0.10
+        controller.planned_costmap_version = 1
+        controller.costmap_version = 2
+        controller._input_problem = lambda now, require_scan=True: None
+        controller._planner_grid = lambda: object()
+        controller.planner.pose_is_collision_free = lambda _grid, _pose: True
+        controller.planner.primitive_is_collision_free = (
+            lambda _grid, pose, _curvature, _distance: pose.x < 0.20
+        )
+
+        controller.control_callback(None)
+
+        self.assertEqual(controller.state, controller.PLANNING)
+        self.assertEqual(controller.replan_count, 1)
+        self.assertNotEqual(controller.state, controller.FAILED)
+        self.assert_zero(controller.cmd_pub.messages[-1])
+
     def test_moving_exit_seam_preserves_cruise_command_without_zero(self):
         controller = self.make_controller()
         controller.state = controller.FOLLOWING
@@ -2132,6 +2715,10 @@ class TunnelMissionControllerTest(unittest.TestCase):
             self.assertTrue(controller.exit_confirmation_started)
             confirmation_started_at = controller.confirmation_started_at
             self.assertEqual(confirmation_started_at, self.now)
+            self.assertEqual(
+                [message.data for message in controller.speed_limit_pub.messages],
+                [controller.join_velocity_cap],
+            )
             self.assertEqual(len(controller.cmd_pub.messages), 1)
             self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
             self.assertAlmostEqual(controller.last_linear, 0.075)
@@ -2147,6 +2734,13 @@ class TunnelMissionControllerTest(unittest.TestCase):
         self.assertEqual(controller.state, controller.JOINING_LANE)
         self.assertFalse(controller.mission_has_control)
         self.assertEqual(controller.lane_service.calls, [True])
+        cap_event_index = next(
+            index
+            for index, event in enumerate(controller.events)
+            if event[0:2] == ("publish", "/control/max_vel")
+        )
+        handoff_event_index = controller.events.index(("handoff", True))
+        self.assertLess(cap_event_index, handoff_event_index)
         self.assertTrue(
             all(
                 command.linear.x > 0.0
@@ -2157,6 +2751,54 @@ class TunnelMissionControllerTest(unittest.TestCase):
             [message.data for message in controller.state_pub.messages],
             [controller.EXITING, controller.JOINING_LANE],
         )
+
+    def test_exit_handoff_retries_while_tunnel_keeps_positive_command(self):
+        controller = self.make_rolling_exit_controller()
+        controller._exit_clearance_ready = lambda: True
+        controller._lane_confirmed = lambda _now, _frames: True
+        controller._tracking_endpoint_ready = lambda: False
+        controller.last_linear = 0.075
+        controller.last_angular = 0.02
+        handoffs = []
+
+        def deferred(_enabled):
+            handoffs.append(True)
+            controller.events.append(("handoff", True))
+            return SimpleNamespace(success=False, message="lane path not ready")
+
+        controller.lane_service = deferred
+        tracking = SimpleNamespace(
+            path_index=1,
+            position_error=0.0,
+            heading_error=0.0,
+            target_speed=0.050,
+            angular_velocity=-0.03,
+        )
+        with mock.patch.object(
+            controller_module, "calculate_tracking", return_value=tracking
+        ):
+            for _ in range(20):
+                controller.control_callback(None)
+                self.assertEqual(controller.state, controller.EXITING)
+                self.assertTrue(controller.mission_has_control)
+                self.assertTrue(controller.lane_handoff_retry_pending)
+                self.advance()
+
+        self.assertEqual(len(handoffs), 20)
+        self.assertEqual(len(controller.cmd_pub.messages), 20)
+        self.assertTrue(
+            all(command.linear.x > 0.0 for command in controller.cmd_pub.messages)
+        )
+        self.assertLess(controller.cmd_pub.messages[-1].linear.x, 0.075)
+
+        controller.lane_service = RecordingLaneService(controller.events)
+        with mock.patch.object(
+            controller_module, "calculate_tracking", return_value=tracking
+        ):
+            controller.control_callback(None)
+        self.assertEqual(controller.state, controller.JOINING_LANE)
+        self.assertFalse(controller.mission_has_control)
+        self.assertFalse(controller.lane_handoff_retry_pending)
 
     def test_moving_exit_builder_requires_safe_guarded_connector(self):
         controller = self.make_controller()

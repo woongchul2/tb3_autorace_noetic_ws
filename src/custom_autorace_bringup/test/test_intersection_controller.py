@@ -338,9 +338,11 @@ class IntersectionControllerTest(unittest.TestCase):
         controller.last_direction_confirmation_time = None
         controller.direction_search_timeout = 35.0
         controller.ready_gate_timeout = 5.0
-        controller.entry_takeover_pose_timeout = 0.75
         controller.yaw = 0.0
         controller.mission_has_control = False
+        controller.observed_lane_linear = 0.11
+        controller.observed_lane_angular = 0.17
+        controller.observed_lane_command_received = self.now()
         controller.zone_gate_open = False
         controller.arm_seq = 17
         controller.ready_published_seq = 17
@@ -365,12 +367,9 @@ class IntersectionControllerTest(unittest.TestCase):
         controller.mission_started = self.now()
 
         controller.arc_lane_start_distance = None
-        controller.entry_takeover_odom_sequence = -1
+        controller.exit_plan_in_progress = False
         controller.arc_lane_timeout = 10.0
         controller.arc_lane_max_distance = 2.0
-        controller.exit_takeover_settle_time = 0.10
-        controller.exit_takeover_pose_timeout = 0.75
-        controller.exit_takeover_odom_sequence = -1
         controller.exit_takeover_max_distance = 0.06
         controller.map_exit_control_points = ((0.60, -0.75), (0.25, -0.30))
         controller.map_left_exit_control_points = (
@@ -424,8 +423,13 @@ class IntersectionControllerTest(unittest.TestCase):
         controller._set_lane_controller = set_lane_controller
         controller._generate_entry_path = mock.Mock(return_value=True)
         controller._start_prepared_entry_path = mock.Mock(return_value=True)
+        controller._prepare_active_exit_parameters = mock.Mock()
         controller._generate_exit_path = mock.Mock(return_value=True)
         controller._path_goal_reached = mock.Mock(return_value=True)
+        first_command = controller_module.Twist()
+        first_command.linear.x = controller.observed_lane_linear
+        first_command.angular.z = controller.observed_lane_angular
+        controller._path_command = mock.Mock(return_value=first_command)
         controller._tracking_pose = lambda: (
             0.0,
             0.0,
@@ -441,6 +445,24 @@ class IntersectionControllerTest(unittest.TestCase):
             station=0.0,
         )
         controller._final_lane_observation_valid = lambda _now: True
+
+        def attempt_exit_takeover(_snapshot):
+            controller.exit_plan_in_progress = False
+            if controller._generate_exit_path() is not True:
+                return False
+            if not controller._set_lane_controller(False):
+                return False
+            controller.lane_speed_limit_pub.publish(
+                controller_module.Float64(
+                    data=controller.final_lane_join_velocity
+                )
+            )
+            controller.path_started = self.now()
+            controller._set_state(controller.FOLLOW_EXIT_PATH)
+            controller.cmd_pub.publish(controller._path_command())
+            return True
+
+        controller._attempt_exit_takeover = attempt_exit_takeover
 
         return controller
 
@@ -714,6 +736,109 @@ class IntersectionControllerTest(unittest.TestCase):
 
         self.assertEqual(calculation.call_count, 1)
         self.assertGreater(command.linear.x, 0.0)
+
+    def test_final_lane_handoff_retries_beyond_lane_timeout_without_stopping(self):
+        path = CommonPath(
+            x=[0.0, 0.25, 0.50],
+            y=[0.0, 0.0, 0.0],
+            heading=[0.0, 0.0, 0.0],
+            curvature=[0.0, 0.0, 0.0],
+            speed=[0.10, 0.10, 0.10],
+            frame_id="odom",
+            goal_tolerance=GoalTolerance(
+                position=0.03,
+                heading=math.radians(5.0),
+                terminal_crossing=0.10,
+            ),
+        )
+        config = TrackingConfig(
+            lookahead_distance=0.08,
+            maximum_linear_velocity=0.20,
+            maximum_angular_velocity=0.8,
+            maximum_lateral_acceleration=0.08,
+            linear_acceleration=0.25,
+            linear_deceleration=0.50,
+            angular_acceleration=1.5,
+            heading_gain=0.5,
+        )
+        controller = self.make_transition_harness(
+            IntersectionMissionController.LEFT
+        )
+        controller.state = controller.FOLLOW_EXIT_PATH
+        controller.state_started = self.now()
+        controller.mission_has_control = True
+        controller.handoff_ambiguous = False
+        controller.path = path
+        controller.path_follower = PathFollower(config)
+        pose = [0.50, 0.0, 0.0]
+        controller.path_follower.reset(
+            path,
+            Pose2D(*pose),
+            initial_linear=controller.final_lane_join_velocity,
+        )
+        controller.path_validator = SweptFootprintValidator(
+            AsymmetricFootprint(0.067645, 0.118073, 0.0903)
+        )
+        controller.path_index = path.size - 1
+        controller.path_exit_yaw = 0.0
+        controller.path_handoff_pending = False
+        controller.path_tick_pose = None
+        controller.path_tick_tracking = None
+        controller.odom_linear_velocity = controller.final_lane_join_velocity
+        controller.odom_angular_velocity = 0.0
+        controller.safety_reaction_time = 0.10
+        controller.path_linear_deceleration = 0.50
+        controller.safety_stop_margin = 0.005
+        controller.last_path_command_time = self.now()
+        controller.path_max_commanded_angular = 0.0
+        controller.diagnostics_pub = RecordingPublisher()
+        controller._tracking_pose = lambda: tuple(pose)
+        controller._path_goal_reached = (
+            IntersectionMissionController._path_goal_reached.__get__(
+                controller, IntersectionMissionController
+            )
+        )
+        controller._path_command = (
+            IntersectionMissionController._path_command.__get__(
+                controller, IntersectionMissionController
+            )
+        )
+
+        control_period = 0.05
+        rejection_duration = 0.75
+        rejection_steps = int(math.ceil(rejection_duration / control_period))
+        outcomes = [False] * rejection_steps + [True]
+        handoffs = []
+
+        def set_lane_controller(enabled):
+            handoffs.append(enabled)
+            accepted = outcomes.pop(0)
+            controller.handoff_ambiguous = False
+            if accepted:
+                controller.mission_has_control = not enabled
+            return accepted
+
+        controller._set_lane_controller = set_lane_controller
+        for _ in range(rejection_steps):
+            self.advance(control_period)
+            controller.control_callback(None)
+            command = controller.cmd_pub.messages[-1]
+            self.assertGreater(command.linear.x, 0.0)
+            pose[0] += command.linear.x * control_period
+
+        self.assertGreater(rejection_duration, 0.50)
+        self.assertTrue(controller.path_handoff_pending)
+        self.assertEqual(handoffs, [True] * rejection_steps)
+        self.assertTrue(
+            all(message.linear.x > 0.0 for message in controller.cmd_pub.messages)
+        )
+
+        self.advance(control_period)
+        controller.control_callback(None)
+        self.assertEqual(handoffs, [True] * (rejection_steps + 1))
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(controller.state, controller.VERIFY_FINAL_LANE)
+        self.assertEqual(len(controller.cmd_pub.messages), rejection_steps)
 
     def test_production_entry_envelope_and_exit_sweeps_are_safe(self):
         controller, mission, _raw_occupied = self.make_course_map_harness()
@@ -1184,7 +1309,7 @@ class IntersectionControllerTest(unittest.TestCase):
                 self.assertLessEqual(opposite_turn, opposite_limit)
                 self.assertLessEqual(float(np.sum(np.abs(delta))), total_limit)
 
-    def test_path_follower_command_history_starts_at_handoff_zero(self):
+    def test_path_follower_command_history_inherits_lane_velocity(self):
         controller, mission, _ = self.make_course_map_harness()
         cruise = float(mission["right_path_linear_velocity"])
         maximum_angular = float(mission["right_path_max_angular_velocity"])
@@ -1240,38 +1365,38 @@ class IntersectionControllerTest(unittest.TestCase):
         self.assertLess(float(np.max(path.curvature)), 0.0)
         self.assertLess(tracking.angular_velocity, 0.0)
 
-        # The lane watchdog had already published zero before takeover, while
-        # odometry still measured +0.6423 rad/s of physical rotation. Command
-        # slew must start from the former; the latter remains for safety only.
-        incompatible_lane_rate = 0.6423
+        observed_lane_rate = -0.20
         follower.reset(
+            path,
+            pose,
+            initial_linear=cruise,
+            initial_angular=observed_lane_rate,
+        )
+        command, _ = follower.command(pose, 0.05)
+        self.assertLess(command.angular_velocity, 0.0)
+        self.assertLessEqual(
+            abs(command.angular_velocity - observed_lane_rate),
+            angular_acceleration * 0.05 + 1e-12,
+        )
+        self.assertGreater(
+            command.linear_velocity,
+            config.linear_acceleration * 0.05,
+        )
+
+        zero_seeded = PathFollower(config)
+        zero_seeded.reset(
             path,
             pose,
             initial_linear=0.0,
             initial_angular=0.0,
         )
-        command, _ = follower.command(pose, 0.05)
-        self.assertLess(command.angular_velocity, 0.0)
-        self.assertLessEqual(
-            abs(command.angular_velocity),
-            angular_acceleration * 0.05 + 1e-12,
-        )
-
-        # Reproduce the removed initialization: treating measured rotation as
-        # previous command bypasses the intended command-history slew bound.
-        legacy = PathFollower(config)
-        legacy.reset(
-            path,
-            pose,
-            initial_linear=cruise,
-            initial_angular=incompatible_lane_rate,
-        )
-        legacy_command, _ = legacy.command(pose, 0.05)
+        zero_command, _ = zero_seeded.command(pose, 0.05)
         self.assertGreater(
-            legacy_command.angular_velocity, command.angular_velocity
+            command.linear_velocity,
+            zero_command.linear_velocity,
         )
 
-    def test_path_activation_starts_after_handoff_zero_barrier(self):
+    def test_path_activation_inherits_observed_lane_command(self):
         controller = IntersectionMissionController.__new__(
             IntersectionMissionController
         )
@@ -1326,6 +1451,11 @@ class IntersectionControllerTest(unittest.TestCase):
         controller.entry_max_total_turn = math.radians(120.0)
         controller.odom_linear_velocity = 0.12
         controller.odom_angular_velocity = 0.6423
+        controller.observed_lane_linear = 0.11
+        controller.observed_lane_angular = -0.23
+        controller.observed_lane_command_received = (
+            controller_module.rospy.Time.from_sec(10.0)
+        )
         controller.odom_timeout = 0.35
         controller._tracking_pose = lambda: (0.0, 0.0, math.pi)
         controller._publish_path = mock.Mock()
@@ -1371,14 +1501,11 @@ class IntersectionControllerTest(unittest.TestCase):
 
         self.assertEqual(follower.reset.call_count, 1)
         final_reset = follower.reset.call_args
-        self.assertEqual(final_reset.kwargs["initial_angular"], 0.0)
-        self.assertEqual(
-            final_reset.kwargs["initial_linear"],
-            0.0,
-        )
+        self.assertAlmostEqual(final_reset.kwargs["initial_angular"], -0.23)
+        self.assertAlmostEqual(final_reset.kwargs["initial_linear"], 0.11)
 
-        # Exit takeover has already published mission-owned zero during its
-        # settle interval and uses the same zero command history.
+        # The selected camera arc remains the previous owner at exit, so its
+        # latest command is also the common follower's initial slew history.
         follower.reset_mock()
         follower.path_index = 0
         with mock.patch.object(
@@ -1393,8 +1520,8 @@ class IntersectionControllerTest(unittest.TestCase):
                 )
             )
         exit_reset = follower.reset.call_args
-        self.assertEqual(exit_reset.kwargs["initial_linear"], 0.0)
-        self.assertEqual(exit_reset.kwargs["initial_angular"], 0.0)
+        self.assertAlmostEqual(exit_reset.kwargs["initial_linear"], 0.11)
+        self.assertAlmostEqual(exit_reset.kwargs["initial_angular"], -0.23)
 
     def test_exit_handoff_projects_onto_branch_after_first_point(self):
         controller, mission, _ = self.make_course_map_harness()
@@ -3139,26 +3266,18 @@ class IntersectionControllerTest(unittest.TestCase):
                 controller._start_prepared_entry_path.assert_not_called()
 
                 controller.zone_gate_open = True
+                publishes_before_entry_handoff = len(
+                    controller.cmd_pub.messages
+                )
                 self.advance()
-                controller.control_callback(None)
-                self.assertEqual(controller.state, controller.PREPARE_ENTRY_PATH)
-                controller._start_prepared_entry_path.assert_not_called()
-                entry_takeover_stop = controller.cmd_pub.messages[-1]
-                self.assertEqual(entry_takeover_stop.linear.x, 0.0)
-                self.assertEqual(entry_takeover_stop.angular.z, 0.0)
-
-                # Path creation must use an EKF sample received after the
-                # blocking lane-ownership service has returned.
-                self.advance(0.05)
-                controller.control_callback(None)
-                self.assertEqual(controller.state, controller.PREPARE_ENTRY_PATH)
-                controller._start_prepared_entry_path.assert_not_called()
-
-                controller.odom_sequence += 1
-                self.advance(0.05)
                 controller.control_callback(None)
                 self.assertEqual(controller.state, controller.FOLLOW_ENTRY_PATH)
                 controller._start_prepared_entry_path.assert_called_once_with()
+                self.assertEqual(
+                    len(controller.cmd_pub.messages),
+                    publishes_before_entry_handoff + 1,
+                )
+                self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
 
                 publishes_before_arc_handoff = len(controller.cmd_pub.messages)
                 self.advance()
@@ -3192,27 +3311,12 @@ class IntersectionControllerTest(unittest.TestCase):
                 controller.localized_map_y = selected_start[1]
                 self.advance()
                 controller.control_callback(None)
-                self.assertEqual(controller.state, controller.PREPARE_EXIT_PATH)
+                self.assertEqual(controller.state, controller.FOLLOW_EXIT_PATH)
                 self.assertEqual(
                     len(controller.cmd_pub.messages),
                     publishes_before_arc_end + 1,
                 )
-                takeover_stop = controller.cmd_pub.messages[-1]
-                self.assertEqual(takeover_stop.linear.x, 0.0)
-                self.assertEqual(takeover_stop.angular.z, 0.0)
-                controller._generate_exit_path.assert_not_called()
-
-                # Time alone is insufficient: path generation must wait for
-                # an EKF odometry sample acquired after lane handoff.
-                self.advance(0.05)
-                controller.control_callback(None)
-                self.assertEqual(controller.state, controller.PREPARE_EXIT_PATH)
-                controller._generate_exit_path.assert_not_called()
-
-                controller.odom_sequence += 1
-                self.advance(0.06)
-                controller.control_callback(None)
-                self.assertEqual(controller.state, controller.FOLLOW_EXIT_PATH)
+                self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
                 controller._generate_exit_path.assert_called_once_with()
 
                 publishes_before_final_handoff = len(controller.cmd_pub.messages)
@@ -3260,10 +3364,8 @@ class IntersectionControllerTest(unittest.TestCase):
                     controller.state_history,
                     [
                         controller.WAIT_ENTRY_HANDOFF,
-                        controller.PREPARE_ENTRY_PATH,
                         controller.FOLLOW_ENTRY_PATH,
                         controller.FOLLOW_ARC_LANE,
-                        controller.PREPARE_EXIT_PATH,
                         controller.FOLLOW_EXIT_PATH,
                         controller.VERIFY_FINAL_LANE,
                         controller.COMPLETE,
@@ -3316,52 +3418,139 @@ class IntersectionControllerTest(unittest.TestCase):
         self.assertEqual(controller.state, controller.SEARCH_DIRECTION)
         self.assertFalse(controller.mission_has_control)
 
-    def test_prepare_entry_times_out_without_post_handoff_odometry(self):
+    def test_command_observer_keeps_latest_lane_command_only(self):
+        controller = self.make_transition_harness(
+            IntersectionMissionController.LEFT
+        )
+        command = controller_module.Twist()
+        command.linear.x = 0.093
+        command.angular.z = -0.27
+        controller.command_observer_callback(command)
+
+        self.assertAlmostEqual(controller.observed_lane_linear, 0.093)
+        self.assertAlmostEqual(controller.observed_lane_angular, -0.27)
+        self.assertEqual(controller.observed_lane_command_received, self.now())
+
+        controller.mission_has_control = True
+        mission_command = controller_module.Twist()
+        mission_command.linear.x = 0.04
+        mission_command.angular.z = 0.55
+        controller.command_observer_callback(mission_command)
+        self.assertAlmostEqual(controller.observed_lane_linear, 0.093)
+        self.assertAlmostEqual(controller.observed_lane_angular, -0.27)
+
+    def test_exit_planning_retries_while_lane_keeps_control(self):
         controller = self.make_transition_harness(
             IntersectionMissionController.LEFT
         )
         controller.direction = controller.LEFT
-        controller.state = controller.PREPARE_ENTRY_PATH
+        controller.state = controller.FOLLOW_ARC_LANE
         controller.state_started = self.now()
-        controller.entry_takeover_odom_sequence = controller.odom_sequence
-        controller.entry_takeover_pose_timeout = 0.10
-        controller.mission_has_control = True
-        controller._fail = mock.Mock()
-
-        self.advance(0.11)
-        controller.control_callback(None)
-
-        controller._fail.assert_called_once()
-        self.assertIn(
-            "no post-handoff EKF pose",
-            controller._fail.call_args.args[0],
-        )
-        controller._start_prepared_entry_path.assert_not_called()
-        stop = controller.cmd_pub.messages[-1]
-        self.assertEqual(stop.linear.x, 0.0)
-        self.assertEqual(stop.angular.z, 0.0)
-
-    def test_prepare_exit_retries_transient_generation_then_follows_path(self):
-        controller = self.make_transition_harness(
-            IntersectionMissionController.LEFT
-        )
-        controller.state = controller.PREPARE_EXIT_PATH
-        controller.state_started = self.now()
-        controller.exit_takeover_odom_sequence = controller.odom_sequence
-        controller.odom_sequence += 1
+        controller.arc_lane_start_distance = 0.0
+        controller.total_distance = 0.65
+        selected_start = controller._selected_exit_control_points()[0]
+        controller.localized_map_x = selected_start[0]
+        controller.localized_map_y = selected_start[1]
         controller._generate_exit_path = mock.Mock(
             side_effect=(None, True)
         )
 
-        self.advance(controller.exit_takeover_settle_time + 0.01)
         controller.control_callback(None)
-        self.assertEqual(controller.state, controller.PREPARE_EXIT_PATH)
+        self.assertEqual(controller.state, controller.FOLLOW_ARC_LANE)
         self.assertEqual(controller._generate_exit_path.call_count, 1)
+        self.assertEqual(controller.handoff_history, [])
+        self.assertEqual(controller.cmd_pub.messages, [])
 
         self.advance(0.05)
         controller.control_callback(None)
         self.assertEqual(controller.state, controller.FOLLOW_EXIT_PATH)
         self.assertEqual(controller._generate_exit_path.call_count, 2)
+        self.assertEqual(controller.handoff_history, [False])
+        self.assertEqual(len(controller.cmd_pub.messages), 1)
+        self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
+
+    def test_exit_sweep_releases_lock_and_commits_latest_pose_and_command(self):
+        controller = self.make_transition_harness(
+            IntersectionMissionController.LEFT
+        )
+        controller.direction = controller.LEFT
+        controller.state = controller.FOLLOW_ARC_LANE
+        controller.state_started = self.now()
+        controller.exit_plan_in_progress = True
+        controller.exit_local_snap_max_distance = 0.06
+        controller.shutting_down = False
+        controller.manual_stop = False
+        live_pose = [0.0, 0.0, 0.0]
+        controller._tracking_pose = lambda: tuple(live_pose)
+        executable = controller_module.path_from_xy(
+            ((0.0, 0.0), (0.20, 0.0)),
+            "odom",
+            target_speed=0.10,
+        )
+        activation = {"path": executable}
+        sweep_started = threading.Event()
+        release_sweep = threading.Event()
+
+        def blocked_generation(**_kwargs):
+            sweep_started.set()
+            if not release_sweep.wait(timeout=1.0):
+                raise RuntimeError("timed out waiting to release exit sweep")
+            return activation
+
+        controller._generate_exit_path = blocked_generation
+        controller.path_validator = SimpleNamespace(
+            validate_poses=lambda *_args, **_kwargs: SimpleNamespace(
+                safe=True,
+                minimum_line_clearance=0.05,
+                minimum_obstacle_clearance=math.inf,
+                minimum_map_clearance=0.10,
+            )
+        )
+        controller._commit_path_activation = mock.Mock()
+        controller._attempt_exit_takeover = (
+            IntersectionMissionController._attempt_exit_takeover.__get__(
+                controller, IntersectionMissionController
+            )
+        )
+        snapshot = {
+            "state_started": controller.state_started,
+            "arm_seq": controller.arm_seq,
+            "direction": controller.direction,
+            "tracking_from_local": controller.local_to_odom,
+            "tracking_pose": Pose2D(0.0, 0.0, 0.0),
+            "arc_distance": 0.65,
+        }
+        errors = []
+
+        def run_attempt():
+            try:
+                controller._attempt_exit_takeover(snapshot)
+            except BaseException as error:  # Thread failures must fail the test.
+                errors.append(error)
+
+        worker = threading.Thread(target=run_attempt)
+        worker.start()
+        self.assertTrue(sweep_started.wait(timeout=1.0))
+
+        lane_command = controller_module.Twist()
+        lane_command.linear.x = 0.087
+        lane_command.angular.z = -0.19
+        controller.command_observer_callback(lane_command)
+        with controller.lock:
+            live_pose[:] = (0.02, 0.0, 0.0)
+
+        release_sweep.set()
+        worker.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        commit = controller._commit_path_activation.call_args
+        self.assertAlmostEqual(commit.args[1].x, 0.02)
+        self.assertAlmostEqual(commit.kwargs["initial_linear"], 0.087)
+        self.assertAlmostEqual(commit.kwargs["initial_angular"], -0.19)
+        self.assertEqual(controller.handoff_history, [False])
+        self.assertEqual(controller.state, controller.FOLLOW_EXIT_PATH)
+        self.assertGreater(controller.cmd_pub.messages[-1].linear.x, 0.0)
 
     def test_both_directions_feed_one_fixed_common_exit(self):
         mission = load_mission_config()

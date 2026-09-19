@@ -439,24 +439,39 @@ def build_speed_profile(station, curvature, profile):
     speed = np.minimum(nominal_speed, physical_limit)
 
     def apply_longitudinal_limits():
-        for index in range(count - 2, -1, -1):
-            reachable = math.sqrt(
-                max(
-                    0.0,
-                    speed[index + 1] ** 2
-                    + 2.0 * profile.linear_deceleration * segment[index],
-                )
+        # The two scalar recurrences have an equivalent cumulative-minimum
+        # form in squared-speed space.  Keeping this authoritative calculation
+        # vectorized matters when a local planner compares hundreds of route
+        # candidates, while producing the same forward/backward envelope as
+        # the point-wise passes.
+        squared = speed * speed
+        backward = (
+            np.minimum.accumulate(
+                (
+                    squared
+                    + 2.0 * profile.linear_deceleration * station
+                )[::-1]
+            )[::-1]
+            - 2.0 * profile.linear_deceleration * station
+        )
+        roundoff = 16.0 * np.finfo(np.float64).eps * np.maximum(
+            1.0, np.abs(squared)
+        )
+        backward = np.where(
+            backward >= squared - roundoff, squared, backward
+        )
+        squared = np.minimum(squared, backward)
+        forward = (
+            np.minimum.accumulate(
+                squared - 2.0 * profile.linear_acceleration * station
             )
-            speed[index] = min(speed[index], reachable)
-        for index in range(count - 1):
-            reachable = math.sqrt(
-                max(
-                    0.0,
-                    speed[index] ** 2
-                    + 2.0 * profile.linear_acceleration * segment[index],
-                )
-            )
-            speed[index + 1] = min(speed[index + 1], reachable)
+            + 2.0 * profile.linear_acceleration * station
+        )
+        roundoff = 16.0 * np.finfo(np.float64).eps * np.maximum(
+            1.0, np.abs(squared)
+        )
+        forward = np.where(forward >= squared - roundoff, squared, forward)
+        speed[:] = np.sqrt(np.maximum(0.0, np.minimum(squared, forward)))
 
     apply_longitudinal_limits()
     if math.isfinite(profile.angular_acceleration):
@@ -471,14 +486,18 @@ def build_speed_profile(station, curvature, profile):
             )
             if offending.size == 0:
                 break
-            for index in offending:
-                scale = math.sqrt(
-                    profile.angular_acceleration
-                    / max(float(measured[index]), 1e-12)
-                )
-                scale *= 1.0 - 1e-6
-                speed[index] *= scale
-                speed[index + 1] *= scale
+            scales = np.sqrt(
+                profile.angular_acceleration
+                / np.maximum(measured[offending], 1e-12)
+            )
+            scales *= 1.0 - 1e-6
+            point_scale = np.ones(count, dtype=np.float64)
+            # Adjacent offending intervals multiply their shared point twice
+            # in the scalar algorithm. ``multiply.at`` preserves that exact
+            # behaviour while avoiding one Python loop per interval.
+            np.multiply.at(point_scale, offending, scales)
+            np.multiply.at(point_scale, offending + 1, scales)
+            speed *= point_scale
             apply_longitudinal_limits()
         else:
             raise ValueError("speed profile cannot satisfy angular acceleration")
@@ -3101,6 +3120,81 @@ class PathFollower:
             # and make the robot understeer precisely while braking near a
             # boundary or obstacle.
             tracking.angular_velocity,
+            self.last_linear,
+            self.last_angular,
+            elapsed,
+            self.config,
+        )
+        self.last_linear = limited.linear_velocity
+        self.last_angular = limited.angular_velocity
+        self.diagnostics.commanded_linear = limited.linear_velocity
+        self.diagnostics.commanded_angular = limited.angular_velocity
+        return limited, tracking
+
+    def terminal_continuation(
+        self,
+        pose,
+        elapsed,
+        target_speed,
+        speed_limit=math.inf,
+        tracking=None,
+    ):
+        """Continue through a validated handoff corridor on the end tangent.
+
+        A fixed mission path can end before the rolling lane controller is
+        ready to accept ``cmd_vel``.  Once that endpoint has genuinely been
+        reached, keep the configured positive join speed and hold the final
+        path tangent instead of entering the normal terminal stop.  The caller
+        remains responsible for supplying the current swept-safety speed limit;
+        a zero limit still uses the ordinary slew-bounded stop.
+        """
+        if self.path is None:
+            raise ValueError("no path is active")
+        pose = Pose2D.from_value(pose)
+        if tracking is None:
+            tracking = self.calculate_tracking(pose)
+        self._record_tracking(tracking)
+        status = _goal_status_from_progress(
+            self.path,
+            pose,
+            tracking.path_index,
+            tracking.station,
+        )
+        if not (status.complete or status.crossed_terminal):
+            raise ValueError(
+                "terminal continuation requires a reached path endpoint"
+            )
+
+        magnitude = min(
+            max(0.0, float(target_speed)),
+            max(0.0, float(speed_limit)),
+            self.config.maximum_linear_velocity,
+        )
+        if magnitude <= 1e-9:
+            return self._terminal_hold_command(status, elapsed), tracking
+
+        direction = int(self.path.direction[-1])
+        endpoint_motion_yaw = normalize_angle(
+            float(self.path.heading[-1]) + (math.pi if direction < 0 else 0.0)
+        )
+        current_motion_yaw = normalize_angle(
+            pose.yaw + (math.pi if direction < 0 else 0.0)
+        )
+        heading_error = normalize_angle(endpoint_motion_yaw - current_motion_yaw)
+        endpoint_curvature = (
+            float(self.path.feedforward_scale[-1])
+            * float(self.path.curvature[-1])
+        )
+        target_angular = clamp(
+            magnitude * endpoint_curvature
+            + self.config.heading_gain * heading_error,
+            -self.config.maximum_angular_velocity,
+            self.config.maximum_angular_velocity,
+        )
+        limited = limit_velocity_command(
+            direction * magnitude,
+            magnitude,
+            target_angular,
             self.last_linear,
             self.last_angular,
             elapsed,

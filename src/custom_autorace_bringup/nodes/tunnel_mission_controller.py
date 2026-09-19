@@ -363,6 +363,72 @@ def tracking_path_with_exit_connector(
     return path, connector_station
 
 
+def tracking_path_with_entry(
+    entry,
+    tunnel_path,
+    cruise_velocity,
+    minimum_velocity,
+    entry_velocity,
+    exit_velocity,
+    maximum_angular_velocity,
+    maximum_lateral_acceleration,
+    linear_acceleration,
+    linear_deceleration,
+    maximum_angular_acceleration,
+    frame_id,
+):
+    """Prepend the live portal entry to one preplanned tunnel route."""
+    if entry is None or entry.x.size < 2:
+        raise ValueError("a tunnel entry path needs at least two poses")
+    if tunnel_path is None or tunnel_path.x.size < 2:
+        raise ValueError("a preplanned tunnel path needs at least two poses")
+    position_gap = math.hypot(
+        float(tunnel_path.x[0]) - float(entry.x[-1]),
+        float(tunnel_path.y[0]) - float(entry.y[-1]),
+    )
+    heading_gap = abs(
+        normalize_angle(
+            float(tunnel_path.heading[0]) - float(entry.heading[-1])
+        )
+    )
+    if position_gap > 1e-6 or heading_gap > 1e-6:
+        raise ValueError("tunnel entry and Hybrid A* poses do not meet")
+
+    x = np.concatenate((entry.x, tunnel_path.x[1:]))
+    y = np.concatenate((entry.y, tunnel_path.y[1:]))
+    heading = np.concatenate((entry.heading, tunnel_path.heading[1:]))
+    # Curvature is attached to the outgoing segment at each sample.  The
+    # shared entry/tunnel pose therefore belongs to the first Hybrid A*
+    # primitive, not to the final straight entry sample.
+    curvature = np.concatenate((entry.curvature[:-1], tunnel_path.curvature))
+    station = np.concatenate(
+        ([0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y))))
+    )
+    speed = build_speed_profile(
+        station=station,
+        curvature=curvature,
+        cruise_velocity=cruise_velocity,
+        minimum_velocity=minimum_velocity,
+        entry_velocity=entry_velocity,
+        exit_velocity=exit_velocity,
+        maximum_angular_velocity=maximum_angular_velocity,
+        maximum_lateral_acceleration=maximum_lateral_acceleration,
+        linear_acceleration=linear_acceleration,
+        linear_deceleration=linear_deceleration,
+        maximum_angular_acceleration=maximum_angular_acceleration,
+    )
+    return CommonPath(
+        x=x,
+        y=y,
+        heading=heading,
+        curvature=curvature,
+        station=station,
+        speed=speed,
+        frame_id=frame_id,
+        label="tunnel_entry_hybrid_exit",
+    )
+
+
 class TunnelMissionController:
     """Own ``cmd_vel`` from the ordered entrance gate through lane rejoin."""
 
@@ -802,6 +868,27 @@ class TunnelMissionController:
         self.entry_velocity_cap = max(
             0.0, float(get(prefix + "control/entry_velocity_cap", 0.04))
         )
+        self.entry_handoff_velocity_tolerance = max(
+            0.0,
+            float(
+                get(
+                    prefix + "control/entry_handoff_velocity_tolerance",
+                    0.005,
+                )
+            ),
+        )
+        self.preplan_lane_velocity_cap = max(
+            0.005,
+            min(
+                self.entry_velocity_cap,
+                float(
+                    get(
+                        prefix + "control/preplan_lane_velocity_cap",
+                        0.025,
+                    )
+                ),
+            ),
+        )
         self.lane_resume_max_velocity = max(
             self.entry_velocity_cap,
             float(get(prefix + "control/lane_resume_max_velocity", 0.30)),
@@ -1066,6 +1153,7 @@ class TunnelMissionController:
         self.map_path = None
         self.odom_path = None
         self.entry_staging_station = None
+        self.entry_inside_station = None
         self.exit_connector_station = None
         self.path_index = 0
         self.map_path_index = 0
@@ -1082,6 +1170,15 @@ class TunnelMissionController:
         self.last_expanded_nodes = 0
         self.plan_attempts = 0
         self.replan_count = 0
+        self.prepared_arm_generation = 0
+        self.prepared_tunnel_path = None
+        self.prepared_exit_connector_station = None
+        self.prepared_grid = None
+        self.prepared_costmap_version = -1
+        self.prepared_soft_contact_station = None
+        self.prepared_plan_kind = ""
+        self.dynamic_preplan_generation = 0
+        self.preplan_cap_generation = 0
         self.maximum_position_error_seen = 0.0
         self.maximum_heading_error_seen = 0.0
         self.amcl_anchor_position_delta = 0.0
@@ -1095,8 +1192,12 @@ class TunnelMissionController:
         self.lane_path_minimum_line_clearance = math.nan
         self.lane_path_confirmation_count = 0
         self.last_lane_path_confirmation_time = None
+        self.lane_command_linear = math.nan
+        self.lane_command_angular = math.nan
+        self.lane_command_stamp = None
         self.exit_confirmation_started = False
         self.confirmation_started_at = None
+        self.lane_handoff_retry_pending = False
         self.join_start_x = self.join_start_y = self.join_start_yaw = 0.0
         self.join_origin_ready = False
 
@@ -1189,6 +1290,22 @@ class TunnelMissionController:
         self.last_registration_stamp = None
         self.ready_published_generation = 0
 
+    def _reset_preplan(self):
+        self.planning_generation += 1
+        self.last_plan_attempt = None
+        self.plan_attempts = 0
+        self.last_plan_seconds = 0.0
+        self.last_expanded_nodes = 0
+        self.prepared_arm_generation = 0
+        self.prepared_tunnel_path = None
+        self.prepared_exit_connector_station = None
+        self.prepared_grid = None
+        self.prepared_costmap_version = -1
+        self.prepared_soft_contact_station = None
+        self.prepared_plan_kind = ""
+        self.dynamic_preplan_generation = 0
+        self.preplan_cap_generation = 0
+
     def arm_callback(self, message):
         """Start one source-stamped portal-registration generation."""
         if message.frame_id != "tunnel":
@@ -1217,6 +1334,7 @@ class TunnelMissionController:
             self.start_requested = False
             self.revoke_requested = False
             self._reset_registration()
+            self._reset_preplan()
             if generation > 0 and self.costmap is not None:
                 # Start collecting the live mission-local layer while the
                 # lane controller still drives.  Carry this prepared layer
@@ -1228,6 +1346,7 @@ class TunnelMissionController:
                 self.scan_updates = 0
                 self.last_processed_scan_stamp = None
                 self._publish_costmap(self.armed_at)
+                self._start_preplan(self.armed_at, plan_kind="static")
             if generation > 0 and self.state == self.COMPLETE:
                 self._set_state(self.WAIT_GATE)
             if generation > 0:
@@ -1310,8 +1429,146 @@ class TunnelMissionController:
         )
         return True
 
+    def _start_preplan(self, now, plan_kind="dynamic"):
+        if plan_kind not in ("static", "dynamic"):
+            raise ValueError("unknown tunnel preplan kind")
+        if self.costmap is None:
+            return False
+        if plan_kind == "dynamic" and (
+            self.scan_updates < self.minimum_initial_scans
+        ):
+            return False
+        if self.last_plan_attempt is not None and (
+            now - self.last_plan_attempt
+        ).to_sec() < self.plan_retry_period:
+            return False
+        if self.planning_thread is not None and self.planning_thread.is_alive():
+            return False
+
+        self.last_plan_attempt = now
+        self.plan_attempts += 1
+        grid = self._planner_grid()
+        costmap_version = self.costmap_version
+        self.planning_generation += 1
+        generation = self.planning_generation
+        arm_generation = self.arm_generation
+        worker = threading.Thread(
+            target=self._plan_worker,
+            args=(
+                generation,
+                grid,
+                self.entry_inside_pose,
+                None,
+                costmap_version,
+                self.plan_attempts,
+            ),
+            kwargs={
+                "pre_gate": True,
+                "arm_generation": arm_generation,
+                "plan_kind": plan_kind,
+            },
+            name="tunnel_hybrid_astar_%s_preplan" % plan_kind,
+        )
+        worker.daemon = True
+        self.planning_thread = worker
+        worker.start()
+        return True
+
+    def _start_dynamic_preplan(self, now):
+        """Plan once from the first confirmed live layer while lane owns cmd_vel."""
+        if self.dynamic_preplan_generation == self.arm_generation:
+            return False
+        if self.planning_thread is not None and self.planning_thread.is_alive():
+            return False
+        self.prepared_arm_generation = 0
+        self.prepared_tunnel_path = None
+        self.prepared_exit_connector_station = None
+        self.prepared_grid = None
+        self.prepared_costmap_version = -1
+        self.prepared_soft_contact_station = None
+        self.prepared_plan_kind = ""
+        self.last_plan_attempt = None
+        if self.preplan_cap_generation != self.arm_generation:
+            self.speed_limit_pub.publish(
+                Float64(data=self.preplan_lane_velocity_cap)
+            )
+            self.preplan_cap_generation = self.arm_generation
+        if not self._start_preplan(now, plan_kind="dynamic"):
+            return False
+        self.dynamic_preplan_generation = self.arm_generation
+        rospy.loginfo(
+            "Tunnel dynamic preplan started while lane owns cmd_vel: cap=%.3fm/s",
+            self.preplan_lane_velocity_cap,
+        )
+        return True
+
+    def _prepared_path_needs_dynamic_preplan(self, grid):
+        """Return whether live evidence invalidated the prepared tunnel tail."""
+        if self.prepared_tunnel_path is None:
+            return True
+        if not self._path_is_safe(grid, self.prepared_tunnel_path, 0):
+            return True
+        return bool(
+            self.prepared_plan_kind == "static"
+            and self._path_has_new_soft_cost(
+                grid,
+                self.prepared_tunnel_path,
+                self.prepared_grid,
+            )
+        )
+
+    def _restart_dynamic_preplan(self, now):
+        """Replace one invalid prepared tail using the newest live layer."""
+        if self.prepared_plan_kind == "dynamic":
+            self.dynamic_preplan_generation = 0
+        return self._start_dynamic_preplan(now)
+
+    def _route_with_live_entry(self, start, entry_velocity=None):
+        if (
+            self.prepared_arm_generation != self.arm_generation
+            or self.prepared_tunnel_path is None
+            or self.prepared_exit_connector_station is None
+        ):
+            raise ValueError("tunnel Hybrid A* preplan is unavailable")
+        entry_path, staging_station = portal_entry_path(
+            start,
+            self.entry_staging_pose,
+            self.entry_inside_pose,
+            self.entry_tangent_ratio,
+            self.entry_minimum_tangent_length,
+            self.entry_maximum_tangent_length,
+            self.portal_sample_step,
+            self.entry_portal_velocity,
+            self.map_frame,
+        )
+        initial_velocity = (
+            self.entry_velocity
+            if entry_velocity is None
+            else clamp(entry_velocity, 0.005, self.cruise_velocity)
+        )
+        route = tracking_path_with_entry(
+            entry_path,
+            self.prepared_tunnel_path,
+            self.cruise_velocity,
+            self.minimum_velocity,
+            initial_velocity,
+            self.exit_velocity,
+            self.maximum_angular_velocity,
+            self.maximum_lateral_acceleration,
+            self.linear_acceleration,
+            self.linear_deceleration,
+            self.angular_acceleration,
+            self.map_frame,
+        )
+        return (
+            route,
+            staging_station,
+            entry_path.length,
+            entry_path.length + self.prepared_exit_connector_station,
+        )
+
     def _try_publish_ready(self, stamp):
-        """Publish readiness only at a safe, no-dwell lane handoff lead."""
+        """Publish readiness after the complete tunnel route is preplanned."""
         if (
             self.arm_generation <= 0
             or self.registered_map_from_odom is None
@@ -1321,6 +1578,25 @@ class TunnelMissionController:
             or self.registration_source_stamp is None
             or stamp < self.registration_source_stamp
         ):
+            return False
+        now = rospy.Time.now()
+        source_age = (now - stamp).to_sec()
+        if (
+            source_age > self.scan_timeout
+            or source_age < -self.maximum_future_stamp
+        ):
+            return False
+        if self.costmap is None or self.scan_updates < self.minimum_initial_scans:
+            return False
+        if (
+            self.prepared_arm_generation != self.arm_generation
+            or self.prepared_tunnel_path is None
+        ):
+            self._start_dynamic_preplan(now)
+            return False
+        grid = self._planner_grid()
+        if self._prepared_path_needs_dynamic_preplan(grid):
+            self._restart_dynamic_preplan(now)
             return False
         synchronized = self._synchronized_odom_pose(stamp)
         if synchronized is None or self.odom_frame != self.registered_odom_frame:
@@ -1345,27 +1621,12 @@ class TunnelMissionController:
             self.ready_maximum_heading_error
         ):
             return False
-        if self.costmap is None:
-            return False
-        if self.scan_updates < self.minimum_initial_scans:
-            return False
         try:
-            entry_path, _ = portal_entry_path(
-                pose,
-                self.entry_staging_pose,
-                self.entry_inside_pose,
-                self.entry_tangent_ratio,
-                self.entry_minimum_tangent_length,
-                self.entry_maximum_tangent_length,
-                self.portal_sample_step,
-                self.entry_portal_velocity,
-                self.map_frame,
-            )
-            grid = self._planner_grid()
+            route, _, _, _ = self._route_with_live_entry(pose)
         except (TypeError, ValueError):
             return False
         if (
-            not self._path_is_safe(grid, entry_path, 0)
+            not self._path_is_safe(grid, route, 0)
             or not self.planner.pose_is_collision_free(grid, self.goal)
         ):
             return False
@@ -1380,7 +1641,8 @@ class TunnelMissionController:
         ready.frame_id = "tunnel"
         self.ready_pub.publish(ready)
         rospy.loginfo(
-            "Tunnel locally ready: generation=%d entry_lead=%.3fm",
+            "Tunnel locally ready with preplanned route: generation=%d "
+            "entry_lead=%.3fm",
             self.arm_generation,
             lead,
         )
@@ -1398,6 +1660,8 @@ class TunnelMissionController:
                 and self.ready_published_generation == self.arm_generation
                 and self.registered_map_from_odom is not None
                 and self.registered_odom_frame
+                and self.prepared_arm_generation == self.arm_generation
+                and self.prepared_tunnel_path is not None
             )
             self.zone_gate = self.gate_requested and prepared
             if self.gate_requested and not prepared:
@@ -1537,6 +1801,12 @@ class TunnelMissionController:
             self.minimum_planning_scan_updates = self.minimum_initial_scans
             self.last_processed_scan_stamp = None
             self._publish_costmap(message.header.stamp)
+            if (
+                self.arm_generation > 0
+                and self.state == self.WAIT_GATE
+                and self.prepared_arm_generation != self.arm_generation
+            ):
+                self._start_preplan(rospy.Time.now(), plan_kind="static")
         rospy.loginfo(
             "Tunnel costmap ready: %dx%d at %.3fm, bounds=%s",
             candidate.width,
@@ -1577,9 +1847,9 @@ class TunnelMissionController:
             )
             pre_gate_scan = bool(
                 self.arm_generation > 0
+                and self.state == self.WAIT_GATE
                 and self.registered_map_from_odom is not None
                 and self.registered_odom_frame
-                and self.ready_published_generation != self.arm_generation
                 and self.costmap is not None
             )
             active_scan = bool(
@@ -1699,9 +1969,9 @@ class TunnelMissionController:
             pre_gate_scan = bool(
                 not active_scan
                 and self.arm_generation > 0
+                and self.state == self.WAIT_GATE
                 and self.registered_map_from_odom is not None
                 and self.registered_odom_frame == target_frame
-                and self.ready_published_generation != self.arm_generation
                 and self.costmap is not None
             )
             if not active_scan and not pre_gate_scan:
@@ -1747,7 +2017,7 @@ class TunnelMissionController:
                     and self.costmap is not None
                     and self.registered_map_from_odom == map_from_odom
                     and self.registered_odom_frame == target_frame
-                    and self.ready_published_generation != self.arm_generation
+                    and self.state == self.WAIT_GATE
                 )
             if not context_valid:
                 return
@@ -1778,7 +2048,17 @@ class TunnelMissionController:
                 self.grid_cache = None
                 self.grid_cache_version = -1
                 self._publish_costmap(self.scan_stamp)
-            if not active_scan:
+            if (
+                active_scan
+                and self.state == self.ACQUIRING
+                and not self.mission_has_control
+                and self.prepared_arm_generation != self.arm_generation
+                and self.dynamic_preplan_generation != self.arm_generation
+            ):
+                # A rejected pre-handoff plan is retried only after this newer
+                # scan has updated the layer, never in a same-grid busy loop.
+                self._start_dynamic_preplan(processed)
+            elif not active_scan:
                 self._try_publish_ready(source_stamp)
 
     def lane_path_diagnostics_callback(self, message):
@@ -1798,6 +2078,10 @@ class TunnelMissionController:
             self.lane_path_minimum_line_clearance = (
                 diagnostics.minimum_line_clearance if valid else math.nan
             )
+            if valid:
+                self.lane_command_linear = float(diagnostics.commanded_linear)
+                self.lane_command_angular = float(diagnostics.commanded_angular)
+                self.lane_command_stamp = now
             if not valid or not (
                 self.exit_confirmation_started or self.state == self.JOINING_LANE
             ):
@@ -1852,12 +2136,17 @@ class TunnelMissionController:
             )
             response = self.lane_service(enabled)
             if not response.success:
-                raise rospy.ServiceException(response.message)
+                rospy.logwarn_throttle(
+                    0.5,
+                    "Tunnel cmd_vel handoff deferred: %s",
+                    response.message,
+                )
+                return False
             self.mission_has_control = not enabled
             return True
         except (rospy.ROSException, rospy.ServiceException) as error:
             rospy.logerr("Tunnel cmd_vel handoff failed: %s", error)
-            return False
+            return None
 
     def _stop_lane_controller(self):
         try:
@@ -1882,6 +2171,7 @@ class TunnelMissionController:
         self.map_path = None
         self.odom_path = None
         self.entry_staging_station = None
+        self.entry_inside_station = None
         self.exit_connector_station = None
         self.planned_grid = None
         self.soft_replan_contact_station = None
@@ -1898,12 +2188,12 @@ class TunnelMissionController:
         self.amcl_anchor_heading_delta = 0.0
         self.planning_generation += 1
         self.planning_thread = None
-        self.plan_attempts = 0
         self.replan_count = 0
         self.maximum_position_error_seen = 0.0
         self.maximum_heading_error_seen = 0.0
         self.exit_confirmation_started = False
         self.confirmation_started_at = None
+        self.lane_handoff_retry_pending = False
         self.lane_path_stamp = None
         self.lane_path_valid = False
         self.lane_path_minimum_line_clearance = math.nan
@@ -1912,21 +2202,116 @@ class TunnelMissionController:
         self.join_origin_ready = False
         self._set_state(self.ACQUIRING, now)
 
+    def _handoff_motion(self, now, route):
+        measured_linear = max(0.0, float(self.odom_linear_velocity))
+        measured_angular = clamp(
+            self.odom_angular_velocity,
+            -self.maximum_angular_velocity,
+            self.maximum_angular_velocity,
+        )
+        if (
+            self.lane_command_stamp is not None
+            and (now - self.lane_command_stamp).to_sec() <= self.lane_path_timeout
+            and math.isfinite(self.lane_command_linear)
+            and math.isfinite(self.lane_command_angular)
+        ):
+            linear = max(0.0, self.lane_command_linear)
+            angular = clamp(
+                self.lane_command_angular,
+                -self.maximum_angular_velocity,
+                self.maximum_angular_velocity,
+            )
+        else:
+            linear = measured_linear
+            angular = measured_angular
+        if linear > self.entry_velocity_cap:
+            scale = self.entry_velocity_cap / linear
+            linear = self.entry_velocity_cap
+            angular *= scale
+        if linear <= 1e-4:
+            linear = min(float(route.speed[0]), self.entry_velocity_cap)
+            angular = clamp(
+                linear * float(route.curvature[0]),
+                -self.maximum_angular_velocity,
+                self.maximum_angular_velocity,
+            )
+        return linear, angular
+
     def _acquire(self, now):
-        if (now - self.state_started).to_sec() > self.acquisition_timeout:
-            self._fail("timed out while acquiring cmd_vel")
-            return False
         problem = self._input_problem(now, require_scan=False)
         if problem is not None:
             rospy.logwarn_throttle(
                 1.0, "Waiting to use locally registered tunnel frame: %s", problem
             )
             return False
-        if not self._set_lane_controller(False):
-            self._fail("could not acquire cmd_vel")
+        if self.prepared_arm_generation != self.arm_generation:
+            rospy.logwarn_throttle(
+                1.0, "Waiting for tunnel Hybrid A* preplan"
+            )
             return False
         self.map_from_odom = self.registered_map_from_odom
         self.frozen_odom_frame = self.registered_odom_frame
+        grid = self._planner_grid()
+        if self._prepared_path_needs_dynamic_preplan(grid):
+            if self._restart_dynamic_preplan(now):
+                self.state_started = now
+            return False
+        if (now - self.state_started).to_sec() > self.acquisition_timeout:
+            self._fail("timed out while acquiring cmd_vel")
+            return False
+        if self.odom_linear_velocity > (
+            self.entry_velocity_cap + self.entry_handoff_velocity_tolerance
+        ):
+            rospy.loginfo_throttle(
+                1.0,
+                "Tunnel lane handoff remains moving while entry cap settles: "
+                "v=%.3f cap=%.3f",
+                self.odom_linear_velocity,
+                self.entry_velocity_cap,
+            )
+            return False
+        start = Pose2D(*self._actual_map_pose())
+        try:
+            route, staging_station, inside_station, exit_station = (
+                self._route_with_live_entry(
+                    start,
+                    entry_velocity=max(
+                        self.entry_velocity,
+                        min(
+                            max(0.0, self.odom_linear_velocity),
+                            self.entry_velocity_cap,
+                        ),
+                    ),
+                )
+            )
+        except ValueError as error:
+            self._fail("could not refresh preplanned tunnel entry: %s" % error)
+            return False
+        if not self._path_is_safe(grid, route, 0):
+            self._fail("preplanned tunnel route changed before handoff")
+            return False
+        initial_linear, initial_angular = self._handoff_motion(now, route)
+        if not self._command_is_safe(grid, initial_linear, initial_angular):
+            self._fail("moving tunnel handoff command is not collision-free")
+            return False
+        self._commit_tracking_path(
+            route,
+            grid,
+            now,
+            initial_linear=initial_linear,
+            initial_angular=initial_angular,
+        )
+        self.entry_staging_station = staging_station
+        self.entry_inside_station = inside_station
+        self.exit_connector_station = exit_station
+        self.soft_replan_contact_station = (
+            None
+            if self.prepared_soft_contact_station is None
+            else inside_station + self.prepared_soft_contact_station
+        )
+        if self._set_lane_controller(False) is not True:
+            self._fail("could not acquire cmd_vel")
+            return False
         rospy.loginfo(
             "Tunnel mission-local frame frozen from LiDAR: generation=%d "
             "template_from_%s=(%.4f, %.4f, %.2fdeg)",
@@ -1936,10 +2321,20 @@ class TunnelMissionController:
             self.map_from_odom[1],
             math.degrees(self.map_from_odom[2]),
         )
-        self._publish_stop()
+        command = Twist()
+        command.linear.x = initial_linear
+        command.angular.z = initial_angular
+        self.cmd_pub.publish(command)
+        self.last_command_time = now
         self.mission_started = now
         self._set_state(self.ALIGNING_ENTRY, now)
-        return True
+        rospy.loginfo(
+            "Tunnel moving handoff: v=%.3fm/s w=%.3frad/s route=%.3fm",
+            initial_linear,
+            initial_angular,
+            route.length,
+        )
+        return False
 
     def _input_problem(self, now, require_scan=True):
         if self.costmap is None:
@@ -2035,6 +2430,7 @@ class TunnelMissionController:
         self.map_path = None
         self.odom_path = None
         self.entry_staging_station = None
+        self.entry_inside_station = None
         self.exit_connector_station = None
         self.planned_grid = None
         self.soft_replan_contact_station = None
@@ -2042,7 +2438,14 @@ class TunnelMissionController:
         self.map_path_index = 0
         self.remaining_distance = math.inf
 
-    def _commit_tracking_path(self, map_path, grid, now):
+    def _commit_tracking_path(
+        self,
+        map_path,
+        grid,
+        now,
+        initial_linear=0.0,
+        initial_angular=0.0,
+    ):
         """Freeze one already-validated map path into the odometry frame."""
         actual_map_pose = self._actual_map_pose()
         odom_pose = (self.odom_x, self.odom_y, self.odom_yaw)
@@ -2060,8 +2463,12 @@ class TunnelMissionController:
         self.map_path_index = 0
         self.remaining_distance = map_path.length
         self.planned_costmap_version = self.costmap_version
-        self.last_linear = 0.0
-        self.last_angular = 0.0
+        self.last_linear = max(0.0, float(initial_linear))
+        self.last_angular = clamp(
+            float(initial_angular),
+            -self.maximum_angular_velocity,
+            self.maximum_angular_velocity,
+        )
         self.last_command_time = now
         self._publish_path()
         self._publish_diagnostics()
@@ -2102,127 +2509,13 @@ class TunnelMissionController:
         if self.map_path is not None:
             self._follow(now)
             return
-        self._publish_stop()
-        if self._portal_path_problem(
-            now, self.entry_alignment_timeout, "entry alignment"
-        ):
-            return
-        problem = self._input_problem(now, require_scan=True)
-        if problem is not None:
-            rospy.logwarn_throttle(
-                1.0, "Waiting to align at tunnel entrance: %s", problem
-            )
-            return
-        if (
-            abs(self.odom_linear_velocity) > self.planning_stopped_linear
-            or abs(self.odom_angular_velocity) > self.planning_stopped_angular
-        ):
-            return
-        start = Pose2D(*self._actual_map_pose())
-        distance = math.hypot(
-            start.x - self.entry_staging_pose.x,
-            start.y - self.entry_staging_pose.y,
-        )
-        heading_error = abs(
-            normalize_angle(start.yaw - self.entry_staging_pose.yaw)
-        )
-        if (
-            distance <= self.entry_path_position_tolerance
-            and heading_error <= self.entry_path_heading_tolerance
-        ):
-            self._set_state(self.ENTERING, now)
-            return
-        try:
-            path, staging_station = portal_entry_path(
-                start,
-                self.entry_staging_pose,
-                self.entry_inside_pose,
-                self.entry_tangent_ratio,
-                self.entry_minimum_tangent_length,
-                self.entry_maximum_tangent_length,
-                self.portal_sample_step,
-                self.entry_portal_velocity,
-                self.map_frame,
-            )
-        except ValueError as error:
-            self._fail("invalid tunnel entry alignment: %s" % error)
-            return
-        grid = self._planner_grid()
-        if not self._path_is_safe(grid, path, 0):
-            self._fail("surveyed aligned tunnel entry is not collision-free")
-            return
-        self._commit_tracking_path(path, grid, now)
-        self.entry_staging_station = staging_station
-        rospy.loginfo(
-            "Tunnel aligned entry path: %.3fm (staging %.3fm) via "
-            "(%.4f, %.4f, %.1fdeg)",
-            path.length,
-            staging_station,
-            self.entry_staging_pose.x,
-            self.entry_staging_pose.y,
-            math.degrees(self.entry_staging_pose.yaw),
-        )
+        self._fail("continuous preplanned tunnel route is missing at handoff")
 
     def _entering_tick(self, now):
         if self.map_path is not None:
             self._follow(now)
             return
-        self._publish_stop()
-        if self._portal_path_problem(
-            now, self.entry_straight_timeout, "straight entry"
-        ):
-            return
-        problem = self._input_problem(now, require_scan=True)
-        if problem is not None:
-            self._fail("tunnel straight entry lost %s" % problem)
-            return
-        if (
-            abs(self.odom_linear_velocity) > self.planning_stopped_linear
-            or abs(self.odom_angular_velocity) > self.planning_stopped_angular
-        ):
-            return
-        start = Pose2D(*self._actual_map_pose())
-        staging_error = math.hypot(
-            start.x - self.entry_staging_pose.x,
-            start.y - self.entry_staging_pose.y,
-        )
-        heading_error = abs(
-            normalize_angle(start.yaw - self.entry_staging_pose.yaw)
-        )
-        if (
-            staging_error > self.entry_path_position_tolerance
-            or heading_error > self.entry_path_heading_tolerance
-        ):
-            self._fail(
-                "tunnel entry staging alignment was not retained "
-                "(%.3fm/%.1fdeg)"
-                % (staging_error, math.degrees(heading_error))
-            )
-            return
-        travel_yaw = self.entry_staging_pose.yaw
-        distance = (
-            (self.entry_inside_pose.x - start.x) * math.cos(travel_yaw)
-            + (self.entry_inside_pose.y - start.y) * math.sin(travel_yaw)
-        )
-        try:
-            path = portal_straight_path(
-                start,
-                travel_yaw,
-                distance,
-                self.portal_sample_step,
-                self.entry_portal_velocity,
-                self.map_frame,
-                "tunnel_straight_entry",
-            )
-        except ValueError as error:
-            self._fail("invalid tunnel straight entry: %s" % error)
-            return
-        grid = self._planner_grid()
-        if not self._path_is_safe(grid, path, 0):
-            self._fail("surveyed tunnel straight entry is not collision-free")
-            return
-        self._commit_tracking_path(path, grid, now)
-        rospy.loginfo("Tunnel straight entry path: %.3fm", path.length)
+        self._fail("continuous preplanned tunnel route was lost at entrance")
 
     def _entry_clearance_ready(self):
         clearance = portal_rear_clearance(
@@ -2383,13 +2676,16 @@ class TunnelMissionController:
         start_odom,
         costmap_version,
         attempt,
+        pre_gate=False,
+        arm_generation=None,
+        plan_kind="dynamic",
     ):
         wall_start = time.perf_counter()
         try:
             plan = self.planner.plan(
                 grid, start, self.goal, goal_curvature=0.0
             )
-        except Exception as error:  # Keep the sole cmd_vel owner fail-closed.
+        except Exception as error:
             rospy.logerr("Tunnel Hybrid A* raised an exception: %s", error)
             plan = None
         plan_seconds = time.perf_counter() - wall_start
@@ -2404,18 +2700,38 @@ class TunnelMissionController:
             ) = self._build_moving_exit_path(plan, grid)
 
         with self.lock:
-            if (
-                generation != self.planning_generation
-                or self.state != self.PLANNING
-                or not self.zone_gate
-                or self.revoke_requested
-                or rospy.is_shutdown()
-            ):
+            if pre_gate:
+                waiting_before_gate = bool(
+                    self.state in (self.WAIT_GATE, self.COMPLETE)
+                    and not self.zone_gate
+                )
+                waiting_to_acquire = bool(
+                    self.state == self.ACQUIRING
+                    and self.zone_gate
+                    and not self.mission_has_control
+                )
+                context_valid = bool(
+                    generation == self.planning_generation
+                    and arm_generation == self.arm_generation
+                    and (waiting_before_gate or waiting_to_acquire)
+                    and not rospy.is_shutdown()
+                )
+            else:
+                context_valid = bool(
+                    generation == self.planning_generation
+                    and self.state == self.PLANNING
+                    and self.zone_gate
+                    and not self.revoke_requested
+                    and not rospy.is_shutdown()
+                )
+            if not context_valid:
                 return
             self.planning_thread = None
             self.last_plan_seconds = plan_seconds
             self.last_expanded_nodes = 0 if plan is None else plan.expanded_nodes
             if plan is None or map_path is None:
+                if pre_gate and plan_kind == "dynamic":
+                    self.dynamic_preplan_generation = 0
                 rospy.logwarn_throttle(
                     1.0,
                     "Hybrid A* has no complete collision-free tunnel path "
@@ -2431,9 +2747,15 @@ class TunnelMissionController:
             soft_contact_station = None
             if self.costmap_version != costmap_version:
                 latest_grid = self._planner_grid()
-                current_map_pose = Pose2D(*self._actual_map_pose())
+                current_map_pose = (
+                    start
+                    if pre_gate
+                    else Pose2D(*self._actual_map_pose())
+                )
                 if not self._path_is_safe(latest_grid, map_path, 0):
                     self.last_plan_attempt = None
+                    if pre_gate and plan_kind == "dynamic":
+                        self.dynamic_preplan_generation = 0
                     rospy.loginfo(
                         "Discarding tunnel plan affected by newer LiDAR evidence"
                     )
@@ -2451,10 +2773,38 @@ class TunnelMissionController:
                     <= self.soft_replan_lookahead_distance + 1e-9
                 ):
                     self.last_plan_attempt = None
+                    if pre_gate and plan_kind == "dynamic":
+                        self.dynamic_preplan_generation = 0
                     rospy.loginfo(
                         "Discarding tunnel plan affected by newer LiDAR evidence"
                     )
                     return
+            if pre_gate:
+                self.prepared_arm_generation = arm_generation
+                self.prepared_tunnel_path = map_path
+                self.prepared_exit_connector_station = exit_connector_station
+                # Keep the exact layer used by Hybrid A*.  Static-plan soft
+                # validation must compare live costs against this baseline,
+                # rather than treating newly observed clearance bands as old.
+                self.prepared_grid = grid
+                self.prepared_costmap_version = costmap_version
+                self.prepared_soft_contact_station = soft_contact_station
+                self.prepared_plan_kind = plan_kind
+                if self.state == self.ACQUIRING:
+                    self.state_started = rospy.Time.now()
+                self._publish_diagnostics()
+                rospy.loginfo(
+                    "Hybrid A* tunnel %s preplan: %.3fm, %d expanded, %.3fs, "
+                    "costmap=%d",
+                    plan_kind,
+                    map_path.length,
+                    plan.expanded_nodes,
+                    self.last_plan_seconds,
+                    self.costmap_version,
+                )
+                if self.scan_stamp is not None:
+                    self._try_publish_ready(self.scan_stamp)
+                return
             current_map_pose = self._actual_map_pose()
             start_shift = math.hypot(
                 current_map_pose[0] - start.x,
@@ -2557,6 +2907,46 @@ class TunnelMissionController:
             ),
         )
 
+    def _path_is_safe_until_station(
+        self, grid, path, start_index, end_station
+    ):
+        """Sweep the live entry prefix without judging the Hybrid A* tail."""
+        if path is None or path.x.size == 0:
+            return False
+        station = self._path_station(path)
+        start_index = max(0, min(int(start_index), path.x.size - 1))
+        end_index = min(
+            path.x.size - 1,
+            int(np.searchsorted(station, float(end_station), side="left")),
+        )
+        if end_index < start_index:
+            end_index = start_index
+        for index in range(start_index, end_index):
+            start = Pose2D(
+                float(path.x[index]),
+                float(path.y[index]),
+                float(path.heading[index]),
+            )
+            distance = math.hypot(
+                float(path.x[index + 1] - path.x[index]),
+                float(path.y[index + 1] - path.y[index]),
+            )
+            if not self.planner.primitive_is_collision_free(
+                grid,
+                start,
+                float(path.curvature[index]),
+                distance,
+            ):
+                return False
+        return self.planner.pose_is_collision_free(
+            grid,
+            Pose2D(
+                float(path.x[end_index]),
+                float(path.y[end_index]),
+                float(path.heading[end_index]),
+            ),
+        )
+
     def _remaining_path_is_safe(self, grid):
         if self.map_path is None:
             return False
@@ -2615,6 +3005,37 @@ class TunnelMissionController:
             unknown_is_occupied=False,
             soft_cost_data=soft_cost_data,
         )
+
+    def _path_has_new_soft_cost(self, grid, path, baseline_grid):
+        """Check exact swept exposure added after a path was planned."""
+        if path is None or path.x.size == 0:
+            return False
+        increase_grid = self._soft_cost_increase_grid(grid, baseline_grid)
+        if increase_grid is None:
+            return False
+        for index in range(path.x.size - 1):
+            start = Pose2D(
+                float(path.x[index]),
+                float(path.y[index]),
+                float(path.heading[index]),
+            )
+            distance = math.hypot(
+                float(path.x[index + 1] - path.x[index]),
+                float(path.y[index + 1] - path.y[index]),
+            )
+            if self.planner._primitive_soft_cost_exposure(
+                increase_grid,
+                start,
+                float(path.curvature[index]),
+                distance,
+            ) > 1e-12:
+                return True
+        terminal = Pose2D(
+            float(path.x[-1]),
+            float(path.y[-1]),
+            float(path.heading[-1]),
+        )
+        return bool(self.planner._pose_soft_cost(increase_grid, terminal) > 0.0)
 
     def _path_future_soft_contact_station(
         self,
@@ -2874,6 +3295,8 @@ class TunnelMissionController:
         self.last_plan_attempt = None
         self.map_path = None
         self.odom_path = None
+        self.entry_staging_station = None
+        self.entry_inside_station = None
         self.exit_connector_station = None
         self.planned_grid = None
         self.soft_replan_contact_station = None
@@ -2891,8 +3314,12 @@ class TunnelMissionController:
             return
         self.exit_confirmation_started = True
         self.confirmation_started_at = now
+        self.lane_handoff_retry_pending = False
         self.lane_path_confirmation_count = 0
         self.last_lane_path_confirmation_time = None
+        # Give the lane controller time to rebuild its rolling command at the
+        # join speed before the ownership service can accept the handoff.
+        self.speed_limit_pub.publish(Float64(data=self.join_velocity_cap))
 
     def _lane_confirmed(self, now, required_frames):
         return bool(
@@ -2940,23 +3367,13 @@ class TunnelMissionController:
     def _finish_tracking_phase(self, now):
         phase = self.state
         if phase == self.ALIGNING_ENTRY:
-            self._publish_stop()
-            self._clear_tracking_path()
-            self._set_state(self.ENTERING, now)
+            self._fail(
+                "continuous tunnel route ended before the staging transition"
+            )
             return
         if phase == self.ENTERING:
-            self._publish_stop()
-            if not self._entry_clearance_ready():
-                self._fail("robot footprint did not clear the tunnel entrance")
-                return
-            self.minimum_planning_scan_updates = (
-                self.scan_updates + self.minimum_initial_scans
-            )
-            self._clear_tracking_path()
-            self._set_state(self.PLANNING, now)
-            rospy.loginfo(
-                "Tunnel entrance cleared; waiting for %d fresh interior scans",
-                self.minimum_initial_scans,
+            self._fail(
+                "continuous tunnel route ended before the Hybrid A* segment"
             )
             return
         if phase == self.FOLLOWING:
@@ -3023,6 +3440,20 @@ class TunnelMissionController:
                 if self.state == self.FOLLOWING:
                     self._request_replan(
                         now, "new LiDAR obstacle intersects the path"
+                    )
+                elif (
+                    self.state in (self.ALIGNING_ENTRY, self.ENTERING)
+                    and self.entry_inside_station is not None
+                    and self._path_is_safe_until_station(
+                        grid,
+                        self.map_path,
+                        self.map_path_index,
+                        self.entry_inside_station,
+                    )
+                ):
+                    self._request_replan(
+                        now,
+                        "new LiDAR obstacle intersects the interior tail",
                     )
                 else:
                     self._fail(
@@ -3100,6 +3531,18 @@ class TunnelMissionController:
             # the narrow staging pose before its final heading has converged.
             self._set_state(self.ENTERING, now)
         if (
+            self.state == self.ENTERING
+            and self.entry_inside_station is not None
+            and float(self.odom_path.station[self.path_index])
+            >= self.entry_inside_station
+        ):
+            if not self._entry_clearance_ready():
+                self._fail("robot footprint did not clear the tunnel entrance")
+                return
+            # The entry, Hybrid A* route, and exit are one prevalidated path.
+            # Change only the phase; the same command stream continues.
+            self._set_state(self.FOLLOWING, now)
+        if (
             self.state == self.FOLLOWING
             and self.exit_connector_station is not None
             and float(self.odom_path.station[self.path_index])
@@ -3110,6 +3553,7 @@ class TunnelMissionController:
             # limiter and the commanded motion remain continuous at the seam.
             self._start_exit_confirmation(now)
             self._set_state(self.EXITING, now)
+        handoff_deferred = False
         if (
             self.state == self.EXITING
             and self._exit_clearance_ready()
@@ -3118,10 +3562,12 @@ class TunnelMissionController:
             # The camera path is generated while tunnel control still owns
             # cmd_vel.  Hand it over as soon as the rear footprint clears the
             # portal; neither controller inserts a zero command at the seam.
-            self._start_lane_join(now)
-            return
+            handoff = self._start_lane_join(now)
+            if handoff is not False:
+                return
+            handoff_deferred = True
         self._publish_diagnostics()
-        if self._tracking_endpoint_ready():
+        if self._tracking_endpoint_ready() and not handoff_deferred:
             self._finish_tracking_phase(now)
             return
 
@@ -3164,16 +3610,23 @@ class TunnelMissionController:
         self.last_command_time = now
 
     def _start_lane_join(self, now):
-        self.speed_limit_pub.publish(Float64(data=self.join_velocity_cap))
-        if not self._set_lane_controller(True):
-            self._fail("could not return cmd_vel to lane control")
-            return
+        handoff = self._set_lane_controller(True)
+        if handoff is None:
+            self._fail("lane-control return outcome is unknown")
+            return None
+        if not handoff:
+            # Keep ownership and let _follow finish this tick's normal tracking
+            # and safety calculation. The next tick retries the service.
+            self.lane_handoff_retry_pending = True
+            return False
+        self.lane_handoff_retry_pending = False
         started = rospy.Time.now()
         self.confirmation_started_at = started
         self.lane_path_confirmation_count = 0
         self.last_lane_path_confirmation_time = None
         self.join_origin_ready = False
         self._set_state(self.JOINING_LANE, started)
+        return True
 
     def _join_lane(self, now):
         if not self.odom_ready or self.odom_received is None or (

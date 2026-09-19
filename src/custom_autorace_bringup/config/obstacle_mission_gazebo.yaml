@@ -34,7 +34,6 @@ obstacle:
     boundary_max_heading_deg: 12.0
     # The mission polygon begins on the horizontal approach. Do not interpret
     # its camera/LiDAR data as this +map-y corridor until the turn is complete.
-    acquisition_max_heading_deg: 12.0
     camera_timeout: 0.50
     # Two visible painted lines may refine the mapped corridor only when their
     # centre agrees with AMCL. A one-line view beside a barrier is validation
@@ -77,12 +76,16 @@ obstacle:
     collision_check_step: 0.008
     collision_check_angle_deg: 3.0
     # The live body pose is the first point of the executable CommonPath.
-    # Search a short G2 quintic into the measured spline; no two-point lateral
-    # jump is accepted or discarded after validation.
+    # Search the new asymmetric G2 lattice together with every previously
+    # admissible symmetric connector, then choose minimum executable time after
+    # the rectangle/line/obstacle hard constraints.
     entry_connector_minimum_join_distance: 0.12
     entry_connector_maximum_join_distance: 0.32
     entry_connector_join_step: 0.02
-    entry_connector_tangent_ratios: [0.12, 0.14, 0.16, 0.18, 0.20, 0.22, 0.10, 0.24, 0.28]
+    entry_connector_start_tangent_ratios: [0.12, 0.15, 0.18]
+    entry_connector_end_tangent_ratios: [0.24, 0.30, 0.36]
+    entry_connector_symmetric_tangent_ratios:
+      [0.12, 0.14, 0.16, 0.18, 0.20, 0.22, 0.10, 0.24, 0.28]
 
   template:
     # Mission-local template. Local +x is course-forward and local +y is
@@ -223,17 +226,12 @@ obstacle:
 
   control:
     period: 0.05
-    # Apply this cap as soon as pre-gate path planning starts, then republish
-    # it at the gate edge.  The lane controller decelerates during the full
-    # sweep so the fresh G2 refresh remains inside its measured join window.
-    entry_velocity_cap: 0.09
-    entry_handoff_velocity_tolerance: 0.005
-    # The refreshed connector may acquire control only while its live pose is
-    # still joined. Ownership then emits exact zero, waits for a newer odom
-    # source stamp, and lets the common follower enforce both acceleration
-    # limits; the old lane command is not compared with future path curvature.
-    entry_projection_position_tolerance: 0.015
-    entry_projection_heading_tolerance_deg: 8.0
+    # The pre-gate validated path is acquired directly at the gate. The common
+    # follower starts from measured odometry, so the ownership boundary does
+    # not inject a zero-velocity command.
+    # Begin the atomic lane-ready handoff on the aligned exit while the
+    # validated obstacle path still carries positive forward motion.
+    lane_handoff_lead_distance: 0.060
     lane_resume_max_velocity: 0.30
     maximum_angular_velocity: 0.85
     maximum_lateral_acceleration: 0.035

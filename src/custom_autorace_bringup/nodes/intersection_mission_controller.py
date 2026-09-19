@@ -49,10 +49,8 @@ class IntersectionMissionController:
     WAIT_INTERSECTION = "WAIT_INTERSECTION"
     SEARCH_DIRECTION = "SEARCH_DIRECTION"
     WAIT_ENTRY_HANDOFF = "WAIT_ENTRY_HANDOFF"
-    PREPARE_ENTRY_PATH = "PREPARE_ENTRY_PATH"
     FOLLOW_ENTRY_PATH = "FOLLOW_ENTRY_PATH"
     FOLLOW_ARC_LANE = "FOLLOW_ARC_LANE"
-    PREPARE_EXIT_PATH = "PREPARE_EXIT_PATH"
     FOLLOW_EXIT_PATH = "FOLLOW_EXIT_PATH"
     VERIFY_FINAL_LANE = "VERIFY_FINAL_LANE"
     COMPLETE = "COMPLETE"
@@ -125,9 +123,6 @@ class IntersectionMissionController:
         )
         self.ready_gate_timeout = max(
             1.0, float(get(p + "ready_gate_timeout", 5.0))
-        )
-        self.entry_takeover_pose_timeout = max(
-            0.10, float(get(p + "entry_takeover_pose_timeout", 0.75))
         )
         self.path_follow_timeout = float(get(p + "path_follow_timeout", 10.0))
         self.path_lookahead = float(get(p + "path_lookahead", 0.08))
@@ -529,16 +524,7 @@ class IntersectionMissionController:
             self.arc_lane_max_velocity,
             float(get(p + "lane_resume_max_velocity", 0.30)),
         )
-        # After revoking the lane controller, hold zero until at least one new
-        # EKF odometry sample arrives. This prevents the exit path from being
-        # anchored to the pose cached before the cmd_vel ownership transfer.
-        self.exit_takeover_settle_time = max(
-            0.0, float(get(p + "exit_takeover_settle_time", 0.10))
-        )
-        self.exit_takeover_pose_timeout = max(
-            self.exit_takeover_settle_time + 0.05,
-            float(get(p + "exit_takeover_pose_timeout", 0.75)),
-        )
+        # Begin exit-path planning while the camera arc still owns cmd_vel.
         self.exit_takeover_max_distance = max(
             0.01, float(get(p + "exit_takeover_max_distance", 0.06))
         )
@@ -642,6 +628,9 @@ class IntersectionMissionController:
         self.x = self.y = self.yaw = 0.0
         self.odom_linear_velocity = 0.0
         self.odom_angular_velocity = 0.0
+        self.observed_lane_linear = 0.0
+        self.observed_lane_angular = 0.0
+        self.observed_lane_command_received = None
         self.last_x = self.last_y = self.last_wrapped_yaw = None
         self.odom_sequence = 0
         self.odom_history = deque()
@@ -699,9 +688,9 @@ class IntersectionMissionController:
         self.last_path_command_time = None
         self.path_tick_pose = None
         self.path_tick_tracking = None
+        self.path_handoff_pending = False
         self.arc_lane_start_distance = None
-        self.entry_takeover_odom_sequence = -1
-        self.exit_takeover_odom_sequence = -1
+        self.exit_plan_in_progress = False
         self.final_lane_verify_start_distance = None
         self.course_occupied = None
         self.course_raw_occupied = None
@@ -751,6 +740,12 @@ class IntersectionMissionController:
         )
         rospy.Subscriber(self.boundary_topic, Float64MultiArray, self.boundary_callback, queue_size=1)
         rospy.Subscriber(self.manual_stop_topic, Bool, self.manual_stop_callback, queue_size=1)
+        rospy.Subscriber(
+            self.cmd_vel_topic,
+            Twist,
+            self.command_observer_callback,
+            queue_size=1,
+        )
         rospy.Subscriber(
             self.zone_gate_topic, Bool, self.zone_gate_callback, queue_size=1
         )
@@ -816,6 +811,18 @@ class IntersectionMissionController:
                 ):
                     self.odom_history.popleft()
 
+    def command_observer_callback(self, message):
+        """Keep the lane owner's latest command as follower command history."""
+        with self.lock:
+            if (
+                not self.mission_has_control
+                and math.isfinite(message.linear.x)
+                and math.isfinite(message.angular.z)
+            ):
+                self.observed_lane_linear = float(message.linear.x)
+                self.observed_lane_angular = float(message.angular.z)
+                self.observed_lane_command_received = rospy.Time.now()
+
     def zone_gate_callback(self, message):
         with self.lock:
             was_open = self.zone_gate_open
@@ -860,6 +867,8 @@ class IntersectionMissionController:
         self.path = None
         self.path_follower = None
         self.active_path_stage = ""
+        self.exit_plan_in_progress = False
+        self.path_handoff_pending = False
         self._exit_branch_path_cache = {}
 
     def arm_callback(self, message):
@@ -1093,9 +1102,15 @@ class IntersectionMissionController:
             )
         return eligible
 
-    def _registration_uncertainties(self, tracking_points=None):
+    def _registration_uncertainties(
+        self, tracking_points=None, tracking_from_local=None
+    ):
         local_points = None
-        transform = getattr(self, "active_tracking_from_local", None)
+        transform = (
+            getattr(self, "active_tracking_from_local", None)
+            if tracking_from_local is None
+            else tracking_from_local
+        )
         if tracking_points is not None and transform is not None:
             inverse = transform.inverse()
             local_points = [inverse.apply_point(point) for point in tracking_points]
@@ -1467,6 +1482,14 @@ class IntersectionMissionController:
             rospy.wait_for_service(self.lane_service_name, timeout=2.0)
             response = self.lane_service(enabled)
             if not response.success:
+                self.handoff_ambiguous = False
+                if enabled:
+                    rospy.logwarn_throttle(
+                        0.5,
+                        "Intersection keeps cmd_vel while lane return waits: %s",
+                        response.message,
+                    )
+                    return False
                 raise rospy.ServiceException(response.message)
             self.mission_has_control = not enabled
             self.handoff_ambiguous = False
@@ -1515,8 +1538,10 @@ class IntersectionMissionController:
         )
         self.arc_lane_start_distance = self.total_distance
         if not self._set_lane_controller(True):
-            self._fail("could not hand off the selected arc lane")
+            if self.handoff_ambiguous:
+                self._fail("could not hand off the selected arc lane")
             return False
+        self.path_handoff_pending = False
         rospy.loginfo(
             "Selected %s arc handed directly to the rolling camera path "
             "follower",
@@ -1534,12 +1559,15 @@ class IntersectionMissionController:
         self.final_lane_count = 0
         self.last_final_lane_confirmation_time = None
         if not self._set_lane_controller(True):
-            self._fail("could not return the final lane to normal control")
+            if self.handoff_ambiguous:
+                self._fail("could not return the final lane to normal control")
             return False
+        self.path_handoff_pending = False
         self._set_state(self.VERIFY_FINAL_LANE)
         return True
 
     def control_callback(self, _event):
+        exit_plan_snapshot = None
         with self.lock:
             if self.shutting_down:
                 return
@@ -1583,20 +1611,27 @@ class IntersectionMissionController:
 
             elif self.state == self.WAIT_ENTRY_HANDOFF:
                 if self.zone_gate_open:
+                    if not self._start_prepared_entry_path():
+                        self._fail("prepared arc-entry path could not start")
+                        return
                     if not self._set_lane_controller(False):
                         self._fail("could not acquire cmd_vel control")
                         return
-                    # The service call runs while this controller lock is
-                    # held, so callbacks cannot refresh x/y/yaw during the
-                    # ownership transfer. Flush the previous owner and defer
-                    # path creation until at least one later EKF sample.
-                    self.cmd_pub.publish(Twist())
-                    self.entry_takeover_odom_sequence = self.odom_sequence
+                    # Queue the next lane-owner cap well before the return
+                    # service so its independent subscriber has already run.
+                    self.lane_speed_limit_pub.publish(
+                        Float64(data=self.arc_lane_max_velocity)
+                    )
+                    self.mission_started = rospy.Time.now()
                     rospy.loginfo(
                         "Intersection acquired cmd_vel after matching ready "
-                        "generation; waiting for a post-handoff EKF pose"
+                        "generation with lane command history "
+                        "v=%.3fm/s w=%.3frad/s",
+                        self.observed_lane_linear,
+                        self.observed_lane_angular,
                     )
-                    self._set_state(self.PREPARE_ENTRY_PATH)
+                    self._set_state(self.FOLLOW_ENTRY_PATH)
+                    self.cmd_pub.publish(self._path_command())
                     return
                 elif self._state_age() > self.ready_gate_timeout:
                     rospy.logwarn(
@@ -1606,52 +1641,42 @@ class IntersectionMissionController:
                     self._reset_registration()
                     self._set_state(self.SEARCH_DIRECTION)
 
-            elif self.state == self.PREPARE_ENTRY_PATH:
-                # A short zero barrier establishes one command owner and lets
-                # odometry expose all motion that occurred inside the service
-                # call before the aligned entry path is frozen.
-                self.cmd_pub.publish(Twist())
-                if self.odom_sequence > self.entry_takeover_odom_sequence:
-                    if not self._start_prepared_entry_path():
-                        self._fail("prepared arc-entry path could not start")
-                        return
-                    self.mission_started = rospy.Time.now()
-                    self._set_state(self.FOLLOW_ENTRY_PATH)
-                    return
-                if self._state_age() > self.entry_takeover_pose_timeout:
-                    self._fail(
-                        "no post-handoff EKF pose for the arc-entry path: "
-                        "odom_sequence=%d takeover_sequence=%d"
-                        % (
-                            self.odom_sequence,
-                            self.entry_takeover_odom_sequence,
-                        )
-                    )
-                    return
-
             elif self.state == self.FOLLOW_ENTRY_PATH:
-                if self._path_goal_reached():
-                    pose_x, pose_y, tracking_yaw = self._tracking_pose()
-                    yaw_error = normalize_angle(self.path_exit_yaw - tracking_yaw)
-                    self.entry_elapsed = (
-                        rospy.Time.now() - self.path_started
-                    ).to_sec()
-                    self.entry_goal_error = math.hypot(
-                        self.path[-1][0] - pose_x,
-                        self.path[-1][1] - pose_y,
-                    )
-                    self.entry_yaw_error = math.degrees(yaw_error)
-                    rospy.loginfo(
-                        "Arc-entry endpoint reached: elapsed=%.3fs "
-                        "goal_error=%.3fm yaw_error=%.1fdeg",
-                        self.entry_elapsed,
-                        self.entry_goal_error,
-                        self.entry_yaw_error,
-                    )
+                if (
+                    getattr(self, "path_handoff_pending", False)
+                    or self._path_goal_reached()
+                ):
+                    if not getattr(self, "path_handoff_pending", False):
+                        pose_x, pose_y, tracking_yaw = self._tracking_pose()
+                        yaw_error = normalize_angle(
+                            self.path_exit_yaw - tracking_yaw
+                        )
+                        self.entry_elapsed = (
+                            rospy.Time.now() - self.path_started
+                        ).to_sec()
+                        self.entry_goal_error = math.hypot(
+                            self.path[-1][0] - pose_x,
+                            self.path[-1][1] - pose_y,
+                        )
+                        self.entry_yaw_error = math.degrees(yaw_error)
+                        rospy.loginfo(
+                            "Arc-entry endpoint reached: elapsed=%.3fs "
+                            "goal_error=%.3fm yaw_error=%.1fdeg",
+                            self.entry_elapsed,
+                            self.entry_goal_error,
+                            self.entry_yaw_error,
+                        )
+                        self.path_handoff_pending = True
                     # Common goal_status already requires this segment's
                     # endpoint and heading tolerances. Do not add a second
                     # mission-specific rotate-in-place tracking formula.
-                    self._begin_arc_lane_follow()
+                    if not self._begin_arc_lane_follow():
+                        if self.mission_has_control and self.state != self.FAILED:
+                            self.cmd_pub.publish(
+                                self._path_command(
+                                    handoff_velocity=self.arc_lane_max_velocity
+                                )
+                            )
                     return
                 if (
                     self.path_started is not None
@@ -1677,25 +1702,18 @@ class IntersectionMissionController:
                 arc_end_ready = bool(
                     exit_path_distance <= self.exit_takeover_max_distance
                 )
-                if arc_end_ready:
-                    if not self._set_lane_controller(False):
-                        self._fail("could not reacquire control at the arc exit")
-                        return
-                    # Flush any command queued by the previous owner. Exit
-                    # planning is deferred to PREPARE_EXIT_PATH so odometry can
-                    # update after the ownership transfer.
-                    self.cmd_pub.publish(Twist())
-                    self.exit_takeover_odom_sequence = self.odom_sequence
-                    rospy.loginfo(
-                        "Local route confirmed the %s semicircle end; intersection "
-                        "controller reacquired cmd_vel after %.3fm; waiting "
-                        "for a post-handoff EKF pose",
-                        "LEFT" if self.direction == self.LEFT else "RIGHT",
-                        arc_distance,
-                    )
-                    self._set_state(self.PREPARE_EXIT_PATH)
-                    return
-                if (
+                if arc_end_ready and not self.exit_plan_in_progress:
+                    self._prepare_active_exit_parameters()
+                    self.exit_plan_in_progress = True
+                    exit_plan_snapshot = {
+                        "state_started": self.state_started,
+                        "arm_seq": self.arm_seq,
+                        "direction": self.direction,
+                        "tracking_from_local": self.local_to_odom,
+                        "tracking_pose": Pose2D(*self._tracking_pose()),
+                        "arc_distance": arc_distance,
+                    }
+                elif (
                     self._state_age() > self.arc_lane_timeout
                     or arc_distance > self.arc_lane_max_distance
                 ):
@@ -1712,56 +1730,42 @@ class IntersectionMissionController:
                         )
                     )
 
-            elif self.state == self.PREPARE_EXIT_PATH:
-                # Repeated zero commands form a short barrier between the two
-                # independent cmd_vel publishers. Planning starts only from a
-                # pose sampled after that barrier, never from the lane owner's
-                # cached pre-handoff pose.
-                self.cmd_pub.publish(Twist())
-                pose_updated = (
-                    self.odom_sequence > self.exit_takeover_odom_sequence
-                )
-                settled = self._state_age() >= self.exit_takeover_settle_time
-                if pose_updated and settled:
-                    generation_result = self._generate_exit_path()
-                    if generation_result is False:
-                        self._fail("shared exit path planning failed")
-                        return
-                    if generation_result is True:
-                        self._set_state(self.FOLLOW_EXIT_PATH)
-                        return
-                if self._state_age() > self.exit_takeover_pose_timeout:
-                    self._fail(
-                        "no usable post-handoff EKF pose for the shared exit path: "
-                        "odom_sequence=%d takeover_sequence=%d"
-                        % (
-                            self.odom_sequence,
-                            self.exit_takeover_odom_sequence,
-                        )
-                    )
-                    return
-
             elif self.state == self.FOLLOW_EXIT_PATH:
-                if self._path_goal_reached():
-                    pose_x, pose_y, tracking_yaw = self._tracking_pose()
-                    yaw_error = normalize_angle(self.path_exit_yaw - tracking_yaw)
-                    self.exit_path_elapsed = (
-                        rospy.Time.now() - self.path_started
-                    ).to_sec()
-                    self.exit_path_goal_error = math.hypot(
-                        self.path[-1][0] - pose_x,
-                        self.path[-1][1] - pose_y,
-                    )
-                    self.exit_path_yaw_error = math.degrees(yaw_error)
-                    rospy.loginfo(
-                        "Shared exit-path endpoint reached: elapsed=%.3fs "
-                        "goal_error=%.3fm yaw_error=%.1fdeg",
-                        self.exit_path_elapsed,
-                        self.exit_path_goal_error,
-                        self.exit_path_yaw_error,
-                    )
+                if (
+                    getattr(self, "path_handoff_pending", False)
+                    or self._path_goal_reached()
+                ):
+                    if not getattr(self, "path_handoff_pending", False):
+                        pose_x, pose_y, tracking_yaw = self._tracking_pose()
+                        yaw_error = normalize_angle(
+                            self.path_exit_yaw - tracking_yaw
+                        )
+                        self.exit_path_elapsed = (
+                            rospy.Time.now() - self.path_started
+                        ).to_sec()
+                        self.exit_path_goal_error = math.hypot(
+                            self.path[-1][0] - pose_x,
+                            self.path[-1][1] - pose_y,
+                        )
+                        self.exit_path_yaw_error = math.degrees(yaw_error)
+                        rospy.loginfo(
+                            "Shared exit-path endpoint reached: elapsed=%.3fs "
+                            "goal_error=%.3fm yaw_error=%.1fdeg",
+                            self.exit_path_elapsed,
+                            self.exit_path_goal_error,
+                            self.exit_path_yaw_error,
+                        )
+                        self.path_handoff_pending = True
                     # Heading completion belongs to the common path goal.
-                    self._begin_final_lane_verification()
+                    if not self._begin_final_lane_verification():
+                        if self.mission_has_control and self.state != self.FAILED:
+                            self.cmd_pub.publish(
+                                self._path_command(
+                                    handoff_velocity=(
+                                        self.final_lane_join_velocity
+                                    )
+                                )
+                            )
                     return
                 if (
                     self.path_started is not None
@@ -1820,6 +1824,9 @@ class IntersectionMissionController:
                 if self.mission_has_control:
                     self.cmd_pub.publish(Twist())
 
+        if exit_plan_snapshot is not None:
+            self._attempt_exit_takeover(exit_plan_snapshot)
+
     def _tracking_pose(self):
         """Return the sole local control pose: encoder/IMU EKF odometry."""
         return self.x, self.y, self.yaw
@@ -1845,7 +1852,7 @@ class IntersectionMissionController:
         return tracking_from_local.apply_pose((0.0, 0.0, local_yaw)).yaw
 
     def _start_prepared_entry_path(self):
-        """Reset the prevalidated entry follower at the post-handoff pose."""
+        """Project the prepared entry path and inherit the live lane command."""
         if (
             self.path is None
             or self.path_follower is None
@@ -1857,14 +1864,23 @@ class IntersectionMissionController:
         self.path_follower.reset(
             self.path,
             pose,
-            initial_linear=0.0,
-            initial_angular=0.0,
+            initial_linear=clamp(
+                max(0.0, self.observed_lane_linear),
+                0.0,
+                self.active_path_velocity,
+            ),
+            initial_angular=clamp(
+                self.observed_lane_angular,
+                -self.active_path_max_angular,
+                self.active_path_max_angular,
+            ),
         )
         self.path_index = self.path_follower.path_index
         self.path_started = rospy.Time.now()
         self.last_path_command_time = None
         self.path_tick_pose = None
         self.path_tick_tracking = None
+        self.path_handoff_pending = False
         self._publish_path_diagnostics()
         return True
 
@@ -1983,6 +1999,8 @@ class IntersectionMissionController:
         stage,
         validation_start_pose=None,
         begin_tracking=True,
+        tracking_from_local=None,
+        defer_commit=False,
     ):
         points = list(path)
         if len(points) < 2:
@@ -1994,7 +2012,12 @@ class IntersectionMissionController:
                 stage,
             )
             return False
-        if self.active_tracking_from_local is None:
+        tracking_from_local = (
+            self.active_tracking_from_local
+            if tracking_from_local is None
+            else tracking_from_local
+        )
+        if tracking_from_local is None:
             rospy.logerr(
                 "Intersection %s path has no frozen local->odom registration",
                 stage,
@@ -2007,7 +2030,7 @@ class IntersectionMissionController:
             )
             return False
         map_boundary = self.course_bounds_local.transformed(
-            self.active_tracking_from_local
+            tracking_from_local
         )
         if self.course_boundary_cell_size is None:
             rospy.logerr(
@@ -2025,9 +2048,11 @@ class IntersectionMissionController:
             )
             return False
         boundary = self.course_boundary_local.transformed(
-            self.active_tracking_from_local
+            tracking_from_local
         )
-        registration_uncertainty = self._registration_uncertainties(points)
+        registration_uncertainty = self._registration_uncertainties(
+            points, tracking_from_local=tracking_from_local
+        )
         safety = PathSafety(
             line_boundaries=(boundary,),
             map_boundaries=(map_boundary,),
@@ -2204,26 +2229,47 @@ class IntersectionMissionController:
             lateral_feedback_gain=self.path_lateral_feedback_gain,
             search_ahead_distance=self.path_search_ahead_distance,
         )
+        activation = {
+            "path": executable,
+            "follower_config": follower_config,
+            "validation": validation,
+            "goal_yaw": goal_yaw,
+            "exit_yaw": exit_yaw,
+            "stage": stage,
+            "begin_tracking": begin_tracking,
+            "tracking_from_local": tracking_from_local,
+        }
+        if defer_commit:
+            return activation
+        self._commit_path_activation(activation, validation_pose)
+        return True
+
+    def _commit_path_activation(
+        self,
+        activation,
+        tracking_pose,
+        initial_linear=None,
+        initial_angular=None,
+        start_validation=None,
+    ):
+        """Commit a fully swept path from the newest pose and command state."""
+        executable = activation["path"]
+        validation = activation["validation"]
         self.path = executable
-        self.path_follower = PathFollower(follower_config)
-        tracking_pose = validation_pose
+        self.path_follower = PathFollower(activation["follower_config"])
+        tracking_pose = Pose2D.from_value(tracking_pose)
         now = rospy.Time.now()
-        if stage == "entry":
-            # PREPARE_ENTRY_PATH has already established a mission-owned zero
-            # barrier while waiting for the fresh pose used by this path.
-            observed_linear, observed_angular = 0.0, 0.0
-        else:
-            # PREPARE_EXIT_PATH has already held the mission-owned output at
-            # zero through the settle interval. The earlier arc-lane command
-            # observed before ownership transfer is no longer command history.
-            observed_linear, observed_angular = 0.0, 0.0
+        if initial_linear is None:
+            initial_linear = self.observed_lane_linear
+        if initial_angular is None:
+            initial_angular = self.observed_lane_angular
         initial_linear = clamp(
-            observed_linear,
-            -self.active_path_velocity,
+            max(0.0, initial_linear),
+            0.0,
             self.active_path_velocity,
         )
         initial_angular = clamp(
-            observed_angular,
+            initial_angular,
             -self.active_path_max_angular,
             self.active_path_max_angular,
         )
@@ -2234,18 +2280,32 @@ class IntersectionMissionController:
             initial_angular=initial_angular,
         )
         self.path_follower.update_clearance(validation)
+        if start_validation is not None:
+            executable.line_clearance = min(
+                executable.line_clearance,
+                start_validation.minimum_line_clearance,
+            )
+            executable.obstacle_clearance = min(
+                executable.obstacle_clearance,
+                start_validation.minimum_obstacle_clearance,
+            )
+            executable.map_clearance = min(
+                executable.map_clearance,
+                start_validation.minimum_map_clearance,
+            )
         self.path_index = self.path_follower.path_index
-        self.path_goal_yaw = goal_yaw
-        self.path_exit_yaw = exit_yaw
-        self.active_path_stage = stage
-        self.path_started = now if begin_tracking else None
+        self.path_goal_yaw = activation["goal_yaw"]
+        self.path_exit_yaw = activation["exit_yaw"]
+        self.active_path_stage = activation["stage"]
+        self.active_tracking_from_local = activation["tracking_from_local"]
+        self.path_started = now if activation["begin_tracking"] else None
         self.path_max_commanded_angular = 0.0
         self.last_path_command_time = None
         self.path_tick_pose = None
         self.path_tick_tracking = None
+        self.path_handoff_pending = False
         self._publish_path()
         self._publish_path_diagnostics()
-        return True
 
     def _generate_entry_path(self, synchronized_start_pose):
         """Build and fully validate the selected entrance from one local pose."""
@@ -2323,13 +2383,31 @@ class IntersectionMissionController:
         )
         return True
 
-    def _generate_exit_path(self):
+    def _generate_exit_path(
+        self,
+        tracking_start=None,
+        tracking_from_local=None,
+        direction=None,
+        defer_commit=False,
+    ):
         """Build the exit with the same frozen local transform as the entry."""
         self._prepare_active_exit_parameters()
-        if self.local_to_odom is None:
+        tracking_from_local = (
+            self.local_to_odom
+            if tracking_from_local is None
+            else tracking_from_local
+        )
+        direction = self.direction if direction is None else direction
+        if tracking_from_local is None:
             rospy.logerr("Shared exit has no frozen local->odom registration")
             return False
-        branch_control_points = self._selected_exit_control_points()
+        if direction == self.LEFT:
+            branch_control_points = self.local_left_exit_control_points
+        elif direction == self.RIGHT:
+            branch_control_points = self.local_right_exit_control_points
+        else:
+            rospy.logerr("Shared exit has no selected direction")
+            return False
         branch_route = self._bezier_path(
             branch_control_points, self.exit_branch_samples
         )
@@ -2342,8 +2420,12 @@ class IntersectionMissionController:
             self.local_frame,
             target_speed=self.active_path_velocity,
         )
-        tracking_pose = Pose2D(*self._tracking_pose())
-        local_pose = self.local_to_odom.inverse().apply_pose(tracking_pose)
+        tracking_pose = (
+            Pose2D(*self._tracking_pose())
+            if tracking_start is None
+            else Pose2D.from_value(tracking_start)
+        )
+        local_pose = tracking_from_local.inverse().apply_pose(tracking_pose)
         local_projection = project_to_path(
             local_common_path,
             local_pose.x,
@@ -2372,10 +2454,10 @@ class IntersectionMissionController:
         join_index = max(1, min(len(branch_route) - 2, join_index))
         tracking_start = tracking_pose
         tracking_join = self._local_to_tracking_point(
-            branch_route[join_index], self.local_to_odom
+            branch_route[join_index], tracking_from_local
         )
         tracking_join_yaw = self._local_to_tracking_yaw(
-            float(fixed_branch_path.heading[join_index]), self.local_to_odom
+            float(fixed_branch_path.heading[join_index]), tracking_from_local
         )
         connector_distance = math.hypot(
             tracking_join[0] - tracking_start.x,
@@ -2394,16 +2476,16 @@ class IntersectionMissionController:
             self.exit_adaptive_connector_samples,
         )
         downstream_branch = [
-            self._local_to_tracking_point(point, self.local_to_odom)
+            self._local_to_tracking_point(point, tracking_from_local)
             for point in branch_route[join_index:]
         ]
         downstream_shared = [
-            self._local_to_tracking_point(point, self.local_to_odom)
+            self._local_to_tracking_point(point, tracking_from_local)
             for point in shared_route
         ]
         route = connector[:-1] + downstream_branch[:-1] + downstream_shared
         goal_yaw = self._local_to_tracking_yaw(
-            self.local_exit_goal_yaw, self.local_to_odom
+            self.local_exit_goal_yaw, tracking_from_local
         )
         rospy.loginfo(
             "Shared exit uses frozen local registration: local_pose="
@@ -2419,15 +2501,24 @@ class IntersectionMissionController:
         self.exit_path_elapsed = math.nan
         self.exit_path_goal_error = math.nan
         self.exit_path_yaw_error = math.nan
-        self.active_tracking_from_local = self.local_to_odom
-        if not self._activate_path(route, goal_yaw, goal_yaw, "exit"):
+        activation = self._activate_path(
+            route,
+            goal_yaw,
+            goal_yaw,
+            "exit",
+            validation_start_pose=tracking_pose,
+            begin_tracking=False,
+            tracking_from_local=tracking_from_local,
+            defer_commit=defer_commit,
+        )
+        if activation is False:
             return False
         rospy.loginfo(
             "Selected and aligned adaptive branch plus shared exit after the %s arc; "
             "start=(%.3f, %.3f, %.1fdeg), join_station=%.3fm, "
             "goal=(%.3f, %.3f, %.1fdeg), "
             "length=%.3fm speed=%.3fm/s",
-            "LEFT" if self.direction == self.LEFT else "RIGHT",
+            "LEFT" if direction == self.LEFT else "RIGHT",
             tracking_start.x,
             tracking_start.y,
             math.degrees(tracking_start.yaw),
@@ -2438,7 +2529,102 @@ class IntersectionMissionController:
             self._polyline_length(route),
             self.active_path_velocity,
         )
-        return True
+        return activation if defer_commit else True
+
+    def _attempt_exit_takeover(self, snapshot):
+        """Sweep outside the controller lock, then commit from the live pose."""
+        try:
+            activation = self._generate_exit_path(
+                tracking_start=snapshot["tracking_pose"],
+                tracking_from_local=snapshot["tracking_from_local"],
+                direction=snapshot["direction"],
+                defer_commit=True,
+            )
+        except (ArithmeticError, TypeError, ValueError, np.linalg.LinAlgError) as error:
+            rospy.logwarn_throttle(
+                0.5, "Intersection exit planning will retry: %s", error
+            )
+            activation = False
+
+        with self.lock:
+            self.exit_plan_in_progress = False
+            if (
+                self.shutting_down
+                or self.manual_stop
+                or self.state != self.FOLLOW_ARC_LANE
+                or self.state_started != snapshot["state_started"]
+                or self.arm_seq != snapshot["arm_seq"]
+                or self.direction != snapshot["direction"]
+                or self.local_to_odom != snapshot["tracking_from_local"]
+            ):
+                return False
+            if not isinstance(activation, dict):
+                rospy.logwarn_throttle(
+                    0.5,
+                    "Intersection exit path is not executable yet; lane control continues",
+                )
+                return False
+
+            executable = activation["path"]
+            live_pose = Pose2D(*self._tracking_pose())
+            projection = project_to_path(executable, live_pose.x, live_pose.y)
+            if projection.distance > self.exit_local_snap_max_distance:
+                rospy.logwarn_throttle(
+                    0.5,
+                    "Intersection exit plan moved %.3fm from the live pose; retrying",
+                    projection.distance,
+                )
+                return False
+            live_index = max(0, min(projection.path_index, executable.size - 1))
+            live_validation = self.path_validator.validate_poses(
+                [live_pose],
+                executable.safety,
+                line_overlap_allowances=[
+                    float(executable.line_overlap_allowance[live_index])
+                ],
+                localization_uncertainties=[
+                    float(executable.localization_uncertainty[live_index])
+                ],
+            )
+            if not live_validation.safe:
+                rospy.logwarn_throttle(
+                    0.5,
+                    "Intersection live exit footprint is not executable yet; "
+                    "lane control continues",
+                )
+                return False
+
+            live_linear = self.observed_lane_linear
+            live_angular = self.observed_lane_angular
+            self._commit_path_activation(
+                activation,
+                live_pose,
+                initial_linear=live_linear,
+                initial_angular=live_angular,
+                start_validation=live_validation,
+            )
+            if not self._set_lane_controller(False):
+                self._fail("could not reacquire control at the arc exit")
+                return False
+            # The outgoing cap now has the complete exit traversal to reach the
+            # lane controller before ownership is returned.
+            self.lane_speed_limit_pub.publish(
+                Float64(data=self.final_lane_join_velocity)
+            )
+            self.path_started = rospy.Time.now()
+            self.last_path_command_time = None
+            rospy.loginfo(
+                "Local route confirmed the %s semicircle end; intersection "
+                "controller reacquired cmd_vel after %.3fm with live lane "
+                "command v=%.3fm/s w=%.3frad/s",
+                "LEFT" if self.direction == self.LEFT else "RIGHT",
+                snapshot["arc_distance"],
+                live_linear,
+                live_angular,
+            )
+            self._set_state(self.FOLLOW_EXIT_PATH)
+            self.cmd_pub.publish(self._path_command())
+            return True
 
     def _selected_exit_control_points(self):
         if self.direction == self.LEFT:
@@ -2640,7 +2826,7 @@ class IntersectionMissionController:
         self._publish_path_diagnostics()
         return status.complete
 
-    def _path_command(self):
+    def _path_command(self, handoff_velocity=None):
         if self.path is None or self.path_follower is None:
             return Twist()
         now = rospy.Time.now()
@@ -2655,11 +2841,16 @@ class IntersectionMissionController:
             abs(self.odom_linear_velocity),
             abs(self.path_follower.last_linear),
         )
+        desired_speed = (
+            tracking.target_speed
+            if handoff_velocity is None
+            else max(0.0, float(handoff_velocity))
+        )
         safety = self.path_validator.motion_safety(
             self.path,
             pose,
             tracking.path_index,
-            tracking.target_speed,
+            desired_speed,
             tracking.direction * measured_speed,
             self.path_follower.stopping_angular_velocities(
                 tracking,
@@ -2685,12 +2876,21 @@ class IntersectionMissionController:
             else clamp((now - self.last_path_command_time).to_sec(), 0.0, 0.15)
         )
         self.last_path_command_time = now
-        limited, tracking = self.path_follower.command(
-            pose,
-            elapsed,
-            speed_limit=safety.speed_limit,
-            tracking=tracking,
-        )
+        if handoff_velocity is None:
+            limited, tracking = self.path_follower.command(
+                pose,
+                elapsed,
+                speed_limit=safety.speed_limit,
+                tracking=tracking,
+            )
+        else:
+            limited, tracking = self.path_follower.terminal_continuation(
+                pose,
+                elapsed,
+                target_speed=handoff_velocity,
+                speed_limit=safety.speed_limit,
+                tracking=tracking,
+            )
         self.path_index = tracking.path_index
         command = Twist()
         command.linear.x = limited.linear_velocity

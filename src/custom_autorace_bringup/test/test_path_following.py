@@ -1085,6 +1085,36 @@ class CommonPathTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "near-path terminal crossing"):
             before_terminal.terminal_hold(Pose2D(0.5, 0.0, 0.0), 0.05)
 
+    def test_terminal_continuation_stays_positive_but_keeps_zero_safety_stop(self):
+        path = self.straight_path()
+        follower = PathFollower(self.tracking_config())
+        pose = Pose2D(1.0, 0.0, 0.0)
+        follower.reset(path, pose, initial_linear=0.10)
+
+        commands = []
+        for _ in range(20):
+            command, _ = follower.terminal_continuation(
+                pose,
+                0.05,
+                target_speed=0.10,
+            )
+            commands.append(command.linear_velocity)
+            pose = Pose2D(pose.x + command.linear_velocity * 0.05, 0.0, 0.0)
+
+        self.assertTrue(all(value > 0.0 for value in commands))
+        self.assertGreater(pose.x - 1.0, 0.05)
+
+        stopping = []
+        for _ in range(3):
+            command, _ = follower.terminal_continuation(
+                pose,
+                0.05,
+                target_speed=0.10,
+                speed_limit=0.0,
+            )
+            stopping.append(command.linear_velocity)
+        self.assertEqual(stopping[-1], 0.0)
+
     def test_regular_command_holds_crossed_terminal_while_correcting_heading(self):
         path = self.straight_path()
         follower = PathFollower(self.tracking_config())

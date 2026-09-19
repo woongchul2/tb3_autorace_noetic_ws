@@ -61,7 +61,6 @@ class ZigzagMissionController:
     WAIT_GATE = "WAIT_GATE"
     ACQUIRING = "ACQUIRING"
     FOLLOWING = "FOLLOWING"
-    VERIFY_EXIT = "VERIFY_EXIT"
     JOINING_LANE = "JOINING_LANE"
     COMPLETE = "COMPLETE"
     FAILED = "FAILED"
@@ -584,9 +583,6 @@ class ZigzagMissionController:
         self.lane_center_tolerance = max(
             0.0, float(get(p + "exit/lane_center_tolerance", 180.0))
         )
-        self.exit_confirmation_frames = max(
-            1, int(get(p + "exit/confirmation_frames", 6))
-        )
         self.exit_confirmation_max_gap = max(
             0.05, float(get(p + "exit/confirmation_max_gap", 0.20))
         )
@@ -622,10 +618,6 @@ class ZigzagMissionController:
         self.mission_timeout = max(
             2.0, float(get(p + "timeouts/mission", 30.0))
         )
-        self.exit_confirmation_timeout = max(
-            0.5, float(get(p + "timeouts/exit_confirmation", 2.0))
-        )
-
         self.lock = threading.RLock()
         self.state = self.WAIT_GATE
         self.state_started = rospy.Time.now()
@@ -671,13 +663,14 @@ class ZigzagMissionController:
         self.last_command_time = None
         self.observed_lane_linear = 0.0
         self.observed_lane_angular = 0.0
+        self.observed_lane_command_received = None
 
         self.boundary_stamp = None
         self.boundary_valid = False
         self.boundary_confirmation_count = 0
         self.last_boundary_confirmation_time = None
         self.exit_confirmation_started = False
-        self.exit_stop_latched = False
+        self.exit_handoff_pending = False
         self.confirmation_started_at = None
         self.join_start_x = self.join_start_y = self.join_start_yaw = 0.0
         self.join_origin_ready = False
@@ -1364,6 +1357,7 @@ class ZigzagMissionController:
             ):
                 self.observed_lane_linear = float(message.linear.x)
                 self.observed_lane_angular = float(message.angular.z)
+                self.observed_lane_command_received = rospy.Time.now()
 
     def boundary_callback(self, message):
         now = rospy.Time.now()
@@ -1452,6 +1446,14 @@ class ZigzagMissionController:
             rospy.wait_for_service(self.lane_service_name, timeout=2.0)
             response = self.lane_service(enabled)
             if not response.success:
+                self.handoff_ambiguous = False
+                if enabled:
+                    rospy.logwarn_throttle(
+                        0.5,
+                        "Zigzag keeps cmd_vel while lane return waits: %s",
+                        response.message,
+                    )
+                    return False
                 raise rospy.ServiceException(response.message)
             self.mission_has_control = not enabled
             self.handoff_ambiguous = False
@@ -1499,7 +1501,7 @@ class ZigzagMissionController:
         self.boundary_confirmation_count = 0
         self.last_boundary_confirmation_time = None
         self.exit_confirmation_started = False
-        self.exit_stop_latched = False
+        self.exit_handoff_pending = False
         self.confirmation_started_at = None
         self.join_origin_ready = False
         self.maximum_position_error_seen = 0.0
@@ -1691,6 +1693,7 @@ class ZigzagMissionController:
             self.last_angular = initial_angular
             self.last_command_time = committed_at
             self.mission_started = committed_at
+            self.exit_handoff_pending = False
             # In Gazebo the raw /odom values are numerically map/world aligned,
             # while the TF named odom belongs to the spawn-relative EKF. Keep
             # the identity-frozen control path but display those coordinates in
@@ -1818,6 +1821,30 @@ class ZigzagMissionController:
         self.last_command_time = now
         return command, tracking
 
+    def _handoff_pending_command(
+        self,
+        now,
+        speed_limit,
+        pose,
+        tracking,
+    ):
+        """Keep moving on the verified terminal tangent until lane accepts."""
+        elapsed = self._command_elapsed(now)
+        limited, tracking = self.path_follower.terminal_continuation(
+            pose,
+            elapsed,
+            target_speed=self.join_velocity_cap,
+            speed_limit=speed_limit,
+            tracking=tracking,
+        )
+        command = Twist()
+        command.linear.x = limited.linear_velocity
+        command.angular.z = limited.angular_velocity
+        self.last_linear = limited.linear_velocity
+        self.last_angular = limited.angular_velocity
+        self.last_command_time = now
+        return command, tracking
+
     def _common_stop_command(self, now):
         """Build one slew-limited zero target with the shared follower."""
         limited = self.path_follower.stop(self._command_elapsed(now))
@@ -1828,17 +1855,6 @@ class ZigzagMissionController:
         self.last_angular = limited.angular_velocity
         self.last_command_time = now
         return command, limited
-
-    def _decelerate_at_exit(self, now):
-        command, limited = self._common_stop_command(now)
-        if self.mission_has_control:
-            self.cmd_pub.publish(command)
-        self._publish_diagnostics()
-        if (
-            abs(limited.linear_velocity) <= 1e-9
-            and abs(limited.angular_velocity) <= 1e-9
-        ):
-            self._set_state(self.VERIFY_EXIT, now)
 
     def _path_safety(self, route_from_odom=None, registration_margin=0.0):
         # Bind each candidate to its own immutable inverse transform. A sweep
@@ -1974,6 +1990,9 @@ class ZigzagMissionController:
     def _start_exit_confirmation(self, now):
         if self.exit_confirmation_started:
             return
+        # Deliver the lane cap before the ownership service is attempted. ROS
+        # topic delivery and service calls use independent callback queues.
+        self.speed_limit_pub.publish(Float64(data=self.join_velocity_cap))
         self.exit_confirmation_started = True
         self.confirmation_started_at = now
         self.boundary_confirmation_count = 0
@@ -1997,18 +2016,21 @@ class ZigzagMissionController:
     def _start_lane_join(self, now):
         if not self.mission_has_control:
             self._fail("cmd_vel ownership was lost before lane join")
-            return
+            return False
         self.speed_limit_pub.publish(Float64(data=self.join_velocity_cap))
         if not self._set_lane_controller(True):
-            self._fail("could not start the low-speed lane join")
-            return
+            if self.handoff_ambiguous:
+                self._fail("could not start the low-speed lane join")
+            return False
         join_started = rospy.Time.now()
         self.boundary_confirmation_count = 0
         self.last_boundary_confirmation_time = None
         self.confirmation_started_at = join_started
         self.exit_confirmation_started = False
+        self.exit_handoff_pending = False
         self.join_origin_ready = False
         self._set_state(self.JOINING_LANE, join_started)
+        return True
 
     def _complete(self, now):
         elapsed = (
@@ -2098,9 +2120,6 @@ class ZigzagMissionController:
                 self.cmd_pub.publish(command)
                 self._publish_diagnostics()
                 rospy.logwarn_throttle(1.0, "Zigzag holds for %s", problem)
-                return
-            if self.exit_stop_latched:
-                self._decelerate_at_exit(now)
                 return
             path = self.committed_path
             follower = self.path_follower
@@ -2206,37 +2225,39 @@ class ZigzagMissionController:
                 + self.exit_confirmation_lead_distance
             ):
                 self._start_exit_confirmation(completed)
-            if self._exit_pose_ready(pose=pose, tracking=tracking):
-                self.exit_stop_latched = True
-                # Check the common goal before calculating another positive path
-                # command. Calculating it first advances last_command_time and
-                # leaves the initial deceleration tick with dt=0.
-                self._decelerate_at_exit(completed)
-                return
-            command, tracking = self._common_command(
-                completed,
-                speed_limit=speed_limit,
-                pose=pose,
-                tracking=tracking,
-            )
+            handoff_ready = getattr(
+                self, "exit_handoff_pending", False
+            ) or self._exit_pose_ready(pose=pose, tracking=tracking)
+            if handoff_ready:
+                self.exit_handoff_pending = True
+                # The rolling lane path is already being observed. Transfer
+                # ownership at the common goal while the configured exit
+                # velocity is still active; JOINING_LANE verifies the same
+                # corridor while lane control keeps the robot moving.
+                if safety is not None and not safety.requires_stop:
+                    if self._start_lane_join(completed):
+                        return
+                    if (
+                        self.state != self.FOLLOWING
+                        or not self.mission_has_control
+                    ):
+                        return
+                command, tracking = self._handoff_pending_command(
+                    completed,
+                    speed_limit=speed_limit,
+                    pose=pose,
+                    tracking=tracking,
+                )
+            else:
+                command, tracking = self._common_command(
+                    completed,
+                    speed_limit=speed_limit,
+                    pose=pose,
+                    tracking=tracking,
+                )
             self.path_index = follower.path_index
             self._publish_diagnostics()
             self.cmd_pub.publish(command)
-
-    def _verify_exit(self, now):
-        self._publish_stop()
-        problem = self._tracking_input_problem(now)
-        if problem is not None:
-            self._fail("zigzag exit confirmation lost %s" % problem)
-            return
-        self._publish_diagnostics()
-        if self._exit_pose_ready() and self._exit_lane_confirmed(
-            now, self.exit_confirmation_frames
-        ):
-            self._start_lane_join(now)
-            return
-        if (now - self.state_started).to_sec() > self.exit_confirmation_timeout:
-            self._fail("zigzag exit lane was not confirmed")
 
     def control_callback(self, _event):
         acquire_now = None
@@ -2268,8 +2289,6 @@ class ZigzagMissionController:
                 acquire_now = now
             elif self.state == self.FOLLOWING:
                 follow_now = now
-            elif self.state == self.VERIFY_EXIT:
-                self._verify_exit(now)
             elif self.state == self.JOINING_LANE:
                 self._join_lane(now)
         if acquire_now is not None:

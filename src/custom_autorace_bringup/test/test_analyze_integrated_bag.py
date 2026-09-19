@@ -19,6 +19,7 @@ from analyze_integrated_bag import (  # noqa: E402
     EXPECTED_RAW_CMD_VEL_CALLERID_ORDER,
     IntegratedRunAccumulator,
     MANAGER_TOPICS,
+    MISSION_EXECUTION_STATES,
     MISSION_ORDER,
     callerid_from_header,
     extract_model_pose,
@@ -303,6 +304,125 @@ class IntegratedBagAnalysisTest(unittest.TestCase):
         self.assertGreaterEqual(
             result["lane_centerline_rate"]["overall_rate_hz"], 29.9
         )
+        continuity = result["cmd_vel"]["nonparking_handoff_continuity"]
+        self.assertTrue(continuity["pass"], continuity)
+        self.assertEqual(len(continuity["excluded"]), 2)
+
+    def test_level_crossing_physical_stop_zero_is_allowed(self):
+        continuity = self.result()["cmd_vel"]["nonparking_handoff_continuity"]
+        crossing_owner = EXPECTED_MISSION_CALLERIDS["level_crossing"]
+
+        entry = next(
+            event for event in continuity["checked"]
+            if event["to"] == crossing_owner
+        )
+        exit_event = next(
+            event for event in continuity["checked"]
+            if event["from"] == crossing_owner
+        )
+
+        self.assertTrue(entry["next_command_is_zero"])
+        self.assertTrue(entry["next_zero_allowed_for_physical_stop"])
+        self.assertTrue(entry["pass"])
+        self.assertTrue(exit_event["previous_command_is_zero"])
+        self.assertTrue(
+            exit_event["previous_zero_allowed_for_physical_stop"]
+        )
+        self.assertFalse(exit_event["next_command_is_zero"])
+        self.assertTrue(exit_event["pass"])
+
+    def test_level_crossing_lane_return_full_zero_is_rejected(self):
+        accumulator = self.complete_accumulator()
+        crossing_owner = EXPECTED_MISSION_CALLERIDS["level_crossing"]
+        for index, run in enumerate(accumulator.cmd_runs[:-1]):
+            if run["callerid"] == crossing_owner:
+                lane_return = accumulator.cmd_runs[index + 1]
+                lane_return["first_linear_velocity_mps"] = 0.0
+                lane_return["first_angular_velocity_radps"] = 0.0
+                break
+        else:
+            self.fail("level-crossing ownership run is missing")
+
+        continuity = self.result(accumulator)["cmd_vel"][
+            "nonparking_handoff_continuity"
+        ]
+        failed = [event for event in continuity["checked"] if not event["pass"]]
+
+        self.assertFalse(continuity["pass"])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["from"], crossing_owner)
+        self.assertEqual(failed[0]["to"], "/safe_lane_controller")
+        self.assertTrue(failed[0]["previous_command_is_zero"])
+        self.assertTrue(failed[0]["next_command_is_zero"])
+
+    def test_nonparking_new_owner_full_zero_is_rejected(self):
+        accumulator = self.complete_accumulator()
+        obstacle_owner = EXPECTED_MISSION_CALLERIDS["obstacle"]
+        obstacle_run = next(
+            run for run in accumulator.cmd_runs if run["callerid"] == obstacle_owner
+        )
+        obstacle_run["first_linear_velocity_mps"] = 0.0
+        obstacle_run["first_angular_velocity_radps"] = 0.0
+
+        result = self.result(accumulator)
+        continuity = result["cmd_vel"]["nonparking_handoff_continuity"]
+
+        self.assertFalse(continuity["pass"])
+        self.assertIn(
+            "nonparking_handoff_continuity",
+            result["validation"]["failed_checks"],
+        )
+        failed = [event for event in continuity["checked"] if not event["pass"]]
+        self.assertEqual(failed[0]["to"], obstacle_owner)
+
+    def test_preexisting_lane_zero_does_not_become_a_handoff_failure(self):
+        accumulator = self.complete_accumulator()
+        lane_run = accumulator.cmd_runs[0]
+        lane_run["last_linear_velocity_mps"] = 0.0
+        lane_run["last_angular_velocity_radps"] = 0.0
+
+        continuity = self.result(accumulator)["cmd_vel"][
+            "nonparking_handoff_continuity"
+        ]
+
+        self.assertTrue(continuity["pass"], continuity)
+        first = continuity["checked"][0]
+        self.assertTrue(first["preexisting_lane_zero"])
+        self.assertFalse(first["next_command_is_zero"])
+
+    def test_mission_zero_before_lane_return_is_rejected(self):
+        accumulator = self.complete_accumulator()
+        intersection_owner = EXPECTED_MISSION_CALLERIDS["intersection"]
+        mission_run = next(
+            run
+            for run in accumulator.cmd_runs
+            if run["callerid"] == intersection_owner
+        )
+        mission_run["last_linear_velocity_mps"] = 0.0
+        mission_run["last_angular_velocity_radps"] = 0.0
+
+        continuity = self.result(accumulator)["cmd_vel"][
+            "nonparking_handoff_continuity"
+        ]
+
+        self.assertFalse(continuity["pass"])
+        failed = [event for event in continuity["checked"] if not event["pass"]]
+        self.assertEqual(failed[0]["from"], intersection_owner)
+
+    def test_pure_rotation_at_handoff_is_not_a_full_stop(self):
+        accumulator = self.complete_accumulator()
+        obstacle_owner = EXPECTED_MISSION_CALLERIDS["obstacle"]
+        obstacle_run = next(
+            run for run in accumulator.cmd_runs if run["callerid"] == obstacle_owner
+        )
+        obstacle_run["first_linear_velocity_mps"] = 0.0
+        obstacle_run["first_angular_velocity_radps"] = 0.10
+
+        continuity = self.result(accumulator)["cmd_vel"][
+            "nonparking_handoff_continuity"
+        ]
+
+        self.assertTrue(continuity["pass"], continuity)
 
     def test_raw_and_motion_ownership_sequences_match_production(self):
         cmd = self.result()["cmd_vel"]
@@ -323,6 +443,15 @@ class IntegratedBagAnalysisTest(unittest.TestCase):
             "/level_crossing_lidar_controller",
             cmd["observed_motion_callerid_order"],
         )
+
+    def test_removed_stop_preparation_states_are_not_accepted(self):
+        self.assertNotIn(
+            "PREPARE_ENTRY_PATH", MISSION_EXECUTION_STATES["intersection"]
+        )
+        self.assertNotIn(
+            "PREPARE_EXIT_PATH", MISSION_EXECUTION_STATES["intersection"]
+        )
+        self.assertNotIn("VERIFY_EXIT", MISSION_EXECUTION_STATES["zigzag"])
 
     def test_zero_only_and_moving_extra_publishers_are_rejected(self):
         zero = self.complete_accumulator()

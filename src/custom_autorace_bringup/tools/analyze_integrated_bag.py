@@ -36,10 +36,8 @@ MISSION_EXECUTION_STATES = {
     "intersection": {
         "SEARCH_DIRECTION",
         "WAIT_ENTRY_HANDOFF",
-        "PREPARE_ENTRY_PATH",
         "FOLLOW_ENTRY_PATH",
         "FOLLOW_ARC_LANE",
-        "PREPARE_EXIT_PATH",
         "FOLLOW_EXIT_PATH",
         "VERIFY_FINAL_LANE",
     },
@@ -59,7 +57,7 @@ MISSION_EXECUTION_STATES = {
         "VERIFY_ZIGZAG_LANE",
         "JOIN_ZIGZAG",
     },
-    "zigzag": {"ACQUIRING", "FOLLOWING", "VERIFY_EXIT", "JOINING_LANE"},
+    "zigzag": {"ACQUIRING", "FOLLOWING", "JOINING_LANE"},
     "level_crossing": {"APPROACH", "STOPPED", "PASSING"},
     "tunnel": {
         "ACQUIRING",
@@ -83,9 +81,16 @@ MISSION_GATE_TOPICS = {
 EXPECTED_MANAGER_CALLERID = "/mission_zone_manager"
 LANE_CENTERLINE_TOPIC = "/detect/lane_centerline"
 EXPECTED_LANE_CALLERID = "/detect_lane"
+EXPECTED_LANE_CMD_CALLERID = "/safe_lane_controller"
 CMD_VEL_TOPIC = "/cmd_vel"
 MANUAL_STOP_TOPIC = "/control/manual_stop"
 EXPECTED_MANUAL_STOP_CALLERID = "/safe_lane_controller"
+HANDOFF_CONTINUITY_EXCLUDED_CALLERIDS = {
+    EXPECTED_MISSION_CALLERIDS["parking"],
+}
+HANDOFF_CONTINUITY_PHYSICAL_STOP_CALLERID = EXPECTED_MISSION_CALLERIDS[
+    "level_crossing"
+]
 COMMON_DIAGNOSTIC_FIELDS = 13
 EXPECTED_RAW_CMD_VEL_CALLERID_ORDER = (
     "/safe_lane_controller",
@@ -687,6 +692,10 @@ class IntegratedRunAccumulator:
                     "message_count": 0,
                     "minimum_linear_velocity_mps": linear,
                     "maximum_linear_velocity_mps": linear,
+                    "first_linear_velocity_mps": linear,
+                    "first_angular_velocity_radps": angular,
+                    "last_linear_velocity_mps": linear,
+                    "last_angular_velocity_radps": angular,
                 }
             )
         run = self.cmd_runs[-1]
@@ -698,6 +707,8 @@ class IntegratedRunAccumulator:
         run["maximum_linear_velocity_mps"] = max(
             run["maximum_linear_velocity_mps"], linear
         )
+        run["last_linear_velocity_mps"] = linear
+        run["last_angular_velocity_radps"] = angular
 
         moving = (
             abs(linear) > self.command_motion_threshold
@@ -768,6 +779,96 @@ class IntegratedRunAccumulator:
             max(point[1] for point in corners),
             abs(normalize_angle(yaw - self.finish_heading)),
         )
+
+    def _handoff_continuity_result(self, bag_start):
+        """Report whether an ownership edge itself injects a full stop.
+
+        Gazebo and the real base retain the previous Twist between messages, so
+        a publisher gap is evidence to report, not a zero command.  A lane
+        watchdog can also stop before a mission becomes active; that is a lane
+        perception event rather than a handoff stop.  The ownership contract is
+        therefore violated only when the new owner starts with a full zero, or
+        when a mission deliberately ends with a full zero before returning to
+        the lane controller. Parking is outside this contract. The level-
+        crossing controller may start and end at zero for the confirmed
+        physical barrier, but the lane controller taking ownership back must
+        still start with motion.
+        """
+
+        checked = []
+        excluded = []
+        for previous, current in zip(self.cmd_runs, self.cmd_runs[1:]):
+            gap = max(0.0, current["start"] - previous["end"])
+            previous_zero = bool(
+                abs(previous["last_linear_velocity_mps"])
+                <= self.command_motion_threshold
+                and abs(previous["last_angular_velocity_radps"])
+                <= self.command_motion_threshold
+            )
+            next_zero = bool(
+                abs(current["first_linear_velocity_mps"])
+                <= self.command_motion_threshold
+                and abs(current["first_angular_velocity_radps"])
+                <= self.command_motion_threshold
+            )
+            event = {
+                "time_s": _relative(current["start"], bag_start),
+                "from": previous["callerid"],
+                "to": current["callerid"],
+                "command_gap_s": gap,
+                "previous_linear_velocity_mps": previous[
+                    "last_linear_velocity_mps"
+                ],
+                "next_linear_velocity_mps": current[
+                    "first_linear_velocity_mps"
+                ],
+                "previous_angular_velocity_radps": previous[
+                    "last_angular_velocity_radps"
+                ],
+                "next_angular_velocity_radps": current[
+                    "first_angular_velocity_radps"
+                ],
+                "previous_command_is_zero": previous_zero,
+                "next_command_is_zero": next_zero,
+                "preexisting_lane_zero": bool(
+                    previous["callerid"] == EXPECTED_LANE_CMD_CALLERID
+                    and previous_zero
+                ),
+                "previous_zero_allowed_for_physical_stop": bool(
+                    previous["callerid"]
+                    == HANDOFF_CONTINUITY_PHYSICAL_STOP_CALLERID
+                ),
+                "next_zero_allowed_for_physical_stop": bool(
+                    current["callerid"]
+                    == HANDOFF_CONTINUITY_PHYSICAL_STOP_CALLERID
+                ),
+            }
+            if (
+                previous["callerid"] in HANDOFF_CONTINUITY_EXCLUDED_CALLERIDS
+                or current["callerid"] in HANDOFF_CONTINUITY_EXCLUDED_CALLERIDS
+            ):
+                excluded.append(event)
+                continue
+            event["pass"] = bool(
+                not (
+                    next_zero
+                    and not event["next_zero_allowed_for_physical_stop"]
+                )
+                and not (
+                    previous["callerid"] != EXPECTED_LANE_CMD_CALLERID
+                    and previous_zero
+                    and not event[
+                        "previous_zero_allowed_for_physical_stop"
+                    ]
+                )
+            )
+            checked.append(event)
+        return {
+            "zero_command_threshold": self.command_motion_threshold,
+            "checked": checked,
+            "excluded": excluded,
+            "pass": bool(checked) and all(event["pass"] for event in checked),
+        }
 
     def observe_pose(
         self, stamp, x, y, yaw, speed, angular_speed=0.0
@@ -1678,6 +1779,7 @@ class IntegratedRunAccumulator:
         expected_motion_order = list(EXPECTED_MOTION_CMD_VEL_CALLERID_ORDER)
         raw_order_pass = observed_raw_order == expected_raw_order
         motion_order_pass = observed_motion_order == expected_motion_order
+        handoff_continuity = self._handoff_continuity_result(bag_start)
 
         parking_reverse = self._parking_reverse_result(bag_start, manager)
         manual_stop_true = [
@@ -1782,6 +1884,7 @@ class IntegratedRunAccumulator:
             "cmd_vel_callerids_present": callerids_present,
             "cmd_vel_raw_callerid_order": raw_order_pass,
             "cmd_vel_motion_callerid_order": motion_order_pass,
+            "nonparking_handoff_continuity": handoff_continuity["pass"],
             "manual_stop_not_requested": manual_stop["pass"],
             "pose_continuity": pose_integrity["pass"],
             "finish_oriented_footprint_after_tunnel": finish["pass"],
@@ -1815,6 +1918,7 @@ class IntegratedRunAccumulator:
                 "observed_motion_callerid_order": observed_motion_order,
                 "motion_callerid_order_pass": motion_order_pass,
                 "motion_publisher_runs": motion_publisher_runs,
+                "nonparking_handoff_continuity": handoff_continuity,
             },
             "manual_stop": manual_stop,
             "pose_integrity": pose_integrity,

@@ -254,8 +254,6 @@ zigzag:
     # Same one-boundary centre estimate used by detect_lane.make_lane().
     single_line_center_offset: 320.0
     lane_center_tolerance: 180.0
-    # 6 frames at 30 Hz preserves the former 2-frame/10 Hz confirmation.
-    confirmation_frames: 6
     confirmation_max_gap: 0.20
     join_velocity_cap: 0.07
     join_minimum_distance: 0.035
@@ -267,4 +265,3 @@ zigzag:
     scan: 0.35
     acquisition: 2.0
     mission: 30.0
-    exit_confirmation: 2.0

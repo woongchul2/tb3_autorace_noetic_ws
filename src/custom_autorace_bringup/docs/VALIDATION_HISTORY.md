@@ -1,7 +1,7 @@
 # Gazebo 검증 이력
 
 이 문서는 현재 운용 설명에서 분리한 검증 기록입니다. 맨 위에는 2026-09-18
-mission-local adaptive registration의 현재 검증 범위를 기록하고, 그 아래
+이동 중 제어권 인계와 adaptive 계획의 `run26` 검증을 기록하고, 그 아래 `run20`,
 2026-09-17 및 이전 결과는 각 당시 코드와 설정에만 해당하는 과거 기준선으로
 보존합니다. 결승선까지의 완료 판정은 상위 [`README.md`](../README.md)에 구분해
 기록합니다.
@@ -10,9 +10,55 @@ mission-local adaptive registration의 현재 검증 범위를 기록하고, 그
 옮긴 자체 완결 요약이며, 서로 다른 방향·주차 분기나 다른 시작 조건의 시간은 엄밀한
 A/B로 비교하지 않습니다.
 
-## 2026-09-18 Mission-local adaptive registration
+## 2026-09-18 이동 중 인계·adaptive 계획 `run26`
 
-현재 코드는 순차 AMCL polygon gate를 `arm → sensor-relative registration → ready →
+인계 서비스가 0을 내지 않고, 새 차선 경로가 아직 준비되지 않은 경우에는 현재
+미션이 양의 명령을 유지한 채 반환을 재시도하도록 바꾸었습니다. Intersection은
+`PREPARE_ENTRY_PATH`·`PREPARE_EXIT_PATH`와 그 준비 0을 제거했습니다. Obstacle은 gate 전
+감속 cap 없이 예상 실행 시간이 가장 짧은 rectangle-safe G2 connector를 commit하고,
+실행 중 우회 재계획 대신 live stopping sweep을 사용합니다. Tunnel은 arm 직후 정적
+Hybrid A*를 preplan한 뒤 live hard/soft cost가 무효화하면 차선 소유와 `0.025 m/s`
+cap을 유지한 채 최신 costmap으로 동적 preplan을 재시도합니다.
+
+첫 공식 재주행 `run25`는 Obstacle의 전체 직사각형 sweep를 이미 통과한 경로에
+gate 지연 후의 위치·방향 join veto를 다시 적용해 `5.3 mm/9.94°`에서 진입을
+거부했습니다. 이 중복 join veto만 제거하고, 전체 경로 rectangle 검증과 인수 후
+live reaction-and-stop sweep는 그대로 유지했습니다.
+
+수정 후 `run26`은 새 Gazebo·통합 launch와 공식 AMCL 출발 자세
+`(0.800, -1.747, 0°)`에서 시작했습니다. 순간이동, 수동 gate, 미션 비활성화와 사람
+개입 없이 다음 순서를 완료하고 결승선 footprint를 통과했습니다.
+
+```text
+intersection → obstacle → parking → zigzag → level_crossing → tunnel
+```
+
+| 구간 | ACTIVE→COMPLETE |
+|---|---:|
+| Intersection | `25.185 s` |
+| Obstacle | `21.756 s` |
+| Parking | `54.692 s` |
+| Zigzag | `15.475 s` |
+| Level Crossing | `14.520 s` |
+| Tunnel | `53.457 s` |
+| 출발→결승 footprint | `243.025 s` |
+
+`analysis.json`의 validation은 실패 항목 없이 전체 PASS였습니다. 비주차 인계 12건을
+검사해 모두 통과했고 Parking의 ownership edge 2건만 제외했습니다. Level Crossing
+제어기의 차단봉 정지 0은 물리 동작으로 허용하되, 차선 복귀 첫 명령은 양수
+`0.007585 m/s`인지 계속 검사합니다. 그 밖에는 새 소유자의 첫 명령 또는 차선이 아닌
+이전 미션 소유자의 마지막 명령이 완전한 0일 때 실패합니다. 명령 간격은 정지 판정이
+아니며 미션 활성 전 차선 watchdog 0은 `preexisting_lane_zero`로 기록합니다.
+
+Obstacle 최대 경로 오차는 `12.644 mm`, 최소 raw line/obstacle 여유는
+`3.391/4.245 mm`였습니다. Tunnel은 계획 3회·정지 재계획 2회로 완료했습니다.
+근거는 `diagnostics/official_full_nohandoff_stop_20260918_run26/run.bag`과 같은
+디렉터리의 `analysis.json`입니다. 현재 변경은 bringup `708/708`, description `7/7`,
+합계 `715/715`과 전체 `catkin_make` 빌드를 통과했습니다.
+
+## 2026-09-18 Mission-local adaptive registration `run20` 기준선
+
+`run20` 당시 코드는 순차 AMCL polygon gate를 `arm → sensor-relative registration → ready →
 enable` 계약으로 교체했습니다. Intersection은 source stamp의 AMCL 방향과 방향
 표지 높이·베어링, Obstacle은 서로 독립인 LiDAR 장벽 면, Parking은 고정 표지의 비평행 면,
 Zigzag는 rolling 카메라 곡선으로 각각 mission-local 경로를 odom에 고정합니다.
@@ -20,7 +66,7 @@ Level Crossing은 고정 landmark 통과 평면, Tunnel은 직교하는 입구·
 같은 ordered readiness에 사용합니다. 선택적 AMCL polygon은 진단일 뿐 활성화 조건이
 아닙니다.
 
-ROS Noetic 컨테이너의 `CMakeLists.txt`에 등록된 Python test 29개 파일을 최종
+ROS Noetic 컨테이너의 `CMakeLists.txt`에 등록되어 있던 Python test 29개 파일을 당시
 aggregate 대상으로 사용했습니다. 아래 범위를 모두 포함하며 시험 파일을 제외하지
 않았습니다.
 
@@ -31,7 +77,7 @@ aggregate 대상으로 사용했습니다. 아래 범위를 모두 포함하며 
 | 6개 미션 arm/ready/enable 세대·source stamp와 launch/config 배선 | 포함 |
 | Intersection 양방향, Obstacle 장벽 등록, Parking 좌·우·후진, Zigzag 곡선 등록 | 포함 |
 | Level Crossing 통과 평면과 Tunnel portal 등록·costmap·Hybrid A* | 포함 |
-| 최종 aggregate·build·diff | bringup `669/669`, description `7/7`, 합계 `676/676 PASS`; fail 0, error 0; 두 패키지 build와 `git diff --check` PASS |
+| 당시 aggregate·build·diff | bringup `669/669`, description `7/7`, 합계 `676/676 PASS`; fail 0, error 0; 두 패키지 build와 `git diff --check` PASS |
 
 ### 공식 시작점 통합 `run20`
 
@@ -54,7 +100,9 @@ Intersection LEFT, Parking LEFT, Tunnel layout B를 선택해 모든 미션과 �
 허용 y 구간 `[-1.86, -1.64] m` 안에 있었습니다. 6개 미션은 모두 `COMPLETE`,
 `FAILED`와 manual stop은 0건이었습니다. Parking 후진은 `6.303 s`, 음수 명령 127개,
 최저 `-0.103447 m/s`였습니다. `/cmd_vel` 발행자는 기대한 순서로만 바뀌었고 발행자
-교차는 없었으며 14개 인계 공백은 `3.582–121.699 ms`였습니다. 공통 경로 오차와
+교차는 없었으며 14개 명령 간격은 `3.582–121.699 ms`였습니다. 이 간격은 당시
+계측값이지 인계 정지 판정이 아닙니다. 현재 analyzer는 소유권 경계에 삽입된 완전한
+0 명령을 별도로 판정합니다. 공통 경로 오차와
 최소 여유는 [`PATH_FOLLOWING.md`](../PATH_FOLLOWING.md)에 기록합니다.
 
 bag 분석은 `19/22`였습니다. 실패한 세 항목은 recorder를 `/use_sim_time=true`보다
@@ -73,7 +121,7 @@ bag 분석은 `19/22`였습니다. 실패한 세 항목은 recorder를 `/use_sim
 실제 원통 3개는 유지됐으며, `2.498 m` 전체 경로의 비대칭 footprint sweep가
 통과했습니다.
 
-최종 코드의 `run20` Tunnel은 계획 2회·재계획 1회로 layout B를 완료했습니다. 별도
+`run20` 당시 코드의 Tunnel은 계획 2회·재계획 1회로 layout B를 완료했습니다. 별도
 공식 시작 반복 `run21`도 Intersection RIGHT, Parking RIGHT, Tunnel layout C에서 6개
 미션을 모두 완료했고 Tunnel은 계획 2회·재계획 1회, `69.660 s`였습니다. Tunnel 완료
 `3.539 s` 뒤 결승 footprint를 통과했습니다. 미션별 ACTIVE→COMPLETE는
@@ -151,6 +199,10 @@ Intersection 제어기의 잔여 주행 명령, 제거한 보조 관찰 토픽�
 `507 tests`, 오류·실패·건너뜀 0으로 통과했습니다. 이 단독 검증 직후에는 전체 코스를
 다시 주행하지 않았고, 이후 위 Level Crossing 절의 공식 통합에서 전체 미션 순서를
 재검증했습니다.
+
+위 상태열은 2026-09-17 당시 기록입니다. 현재 구현은 `PREPARE_ENTRY_PATH`와
+`PREPARE_EXIT_PATH`, 그 상태의 준비 0 명령을 제거하고 각 `FOLLOW_*` 상태로
+직접 전환합니다.
 
 ## Adaptive registration 이전의 공통화 기록
 
@@ -272,6 +324,10 @@ zero 명령, timeout, `FAILED`는 없었습니다. 이 단계 역시 결승선�
 `3.391/4.245 mm`였고 실패와 충돌 로그는 없었습니다. 당시 반복은 `1/1`이며 Parking
 이후 완료 근거는 아닙니다.
 
+이 절은 polygon gate와 `0.09 m/s` 진입 cap을 사용하던 당시 이력입니다. 현재
+Obstacle은 ordered ready를 사용하고 gate 전 전용 감속 cap과 실행 중 우회 재계획을
+사용하지 않습니다.
+
 ## Parking 변경 이력
 
 ### 중앙 판정 자세 즉시 제자리회전
@@ -379,7 +435,7 @@ rolling lane path 진단으로 인계를 확인하도록 바꾼 `run15`는 Tunne
 차이는 모두 `0.5 s` 이내였고, Parking 회전 직후 non-finite 진단은 `2→0`개가 됐습니다.
 
 당시 전체 코스 기준 `run23` Tunnel은 `73.117 s`였고 완료 시 일반 차선 제어기가
-`/cmd_vel`을 소유했습니다. 이 결과의 전체 판정은 상위 README에 기록했습니다.
+`/cmd_vel`을 소유했습니다. 이는 현재 static/live preplan 구조 이전의 과거 기준선입니다.
 
 ## 해석 원칙
 

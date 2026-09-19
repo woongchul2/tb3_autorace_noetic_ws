@@ -42,6 +42,13 @@
   → 일반 차선 제어권 반환
 ```
 
+제어권 인계 서비스 자체는 0 명령을 발행하지 않습니다. 새 소유자의 첫 명령이 완전한
+0이거나, 차선이 아닌 미션 소유자가 0을 마지막으로 낸 뒤 차선에 반환하면
+비주차 인계 실패입니다. 명령 간격은 마지막 Twist가 유지되는 구간이므로 진단에만
+남기고 실패 조건으로 사용하지 않습니다. 미션 활성 전 차선 watchdog이 낸 0은
+`preexisting_lane_zero`로 분리합니다. Parking과 Level Crossing은 각각 계획 정지와 차단봉
+정지가 있어 이 판정에서 제외합니다.
+
 일반 차선은 30 Hz 카메라의 각 유효 프레임에서 짧은 `CommonPath`를 새로 만들고,
 촬영 시각 odom 자세와 같은 프레임의 도색 경계를 함께 고정합니다. 첫 관측점까지는 현재
 차량 자세와 접선을 시작 조건으로 하는 C1 Hermite connector를 사용합니다.
@@ -148,15 +155,17 @@ solid arm과 그 사이의 paint-free opening을 합성해 합법적인 개구�
 | 미션 | 선택기 | 정렬기 | 경로 생성 | 공통 실행 | 완료와 인계 |
 |---|---|---|---|---|---|
 | Intersection | 카메라 LEFT/RIGHT | source stamp의 AMCL 방향과 표지 높이·베어링 평행이동으로 `intersection_local→odom` 고정 | 실제 인계 자세의 진입 cubic, 방향 branch와 공통 출구; 반원은 rolling lane path | 모든 구간 validator와 follower 공유 | 진입 뒤 반원에 반환, 탈출 뒤 최종 차선에 반환 |
-| Obstacle | 측량된 단일 spline | 서로 독립인 LiDAR 장벽 면으로 `obstacle_local→odom` 완전 SE(2) 고정 | 현재 투영점 이후 spline과 곡률 연속 출구 | 고정 라인·course와 live LiDAR 검사 | 종단과 로컬 출구 통과 확인 뒤 반환 |
+| Obstacle | 측량된 단일 spline | 서로 독립인 LiDAR 장벽 면으로 `obstacle_local→odom` 완전 SE(2) 고정 | 대칭·비대칭 G2 connector를 예상 실행 시간순으로 검사해 첫 rectangle-safe 후보와 남은 spline·출구를 한 번 commit | 고정 라인·course와 live LiDAR 검사; gate 전 cap과 실행 중 재계획 없음 | 남은 `0.060 m`부터 이동 중 반환, 거절 시 양의 출구 접선으로 재시도 |
 | Parking | LiDAR 좌·우 ROI로 빈 공간 선택 | 고정 주차 표지의 비평행 면으로 `parking_local→odom` 고정 | 진입·주차·후진·복귀를 방향별 여러 구간으로 생성 | 이동과 제자리회전의 전체·정지 sweep | rolling 차선 확인 뒤 이동 중 반환 |
 | Zigzag | YAML 고정 spline | rolling 카메라 곡선으로 고유 station과 SE(2) 확인; Gazebo 실행 경로는 검증된 identity | 현재 투영점 이후 suffix | 바깥 도색·live LiDAR 검사 | 종단과 새 차선 확인 뒤 저속 반환 |
 
 Level Crossing과 Tunnel의 상태·제어 책임은 [`README.md`](README.md)에 설명합니다.
 두 미션은 공통 follower 대상은 아니지만 같은 ordered arm/ready 계약을 사용합니다.
 Level Crossing은 source-stamped 고정 landmark로 통과 평면을 고정하고, Tunnel은 LiDAR의
-종방향 벽·직교 입구벽·끝점으로 mission-local tunnel template을 고정한 뒤에만 ready가
-됩니다.
+종방향 벽·직교 입구벽·끝점으로 mission-local tunnel template을 고정합니다. arm 직후
+정적 Hybrid A*를 preplan하고, live hard/soft cost가 그 경로를 무효화하면 차선 소유와
+`0.025 m/s` cap을 유지한 채 동적 preplan을 재시도합니다. 현재 입구·Hybrid A*·출구가
+하나의 live-cost-safe 경로로 검증된 뒤에만 ready가 됩니다.
 
 ## 공통 진단 배열
 
@@ -184,7 +193,36 @@ Tunnel 고유 `/tunnel/diagnostics`는 이 배열이 아닙니다. Tunnel은 출
 
 ## 현재 검증 범위
 
-2026-09-18 `run20`은 현재 mission-local adaptive registration 코드와 새 Gazebo의
+2026-09-18 `run26`은 새 Gazebo와 통합 launch, 공식 AMCL 출발 자세
+`(0.800, -1.747, 0°)`에서 시작했습니다. 순간이동·수동 gate·미션 비활성화 없이
+`Intersection → Obstacle → Parking → Zigzag → Level Crossing → Tunnel`을
+순서대로 완료하고 출발 `243.025 s` 후 결승선의 비대칭 footprint 조건을 통과했습니다.
+
+| 미션 | ACTIVE→COMPLETE |
+|---|---:|
+| Intersection | `25.185 s` |
+| Obstacle | `21.756 s` |
+| Parking | `54.692 s` |
+| Zigzag | `15.475 s` |
+| Level Crossing | `14.520 s` |
+| Tunnel | `53.457 s` |
+
+`analysis.json`의 validation은 전체 PASS입니다. 비주차 제어권 인계 12건을 검사해 모두
+PASS했고 Parking의 2개 ownership edge만 제외했습니다. Level Crossing 진입의 0은
+확인된 물리적 차단봉 정지로 허용했지만, 차선 복귀의 첫 명령은 양수
+`0.007585 m/s`인지 별도로 검사했습니다. Obstacle의 최대 경로 오차는 `12.644 mm`,
+최소 raw line/obstacle 여유는 `3.391/4.245 mm`였습니다. Tunnel은 계획 3회와 새 live
+장애물에 대한 정지 재계획 2회를 수행했습니다. 원시 근거는
+`diagnostics/official_full_nohandoff_stop_20260918_run26/run.bag`과 같은 디렉터리의
+`analysis.json`입니다.
+
+현재 변경은 bringup `708/708`, description `7/7`, 합계 `715/715`과 전체
+`catkin_make` 빌드를 통과했습니다. 실제 D405·Mid-360·OpenCR 보정과 실물 공식
+시작점 통합 주행은 아직 수행하지 않았습니다.
+
+### 이전 `run20` 기준선
+
+2026-09-18 `run20`은 당시 mission-local adaptive registration 코드와 새 Gazebo의
 공식 시작 자세 `(0.800, -1.747, 0°)`에서 출발했습니다. 앞선 미션을 생략하거나
 순간이동하지 않고 6개 미션과 결승선 footprint를 `283.053 s`에 통과했습니다. 네 공통화
 미션의 malformed 또는 non-finite core 진단 표본은 0개였습니다.
@@ -202,12 +240,13 @@ Tunnel 고유 `/tunnel/diagnostics`는 이 배열이 아닙니다. Tunnel은 출
 
 같은 실행에서 Level Crossing은 `14.386 s`, 공통화 대상이 아닌 Tunnel은 `75.283 s`에
 완료했습니다. `/cmd_vel` 발행자는 기대한 lane/mission 순서만 나타났고 발행자 교차는
-없었습니다. 제어권 인계 공백은 `3.582–121.699 ms`였습니다. 두 번째 공식 시작
+없었습니다. 당시 보고한 명령 간격은 `3.582–121.699 ms`였으며, 현재 인계 실패 판정은
+이 간격이 아니라 소유권 경계의 완전한 0 명령을 사용합니다. 두 번째 공식 시작
 주행에서도 Intersection RIGHT, Parking RIGHT, Tunnel layout C로 6개 미션과 결승을
 모두 완료했습니다. 두 번째 bag은 출발 뒤 녹화를 시작했으므로 시간 비교 자료로 쓰지
 않습니다.
 
-현재 코드의 자동 회귀는 bringup `669/669`, description `7/7`, 합계 `676/676`이며 두
+당시 코드의 자동 회귀는 bringup `669/669`, description `7/7`, 합계 `676/676`이며 두
 패키지 build와 `git diff --check`도 통과했습니다. `run20` bag의 종합 분석은 recorder
 시작 시각과 누락 토픽 때문에 `19/22`였지만 미션 순서·공통 진단·제어권·결승 검사는
 통과했습니다. 실제 D405·Mid-360·OpenCR 보정과 실물 공식 시작점 통합 주행은 아직

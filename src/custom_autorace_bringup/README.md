@@ -11,33 +11,39 @@ OpenCR, Intel RealSense D405, Livox Mid-360을 사용하는 ROS Noetic AutoRace
 ## 현재 검증 상태
 
 현재 작업트리는 연결 직선의 절대 길이와 AMCL polygon에 의존하지 않는
-mission-local adaptive registration으로 전환되었습니다. 2026-09-18 `run20`은 변경 후
-새 Gazebo와 통합 launch를 시작하고 공식 자세 `(0.800, -1.747, 0°)`에서 출발해
+mission-local adaptive registration과 이동 중 제어권 인계를 사용합니다. 2026-09-18
+`run26`은 새 Gazebo와 통합 launch를 시작하고 공식 AMCL 출발 자세
+`(0.800, -1.747, 0°)`에서 출발해
 `Intersection → Obstacle → Parking → Zigzag → Level Crossing → Tunnel`을 순서대로
 완료하고 결승선 footprint를 통과했습니다.
 
 | 항목 | 결과 |
 |---|---|
 | 미션 결과 | 6개 모두 `COMPLETE`, `FAILED` 0건 |
-| 출발부터 결승선 | `283.053 s` |
-| 선택 조건 | Intersection LEFT, Parking LEFT, Tunnel layout B |
-| 미션 수행시간 | `25.972 / 35.125 / 57.886 / 16.222 / 14.386 / 75.283 s` |
-| Parking 후진 | `6.303 s`, 최저 명령 `-0.1034 m/s` |
-| 제어권 | 기대한 순서로 인계, `/cmd_vel` 발행자 교차 0건 |
-| 결승 자세 | `(1.0335, -1.7459, 0.032°)`, footprint 전체 허용 구간 안 |
+| 출발부터 결승선 | `243.025 s` |
+| 미션 수행시간 | `25.185 / 21.756 / 54.692 / 15.475 / 14.520 / 53.457 s` |
+| 제어권 | 비주차 인계 12건 모두 PASS; Parking 2건만 제외, Level Crossing의 물리적 차단봉 0만 허용 |
+| Obstacle | 최대 경로 오차 `12.644 mm`, 최소 line/obstacle 여유 `3.391/4.245 mm` |
+| Tunnel | 계획 3회, 주행 중 재계획 2회 |
+| 결승 | Tunnel 완료 뒤 비대칭 footprint 전체가 허용 구간을 통과 |
 
-`run20` bag 분석은 22개 중 19개 항목을 통과했습니다. 나머지 3개는 주행 실패가 아니라
-recorder를 `/use_sim_time` 설정 전에 시작해 생긴 기록 시각 burst와 첫 pose 지연,
-`/detect/lane_centerline` 녹화 누락입니다. 실제 연속 pose의 최대 이동은 `0.283 mm`였고,
-미션 순서·진단·결승·제어권 검사는 모두 통과했습니다. 두 번째 공식 시작 주행은
-Intersection RIGHT, Parking RIGHT, Tunnel layout C 조건에서 6개 미션과 결승을 다시
-완료했습니다. 이 두 번째 bag은 출발 뒤 녹화를 시작했으므로 공식 시작 계측값으로
-사용하지 않습니다.
+근거는
+`diagnostics/official_full_nohandoff_stop_20260918_run26/run.bag`과 같은 디렉터리의
+`analysis.json`입니다. 분석기의 validation 항목은 모두 PASS이고 미션 순서, source-stamped
+gate, 공통 진단, 차선 발행률, pose 연속성, 후진, 제어권과 결승 footprint를 함께
+확인했습니다. Parking 2건만 판정에서 제외합니다. 비주차 인계는 새 소유자의 첫 명령
+또는 차선이 아닌 이전 미션 소유자의 마지막 명령이 완전한 0일 때 실패합니다. 단,
+Level Crossing 제어기의 차단봉 정지 0은 물리 동작으로 허용하되 차선 복귀 첫 명령은
+반드시 양수여야 합니다. 명령 사이 시간 간격은 마지막 Twist가 유지되는 구간이므로
+정보로만 기록하고, 미션 활성화 전에 발생한 차선 watchdog 0은 인계 정지로 분류하지
+않습니다.
 
-현재 ROS Noetic 자동 회귀는 등록된 29개 bringup test 파일의 `669/669`와 description
-`7/7`, 합계 `676/676`이 실패·오류 없이 통과했고 두 ROS 패키지 build도 통과했습니다.
-실제 장착 D405 원근 보정, 실제 도색의 30 Hz 차선 주행, Mid-360 motion distortion,
-OpenCR 응답과 실물 공식 시작점 통합 주행은 아직 검증하지 않았습니다.
+이전 `run20` 당시 ROS Noetic 자동 회귀 기준선은 등록된 29개 bringup test 파일의
+`669/669`와 description `7/7`, 합계 `676/676`이었습니다. 현재 변경은 bringup
+`708/708`, description `7/7`, 합계 `715/715`과 전체 `catkin_make` 빌드를 통과했습니다.
+실제 장착 D405 원근 보정, 실제 도색의
+30 Hz 차선 주행, Mid-360 motion distortion, OpenCR 응답과 실물 공식 시작점 통합 주행은
+아직 검증하지 않았습니다.
 미션별 오차와 안전 여유는 [공통 경로 문서](PATH_FOLLOWING.md), 과거 구현과 속도
 비교는 [검증 이력](docs/VALIDATION_HISTORY.md)에 분리해 기록합니다.
 
@@ -60,8 +66,10 @@ Zigzag의 고정·측량 경로도 같은 `CommonPath`, `SweptFootprintValidator
 
 연결 직선이 짧아지거나 길어져도 `arm` 상태에서 일반 차선 주행을 계속하고, 각 미션의
 직접 관측 가능한 형상으로 미션 좌표계를 odom에 맞춘 뒤 실제 진입 창에서만 제어권을
-넘깁니다. 등록과 전체 경로 검증이 끝나기 전에는 미션 제어기가 속도 제한이나
-`/cmd_vel`을 소유하지 않습니다.
+넘깁니다. 등록과 전체 경로 검증이 끝나기 전에는 미션 제어기가 `/cmd_vel`을 소유하지
+않습니다. Obstacle은 gate 전 별도 감속 cap을 걸지 않습니다. Tunnel만 정적 preplan이
+새 live cost와 맞지 않아 동적 preplan이 필요할 때, 차선 제어기가 계속 소유한 상태로
+`0.025 m/s` cap을 먼저 적용합니다.
 
 ```text
 카메라 신호등 출발
@@ -79,6 +87,10 @@ Zigzag의 고정·측량 경로도 같은 `CommonPath`, `SweptFootprintValidator
 `/control/lane_mission_handoff` 서비스로 일반 차선 제어기와 미션 제어기가 소유권을
 주고받습니다. `/control/lane_following`은 수동 정지·재개 서비스이고,
 `/control/manual_stop`이 현재 미션 제어기에도 정지 상태를 전달합니다.
+인계 서비스 자체는 0 명령을 발행하지 않습니다. 일반 차선으로 돌아갈 때 fresh하고
+실행 가능한 rolling 경로가 없으면 서비스가 retryable 실패를 반환하고 현재 미션이
+제어권과 양의 명령을 유지한 채 다음 주기에 다시 요청합니다. Parking의 계획된 정지와
+Level Crossing의 차단봉 정지, 실제 collision stop은 이 이동 중 인계 규칙의 예외입니다.
 
 | 구간 | 경로 결정 | 정렬·기준 frame | 실행 주체 |
 |---|---|---|---|
@@ -198,8 +210,8 @@ AMCL 방향과 표지 기준 평행이동은 제어권 인수 전에 고정하�
 
 ```text
 WAIT_INTERSECTION → SEARCH_DIRECTION(필요할 때만) → WAIT_ENTRY_HANDOFF
-→ PREPARE_ENTRY_PATH → FOLLOW_ENTRY_PATH → FOLLOW_ARC_LANE
-→ PREPARE_EXIT_PATH → FOLLOW_EXIT_PATH → VERIFY_FINAL_LANE → COMPLETE
+→ FOLLOW_ENTRY_PATH → FOLLOW_ARC_LANE
+→ FOLLOW_EXIT_PATH → VERIFY_FINAL_LANE → COMPLETE
 ```
 
 ### Obstacle
@@ -210,9 +222,14 @@ Obstacle은 미리 측량한 하나의 clamped cubic spline과 곡률 연속 qui
 등록은 ready가 되지 않습니다. 카메라 경계는 로컬 template을 이동시키지 않고 주행
 corridor가 맞는지 확인합니다.
 
-제어권을 받기 전 남은 경로 전체의 직사각형 sweep을 검사하고, 주행 중에는 실시간
-LiDAR와 라인 여유를 공통 validator로 다시 검사합니다. 별도 우회 경로나 실행 중 경로
-재생성은 없습니다. 경로 목표와 로컬 종단 통과를 확인한 뒤 일반 차선으로 반환합니다.
+제어권을 받기 전 현재 자세에서 spline으로 이어지는 G2 connector를 생성·고정합니다. 기존
+대칭 후보와 새 비대칭 후보를 모두 실제 가감속 profile 시간으로 비교하고, 직사각형
+footprint·라인·장애물 검사를 통과한 최단 후보만 남은 경로에 결합합니다. 주행 중에는
+실시간 LiDAR와 라인 여유를 공통 validator로 다시 검사하며 별도 우회 경로는 만들지
+않습니다. gate 전에는 장애물 전용 감속 cap이나 실행 중 재계획을 사용하지 않습니다. 진입
+인계는 최신 odometry의 선·각속도를 follower seed로 삼아 계속합니다. 출구의 남은 거리가
+`0.060 m`일 때부터 이동 중 차선 반환을 시도하고, rolling 경로가 아직 준비되지 않았으면
+양의 출구 접선 명령을 유지한 채 다음 주기에 다시 요청합니다.
 
 ```text
 WAIT_GATE → ACQUIRING → AVOIDING → REJOINING → COMPLETE
@@ -275,11 +292,11 @@ Gazebo의 제어용 raw `/odom` 수치는 map/world와 정렬되지만 TF의 `od
 
 공통 follower는 곡률 feed-forward, lookahead feedback과 미리 뒤로 전파한 속도
 profile을 사용합니다. 공통 validator는 바깥 도색 경계와 동시각 LiDAR 장애물을 현재
-반응·완전 정지 영역까지 검사합니다. 끝에서 새 rolling 차선 경로를 확인한 뒤 저속으로
-인계하고, 진행거리와 새 영상 확인 후 일반 속도를 복원합니다.
+반응·완전 정지 영역까지 검사합니다. 끝에서 정지하지 않고 새 rolling 차선 경로에
+저속으로 인계하고, 진행거리와 새 영상 확인 후 일반 속도를 복원합니다.
 
 ```text
-WAIT_GATE → ACQUIRING → FOLLOWING → VERIFY_EXIT → JOINING_LANE → COMPLETE
+WAIT_GATE → ACQUIRING → FOLLOWING → JOINING_LANE → COMPLETE
 ```
 
 ### Level Crossing
@@ -313,18 +330,29 @@ template←odom 변환을 고정하고, 이후 odom을 이 고정 template 좌�
 `CommonPath` 자료형에 담지만 공통
 `PathFollower`나 `SweptFootprintValidator`를 호출하지 않습니다.
 
-LiDAR는 정적 벽-only 지도와 별도인 동적 costmap을 갱신합니다. 전진 전용 Hybrid A*는
-비대칭 직사각형 footprint를 primitive 사이까지 검사하며, 새 장애물이 남은 경로를
-막으면 정지 후 재계획합니다. 정상 출구에서는 Hybrid A* 끝점부터 출구 밖까지의
-zero-end-curvature connector를 미리 결합해 순항 속도를 유지합니다. 이 connector까지 전체
-footprint 검사를 통과한 계획만 주행에 사용하며 정지 yaw 정렬 fallback은 없습니다. 출구
-주행 중 일반 차선 제어기의 최신 공통 경로를 미리 확인하고, rear footprint가 portal을
-통과하면 zero 명령 없이 곧바로 제어권을 반환합니다.
+LiDAR는 정적 벽-only 지도와 별도인 동적 costmap을 갱신합니다. arm 직후 고정된 입구
+안쪽 자세에서 정적 Hybrid A*를 먼저 계산합니다. portal 등록 뒤 live scan이 그 경로의
+hard occupancy와 충돌하거나 정적 plan에 없던 soft clearance cost를 만들면, 차선
+제어가 `0.025 m/s` cap으로 계속 움직이는 동안 동적 preplan을 시작합니다. 경로가
+없거나 계획 중 더 새로운 scan이 들어와 결과를 버린 경우에는 동시 worker를 하나만
+유지하면서 최신 costmap으로 다시 시도합니다. 입구부터 출구까지 직사각형 footprint
+검사를 마친 뒤에만 ready를 발행하므로
+정상 진입에는 계획 정지가 없습니다. 주행 중 새 장애물이 남은 경로를 막을 때만 정지 후
+재계획합니다. 정상 출구에서는 Hybrid A* 끝점부터 출구 밖까지의 zero-end-curvature
+connector를 미리 결합해 순항 속도를 유지합니다. 출구 주행 중 일반 차선 제어기의 최신
+공통 경로를 미리 확인하고, rear footprint가 portal을 통과하면 zero 명령 없이 곧바로
+제어권을 반환합니다. 차선 경로가 아직 준비되지 않았으면 터널 제어기가 양의 명령을
+유지한 채 다음 주기에 다시 인계를 요청합니다.
 
 ```text
-WAIT_GATE → ACQUIRING → ALIGNING_ENTRY → ENTERING → PLANNING
+WAIT_GATE → ACQUIRING → ALIGNING_ENTRY → ENTERING
 → FOLLOWING → EXITING → JOINING_LANE → COMPLETE
+
+새 live 장애물: ALIGNING_ENTRY/ENTERING/FOLLOWING → PLANNING → FOLLOWING
 ```
+
+정적·동적 preplan은 `WAIT_GATE` 상태에서 차선 제어권을 유지한 채 실행됩니다.
+`PLANNING`은 미션 진입 후 새 live 장애물로 정지 재계획할 때만 사용합니다.
 
 ## 표지판 인식
 

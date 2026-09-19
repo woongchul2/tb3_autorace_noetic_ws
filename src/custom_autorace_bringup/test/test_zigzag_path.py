@@ -1204,78 +1204,49 @@ class ZigzagPathTest(unittest.TestCase):
             abs(normalize_angle(recovered[2] - route_pose[2])), 1e-12
         )
 
-    def test_controller_exit_decelerates_before_verify_transition(self):
-        control = self.config["control"]
-        follower = PathFollower(
-            TrackingConfig(
-                lookahead_distance=control["lookahead_distance"],
-                maximum_linear_velocity=control["cruise_velocity"],
-                maximum_angular_velocity=control["maximum_angular_velocity"],
-                maximum_lateral_acceleration=control[
-                    "maximum_lateral_acceleration"
-                ],
-                linear_acceleration=control["linear_acceleration"],
-                linear_deceleration=control["linear_deceleration"],
-                angular_acceleration=control["angular_acceleration"],
-                heading_gain=control["heading_gain"],
-                curvature_feedforward_weight=control[
-                    "path_curvature_weight"
-                ],
-                lateral_feedback_gain=control["lateral_feedback_gain"],
-                search_ahead_distance=control["nearest_search_ahead"],
-            )
-        )
-        follower.reset(
-            self.path,
-            Pose2D(
-                float(self.path.x[-1]),
-                float(self.path.y[-1]),
-                float(self.path.heading[-1]),
-            ),
-            initial_linear=control["exit_velocity"],
-            initial_angular=0.12,
-        )
+    def test_controller_exit_hands_off_without_deceleration_command(self):
         controller = ZigzagMissionController.__new__(ZigzagMissionController)
-        controller.path_follower = follower
-        controller.control_period = control["period"]
-        controller.last_command_time = controller_module.rospy.Time.from_sec(10.0)
-        controller.last_linear = follower.last_linear
-        controller.last_angular = follower.last_angular
         controller.mission_has_control = True
+        controller.handoff_ambiguous = False
         controller.cmd_pub = RecordingPublisher()
-        controller.state = controller.FOLLOWING
-        controller._publish_diagnostics = lambda: None
-        transitions = []
+        controller.speed_limit_pub = RecordingPublisher()
+        controller.state_pub = RecordingPublisher()
+        controller.join_velocity_cap = self.config["exit"]["join_velocity_cap"]
+        controller.boundary_confirmation_count = 3
+        controller.last_boundary_confirmation_time = (
+            controller_module.rospy.Time.from_sec(10.0)
+        )
+        controller.confirmation_started_at = None
+        controller.exit_confirmation_started = True
+        controller.join_origin_ready = False
+        handoffs = []
 
         def set_state(state, now=None):
-            transitions.append(state)
             controller.state = state
+            controller.state_started = now
 
         controller._set_state = set_state
-        for step in range(1, 101):
-            now = controller_module.rospy.Time.from_sec(
-                10.0 + step * control["period"]
-            )
-            controller._decelerate_at_exit(now)
-            if controller.state == controller.VERIFY_EXIT:
-                break
+        controller._set_lane_controller = lambda enabled: (
+            handoffs.append(enabled)
+            or setattr(controller, "mission_has_control", not enabled)
+            or True
+        )
+        now = controller_module.rospy.Time.from_sec(10.0)
+        with mock.patch.object(
+            controller_module.rospy.Time,
+            "now",
+            return_value=now,
+        ):
+            controller._start_lane_join(now)
 
-        commands = controller.cmd_pub.messages
-        self.assertGreater(len(commands), 1)
-        self.assertGreater(commands[0].linear.x, 0.0)
-        for previous, current in zip(commands, commands[1:]):
-            self.assertLessEqual(
-                abs(current.linear.x - previous.linear.x),
-                control["linear_deceleration"] * control["period"] + 1e-9,
-            )
-            self.assertLessEqual(
-                abs(current.angular.z - previous.angular.z),
-                control["angular_acceleration"] * control["period"] + 1e-9,
-            )
-        self.assertEqual(controller.state, controller.VERIFY_EXIT)
-        self.assertEqual(transitions, [controller.VERIFY_EXIT])
-        self.assertAlmostEqual(commands[-1].linear.x, 0.0, places=12)
-        self.assertAlmostEqual(commands[-1].angular.z, 0.0, places=12)
+        self.assertEqual(controller.state, controller.JOINING_LANE)
+        self.assertEqual(handoffs, [True])
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(controller.cmd_pub.messages, [])
+        self.assertAlmostEqual(
+            controller.speed_limit_pub.messages[-1].data,
+            controller.join_velocity_cap,
+        )
 
     def test_exit_confirmation_accepts_the_same_single_line_as_lane_control(self):
         controller = ZigzagMissionController.__new__(ZigzagMissionController)
@@ -1293,7 +1264,7 @@ class ZigzagPathTest(unittest.TestCase):
             "confirmation_max_gap"
         ]
         controller.exit_confirmation_started = True
-        controller.state = controller.VERIFY_EXIT
+        controller.state = controller.JOINING_LANE
         controller.confirmation_started_at = controller_module.rospy.Time.from_sec(
             9.0
         )
@@ -1312,7 +1283,7 @@ class ZigzagPathTest(unittest.TestCase):
         self.assertEqual(controller.boundary_confirmation_count, 1)
 
 
-    def test_follow_checks_terminal_before_calculating_another_path_command(self):
+    def test_follow_keeps_positive_command_until_lane_return_is_ready(self):
         control = self.config["control"]
         follower = PathFollower(
             TrackingConfig(
@@ -1350,7 +1321,6 @@ class ZigzagPathTest(unittest.TestCase):
         controller.manual_stop = False
         controller.mission_started = controller_module.rospy.Time.from_sec(9.0)
         controller.mission_timeout = 5.0
-        controller.exit_stop_latched = False
         controller.odom_x = terminal_pose.x
         controller.odom_y = terminal_pose.y
         controller.odom_yaw = terminal_pose.yaw
@@ -1371,10 +1341,8 @@ class ZigzagPathTest(unittest.TestCase):
                 validation=ValidationResult(True),
             )
         )
-        controller._common_command = mock.Mock(
-            side_effect=AssertionError("terminal tick calculated a path command")
-        )
         controller.exit_confirmation_started = True
+        controller.exit_handoff_pending = False
         controller.handoff_remaining_distance = 0.02
         controller.exit_confirmation_lead_distance = 0.03
         controller.maximum_position_error_seen = 0.0
@@ -1385,6 +1353,7 @@ class ZigzagPathTest(unittest.TestCase):
         controller.last_angular = 0.0
         controller.linear_deceleration = control["linear_deceleration"]
         controller.mission_has_control = True
+        controller.handoff_ambiguous = False
         controller.odom_stamp = controller_module.rospy.Time.from_sec(10.0)
         controller.scan_stamp = controller_module.rospy.Time.from_sec(10.0)
         controller.scan_received = controller_module.rospy.Time.from_sec(10.0)
@@ -1398,22 +1367,78 @@ class ZigzagPathTest(unittest.TestCase):
         controller.odom_timeout = self.config["timeouts"]["odometry"]
         controller.scan_timeout = self.config["timeouts"]["scan"]
         controller.cmd_pub = RecordingPublisher()
+        controller.speed_limit_pub = RecordingPublisher()
+        controller.join_velocity_cap = self.config["exit"]["join_velocity_cap"]
         controller._publish_diagnostics = mock.Mock()
         controller.state = controller.FOLLOWING
         controller._set_state = mock.Mock()
-        now = controller_module.rospy.Time.from_sec(10.0 + control["period"])
+        handoffs = []
 
+        rejection_duration = 0.75
+        rejection_steps = int(
+            math.ceil(rejection_duration / control["period"])
+        )
+        handoff_ready = [False] * rejection_steps + [True]
+
+        def handoff(enabled):
+            handoffs.append(enabled)
+            ready = handoff_ready.pop(0)
+            if ready:
+                controller.mission_has_control = not enabled
+            return ready
+
+        controller._set_lane_controller = handoff
+
+        for step in range(1, rejection_steps + 1):
+            now = controller_module.rospy.Time.from_sec(
+                10.0 + step * control["period"]
+            )
+            controller.odom_stamp = now
+            controller.scan_stamp = now
+            controller.scan_received = now
+            with mock.patch.object(
+                controller_module.rospy.Time, "now", return_value=now
+            ):
+                controller._follow(now)
+            command = controller.cmd_pub.messages[-1]
+            self.assertGreater(command.linear.x, 0.0)
+            controller.odom_x += (
+                command.linear.x
+                * control["period"]
+                * math.cos(controller.odom_yaw)
+            )
+            controller.odom_y += (
+                command.linear.x
+                * control["period"]
+                * math.sin(controller.odom_yaw)
+            )
+
+        self.assertGreater(rejection_duration, 0.50)
+        self.assertEqual(handoffs, [True] * rejection_steps)
+        self.assertTrue(controller.mission_has_control)
+        self.assertEqual(controller.state, controller.FOLLOWING)
+        self.assertEqual(len(controller.cmd_pub.messages), rejection_steps)
+        self.assertTrue(
+            all(message.linear.x > 0.0 for message in controller.cmd_pub.messages)
+        )
+
+        accepted_at = controller_module.rospy.Time.from_sec(
+            10.0 + (rejection_steps + 1) * control["period"]
+        )
+        controller.odom_stamp = accepted_at
+        controller.scan_stamp = accepted_at
+        controller.scan_received = accepted_at
         with mock.patch.object(
-            controller_module.rospy.Time, "now", return_value=now
+            controller_module.rospy.Time, "now", return_value=accepted_at
         ):
-            controller._follow(now)
+            controller._follow(accepted_at)
 
-        controller._common_command.assert_not_called()
-        self.assertTrue(controller.exit_stop_latched)
-        self.assertEqual(len(controller.cmd_pub.messages), 1)
-        self.assertLess(
-            controller.cmd_pub.messages[0].linear.x,
-            control["exit_velocity"],
+        self.assertEqual(handoffs, [True] * (rejection_steps + 1))
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(len(controller.cmd_pub.messages), rejection_steps)
+        controller._set_state.assert_called_once_with(
+            controller.JOINING_LANE,
+            accepted_at,
         )
 
     def test_follow_brakes_with_common_slew_limit_for_stale_odometry(self):
@@ -1622,7 +1647,6 @@ class ZigzagPathTest(unittest.TestCase):
         controller.scan_stamp = controller_module.rospy.Time.from_sec(10.0)
         controller.scan_received = controller_module.rospy.Time.from_sec(10.0)
         controller.scan_pose_stamp_delta = 0.0
-        controller.exit_stop_latched = False
         controller.exit_confirmation_started = False
         controller.handoff_remaining_distance = self.config["exit"][
             "handoff_remaining_distance"
@@ -1733,7 +1757,6 @@ class ZigzagPathTest(unittest.TestCase):
         controller.mission_timeout = self.config["timeouts"]["mission"]
         controller.committed_path = None
         controller.route_from_odom = None
-        controller.exit_stop_latched = False
         controller.exit_confirmation_started = False
         controller.handoff_remaining_distance = self.config["exit"][
             "handoff_remaining_distance"
@@ -1844,6 +1867,11 @@ class ZigzagPathTest(unittest.TestCase):
         self.assertAlmostEqual(controller.last_command_time.to_sec(), 10.10, places=8)
         self.assertAlmostEqual(controller.mission_started.to_sec(), 10.10, places=8)
         self.assertAlmostEqual(controller.last_linear, 0.099, places=12)
+        self.assertAlmostEqual(
+            controller.observed_lane_command_received.to_sec(),
+            10.10,
+            places=8,
+        )
         self.assertGreaterEqual(controller.path_index, latest_index - 1)
         self.assertEqual(len(controller.cmd_pub.messages), 1)
         self.assertAlmostEqual(
@@ -1978,7 +2006,7 @@ class ZigzagPathTest(unittest.TestCase):
 
     def test_lane_join_success_returns_control_and_completes(self):
         controller = ZigzagMissionController.__new__(ZigzagMissionController)
-        controller.state = controller.VERIFY_EXIT
+        controller.state = controller.FOLLOWING
         controller.state_started = controller_module.rospy.Time.from_sec(9.5)
         controller.mission_started = controller_module.rospy.Time.from_sec(8.0)
         controller.mission_has_control = True

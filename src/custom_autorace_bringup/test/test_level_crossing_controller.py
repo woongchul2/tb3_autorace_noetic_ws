@@ -809,6 +809,19 @@ class LevelCrossingLidarControllerTest(unittest.TestCase):
         self.assertEqual(controller.lane_service.calls, [])
         self.assertEqual(controller.cmd_pub.messages, [])
 
+    def test_open_barrier_handoff_does_not_publish_an_extra_zero(self):
+        controller = self.make_controller(open_scans=1)
+        controller.state = controller.STOPPED
+        controller.mission_has_control = True
+        controller.cmd_pub.messages.clear()
+
+        controller._release_after_open()
+
+        self.assertEqual(controller.state, controller.PASSING)
+        self.assertEqual(controller.lane_service.calls, [True])
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(controller.cmd_pub.messages, [])
+
     def test_local_completion_is_invariant_to_longitudinal_course_shift(self):
         for sequence, shift in enumerate((0.0, 3.75), start=20):
             controller = self.make_controller(open_scans=2)
@@ -1053,7 +1066,7 @@ class LevelCrossingLidarControllerTest(unittest.TestCase):
         self.assertEqual(len(controller.cmd_pub.messages), command_count + 1)
         self.assert_zero(controller.cmd_pub.messages[-1])
 
-    def test_release_failure_reacquires_control_and_holds_zero(self):
+    def test_release_not_ready_retries_without_changing_owner(self):
         controller = self.make_controller(closed_scans=1, open_scans=1)
         controller.lane_service = RecordingLaneService(
             controller.events, outcomes=[True, False, True]
@@ -1063,10 +1076,16 @@ class LevelCrossingLidarControllerTest(unittest.TestCase):
         self.publish_scan(controller, False)
         controller.control_callback(None)
 
-        self.assertEqual(controller.lane_service.calls, [False, True, False])
+        self.assertEqual(controller.lane_service.calls, [False, True])
         self.assertTrue(controller.mission_has_control)
-        self.assertEqual(controller.state, controller.FAILED)
+        self.assertEqual(controller.state, controller.STOPPED)
         self.assert_zero(controller.cmd_pub.messages[-1])
+
+        controller.control_callback(None)
+
+        self.assertEqual(controller.lane_service.calls, [False, True, True])
+        self.assertFalse(controller.mission_has_control)
+        self.assertEqual(controller.state, controller.PASSING)
 
 
 if __name__ == "__main__":
